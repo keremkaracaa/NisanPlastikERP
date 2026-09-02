@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pyodbc
+fpdf2
+requests
+customtkinter
+pillow
+passlib
+python-jose
+# ÖNEMLİ: bcrypt 4.1+ sürümleri passlib 1.7.4 ile UYUMSUZ (AttributeError: module
+# 'bcrypt' has no attribute '__about__'). Bu satır olmadan "pip install bcrypt"
+# en güncel sürümü kurar ve giriş ekranı çöker. Mutlaka bu sabitlenmiş sürümü kullanın:
+bcrypt==4.0.1

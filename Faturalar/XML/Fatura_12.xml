@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Fatura><FaturaNo>FT-12</FaturaNo><Tarih>2026-08-13 14:01:42.140000</Tarih><Musteri>a</Musteri><VergiDairesi>d</VergiDairesi><VergiNo>e</VergiNo><Adres>f</Adres><Kalemler><Kalem><StokKod>1</StokKod><StokAdi>1</StokAdi><Miktar>1.0</Miktar><BirimFiyat>1.00</BirimFiyat><SatirToplami>1.00</SatirToplami></Kalem></Kalemler><GenelToplam>1.01</GenelToplam></Fatura>

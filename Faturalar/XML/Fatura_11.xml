@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='utf-8'?>
+<Fatura><FaturaNo>FT-11</FaturaNo><Tarih>2026-08-12 09:12:15.570000</Tarih><Musteri>b</Musteri><VergiDairesi>5</VergiDairesi><VergiNo>5</VergiNo><Adres>5</Adres><Kalemler><Kalem><StokKod>PP-002</StokKod><StokAdi>Polipropilen</StokAdi><Miktar>100.0</Miktar><BirimFiyat>100.00</BirimFiyat><SatirToplami>10000.00</SatirToplami><KdvOrani>20.0</KdvOrani></Kalem></Kalemler><AraToplam>10000.0</AraToplam><KdvToplam>2000.0</KdvToplam><GenelToplam>12000.00</GenelToplam></Fatura>

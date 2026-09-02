@@ -1,0 +1,28 @@
+# --- Kişisel/hassas veriler (asla Git'e yüklenmemeli) ---
+kisayollar_*.json
+belgeler/
+etiket_*.pdf
+Etiket_*.pdf
+Fatura_*.pdf
+fatura_*.pdf
+gecici_qr_*.png
+NisanPlastikERP.bak
+ayarlar.txt
+
+# --- Python çalışma zamanı dosyaları ---
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+venv/
+.venv/
+
+# --- Derleme/paketleme çıktıları (varsa PyInstaller vb.) ---
+build/
+dist/
+*.spec
+
+# --- Log/geçici dosyalar ---
+*.log
+server.exe
