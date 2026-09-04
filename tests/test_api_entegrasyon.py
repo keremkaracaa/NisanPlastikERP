@@ -1164,6 +1164,71 @@ class TestElektronikImza:
         assert "i.KullaniciAdi=?" in cagri.args[0]
 
 
+class TestGuvenliDosyaAdi:
+    """Güvenlik denetiminde bulundu: dosya yükleme uçları dosya.filename'i hiç
+    sanitize etmeden diske yazıyordu - '../../evil.exe' gibi bir ad hedef klasörün
+    dışına yazmayı mümkün kılabilirdi (path traversal)."""
+
+    def test_path_traversal_denemesi_temizlenir(self):
+        assert main.guvenli_dosya_adi("../../evil.exe") == "evil.exe"
+        assert main.guvenli_dosya_adi("..\\..\\windows\\system32\\evil.dll") == "evil.dll"
+
+    def test_normal_dosya_adi_degismez(self):
+        assert main.guvenli_dosya_adi("sozlesme.pdf") == "sozlesme.pdf"
+
+    def test_bos_ad_varsayilana_duser(self):
+        assert main.guvenli_dosya_adi(None) == "dosya"
+        assert main.guvenli_dosya_adi("") == "dosya"
+
+
+class TestImzaTalebiBelgeIndirSahiplikKontrolu:
+    """Güvenlik denetiminde bulundu: /imza-talebi/{id}/belge-indir, imzalama ucundaki
+    (imzala) sahiplik kontrolünün AYNISINI yapmıyordu - herhangi bir giriş yapmış
+    kullanıcı, ID'yi bilirse başkasına ait imza belgesini indirebiliyordu."""
+
+    def test_olusturan_kisi_indirebilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("Sözleşme.pdf", __file__, "muhasebe"))
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "muhasebe", "rol": "Satış"}
+        try:
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+            yanit = TestClient(main.app).get("/imza-talebi/1/belge-indir")
+            assert yanit.status_code == 200
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_listelenen_imzaci_indirebilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("Sözleşme.pdf", __file__, "muhasebe"), (1,)]  # talep + imzaci kaydı bulundu
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "ahmet", "rol": "Satış"}
+        try:
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+            yanit = TestClient(main.app).get("/imza-talebi/1/belge-indir")
+            assert yanit.status_code == 200
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_ilgisiz_kullanici_403_doner(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("Sözleşme.pdf", __file__, "muhasebe"), None]  # talep var, imzaci değil
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "yetkisiz_kisi", "rol": "Satış"}
+        try:
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+            yanit = TestClient(main.app).get("/imza-talebi/1/belge-indir")
+            assert yanit.status_code == 403
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_yonetici_her_zaman_indirebilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("Sözleşme.pdf", __file__, "muhasebe"))
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "baska_biri", "rol": "Yönetici"}
+        try:
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+            yanit = TestClient(main.app).get("/imza-talebi/1/belge-indir")
+            assert yanit.status_code == 200
+        finally:
+            main.app.dependency_overrides.clear()
+
+
 class TestTedarikciGuncelleDenetimIzi:
     """/tedarikci-guncelle önceden sadece düz metin log_islem yazıyordu; /musteri-guncelle
     ile aynı yapıda olmasına rağmen alan bazlı eski/yeni değer denetim izi (log_degisiklik)

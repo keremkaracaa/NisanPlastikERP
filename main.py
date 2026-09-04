@@ -467,7 +467,7 @@ app = FastAPI(title="Nisan Plastik ERP - Ultimate Enterprise Sürüm")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -486,7 +486,7 @@ _FIYAT_YONETIM_YOLLARI = (
 security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-SECRET_KEY = "3d739dffb43c3da76dc5b0598ee571fc5a2e034154c5f21883a40f5d14d62f13"
+SECRET_KEY = os.environ.get("NISAN_ERP_SECRET_KEY", "3d739dffb43c3da76dc5b0598ee571fc5a2e034154c5f21883a40f5d14d62f13")
 ALGORITHM = "HS256"
 
 @app.get("/mobil", response_class=HTMLResponse)
@@ -701,6 +701,11 @@ def log_islem(cursor, aciklama: str, kullanici: str = "Sistem"):
         cursor.execute("INSERT INTO IslemLoglari (KullaniciAdi, Aciklama) VALUES (?, ?)", (kullanici, aciklama))
     except Exception:
         pass
+
+def guvenli_dosya_adi(orijinal_ad: str) -> str:
+    """Yüklenen dosyanın adından yol bileşenlerini (../, klasör ayırıcıları) temizler -
+    aksi halde bir dosya adı 'kaçarak' hedef klasörün dışına yazılabilirdi (path traversal)."""
+    return os.path.basename(orijinal_ad or "dosya")
 
 def oturum_gunlugu_yaz(cursor, kullanici_adi: str, islem_turu: str, ip_adresi: str = None, detay: str = None):
     """Giriş denemelerini (başarılı/başarısız) ve IP adresini ayrı, güvenlik odaklı
@@ -5318,7 +5323,7 @@ def belge_yukle(dosya: UploadFile = File(...), IliskiliTip: str = Form("Genel"),
     kuralı bu tarihe 30 gün kala otomatik uyarı üretir."""
     try:
         os.makedirs(BELGE_KLASORU, exist_ok=True)
-        guvenli_ad = f"{int(time.time()*1000)}_{dosya.filename}"
+        guvenli_ad = f"{int(time.time()*1000)}_{guvenli_dosya_adi(dosya.filename)}"
         hedef_yol = os.path.join(BELGE_KLASORU, guvenli_ad)
         with open(hedef_yol, "wb") as f:
             f.write(dosya.file.read())
@@ -5413,7 +5418,7 @@ def kontrollu_dokuman_ekle(dosya: UploadFile = File(...), Ad: str = Form(...), K
     /dokuman-versiyon-onayla) resmi olarak 'yürürlükte' sayılmaz."""
     try:
         os.makedirs(KONTROLLU_DOKUMAN_KLASORU, exist_ok=True)
-        guvenli_ad = f"{int(time.time()*1000)}_{dosya.filename}"
+        guvenli_ad = f"{int(time.time()*1000)}_{guvenli_dosya_adi(dosya.filename)}"
         hedef_yol = os.path.join(KONTROLLU_DOKUMAN_KLASORU, guvenli_ad)
         with open(hedef_yol, "wb") as f:
             f.write(dosya.file.read())
@@ -5457,7 +5462,7 @@ def kontrollu_dokuman_yeni_versiyon(dokuman_id: int, dosya: UploadFile = File(..
 
         try:
             os.makedirs(KONTROLLU_DOKUMAN_KLASORU, exist_ok=True)
-            guvenli_ad = f"{int(time.time()*1000)}_{dosya.filename}"
+            guvenli_ad = f"{int(time.time()*1000)}_{guvenli_dosya_adi(dosya.filename)}"
             hedef_yol = os.path.join(KONTROLLU_DOKUMAN_KLASORU, guvenli_ad)
             with open(hedef_yol, "wb") as f:
                 f.write(dosya.file.read())
@@ -5593,7 +5598,7 @@ def imza_talebi_olustur(BelgeAdi: str = Form(...), Aciklama: Optional[str] = For
     if dosya is not None:
         try:
             os.makedirs(IMZA_BELGE_KLASORU, exist_ok=True)
-            guvenli_ad = f"{int(time.time()*1000)}_{dosya.filename}"
+            guvenli_ad = f"{int(time.time()*1000)}_{guvenli_dosya_adi(dosya.filename)}"
             dosya_yolu = os.path.join(IMZA_BELGE_KLASORU, guvenli_ad)
             with open(dosya_yolu, "wb") as f:
                 f.write(dosya.file.read())
@@ -5744,11 +5749,15 @@ def imza_talebi_belge_indir(imza_talep_id: int, user: dict = Depends(get_current
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT BelgeAdi, BelgeYolu FROM ImzaTalepleri WHERE ImzaTalepID=?", (imza_talep_id,))
+        cursor.execute("SELECT BelgeAdi, BelgeYolu, OlusturanKullanici FROM ImzaTalepleri WHERE ImzaTalepID=?", (imza_talep_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="İmza talebi bulunamadı.")
-        belge_adi, dosya_yolu = row
+        belge_adi, dosya_yolu, olusturan = row
+        if user["rol"] not in ("Yönetici", "Master") and user["username"] != olusturan:
+            cursor.execute("SELECT 1 FROM ImzaTalebiImzacilari WHERE ImzaTalepID=? AND KullaniciAdi=?", (imza_talep_id, user["username"]))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=403, detail="Bu belgeye erişim yetkiniz yok.")
         if not dosya_yolu or not os.path.exists(dosya_yolu):
             raise HTTPException(status_code=404, detail="Bu talebe bağlı bir dosya yok ya da dosya sunucuda bulunamadı.")
         return FileResponse(dosya_yolu, filename=belge_adi)
