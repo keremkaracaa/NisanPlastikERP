@@ -1094,6 +1094,76 @@ class TestOturumDenetimi:
         assert supheli["DenemeSayisi"] == 7
 
 
+class TestElektronikImza:
+    def test_imza_talebi_olustur_basarili(self, client, monkeypatch, tmp_path):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.chdir(tmp_path)
+
+        yanit = client.post("/imza-talebi-olustur", data={"BelgeAdi": "Sözleşme Taslağı", "Imzacilar": "ahmet,ayse"})
+        assert yanit.status_code == 200
+        assert yanit.json()["ImzaTalepID"] == 1
+
+    def test_imza_talebi_olustur_imzacisiz_400_doner(self, client, monkeypatch):
+        yanit = client.post("/imza-talebi-olustur", data={"BelgeAdi": "Sözleşme Taslağı", "Imzacilar": "  ,  "})
+        assert yanit.status_code == 400
+
+    def test_imza_talebi_olustur_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/imza-talebi-olustur", data={"BelgeAdi": "x", "Imzacilar": "ahmet"})
+        assert yanit.status_code in (401, 403)
+
+    def test_imzala_imzaci_olmayan_kullanici_403_doner(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("BEKLIYOR",), None]  # talep var, ama bu kullanıcı imzacı değil
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "yetkisiz_kisi", "rol": "Satış"}
+        try:
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+            yanit = TestClient(main.app).put("/imza-talebi/1/imzala", json={})
+            assert yanit.status_code == 403
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_imzala_son_imzaci_tamamlandi_yapar(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("BEKLIYOR",), (5, "BEKLIYOR"), (0,)]  # talep, imzaci, kalan bekleyen sayısı=0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/imza-talebi/1/imzala", json={"Not": "Onaylıyorum"})
+        assert yanit.status_code == 200
+        assert yanit.json()["TamamlandiMi"] is True
+        tamamlanma_cagrisi = [c for c in cursor.execute.call_args_list if "SET Durum='TAMAMLANDI'" in c.args[0]]
+        assert len(tamamlanma_cagrisi) == 1
+
+    def test_imzala_bekleyen_baska_imzaci_varsa_tamamlanmaz(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("BEKLIYOR",), (5, "BEKLIYOR"), (1,)]  # hâlâ 1 bekleyen imzacı var
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/imza-talebi/1/imzala", json={})
+        assert yanit.status_code == 200
+        assert yanit.json()["TamamlandiMi"] is False
+
+    def test_reddet_talebi_reddedildi_yapar(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("BEKLIYOR",), (5,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/imza-talebi/1/reddet", json={"Not": "Şartları kabul etmiyorum"})
+        assert yanit.status_code == 200
+        reddetme_cagrisi = [c for c in cursor.execute.call_args_list if "ImzaTalepleri SET Durum='REDDEDILDI'" in c.args[0]]
+        assert len(reddetme_cagrisi) == 1
+
+    def test_imza_talepleri_benim_imzalayacaklarim_filtresi(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[(1, "Sözleşme", "BEKLIYOR", "muhasebe", "2026-09-04 10:00")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/imza-talepleri", params={"benim_imzalayacaklarim": True})
+        assert yanit.status_code == 200
+        cagri = cursor.execute.call_args_list[0]
+        assert "i.KullaniciAdi=?" in cagri.args[0]
+
+
 class _MrpSahteCursor:
     """MRP hesaplama fonksiyonu tek bir cursor üzerinden birden çok FARKLI SELECT
     çalıştırdığı için (talep, reçete, bileşen, stok, açık üretim, açık talep),

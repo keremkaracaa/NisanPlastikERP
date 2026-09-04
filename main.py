@@ -2531,6 +2531,15 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _imza_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> İmza migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -2896,6 +2905,34 @@ def _oturum_gunlugu_migrationlari(cursor):
             Detay NVARCHAR(255) NULL
         )
     """, "OturumGunlugu tablosu")
+
+def _imza_migrationlari(cursor):
+    """Elektronik İmza (Belge İmza Talebi) için tablo eklemesi - diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ImzaTalepleri' and xtype='U')
+        CREATE TABLE ImzaTalepleri (
+            ImzaTalepID INT IDENTITY(1,1) PRIMARY KEY,
+            BelgeAdi NVARCHAR(200) NOT NULL,
+            BelgeYolu NVARCHAR(500) NULL,
+            Aciklama NVARCHAR(500) NULL,
+            OlusturanKullanici NVARCHAR(50) NOT NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'BEKLIYOR',
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "ImzaTalepleri tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ImzaTalebiImzacilari' and xtype='U')
+        CREATE TABLE ImzaTalebiImzacilari (
+            ImzaciID INT IDENTITY(1,1) PRIMARY KEY,
+            ImzaTalepID INT NOT NULL FOREIGN KEY REFERENCES ImzaTalepleri(ImzaTalepID),
+            KullaniciAdi NVARCHAR(50) NOT NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'BEKLIYOR',
+            ImzaTarihi DATETIME NULL,
+            IPAdresi NVARCHAR(50) NULL,
+            Not_ NVARCHAR(500) NULL
+        )
+    """, "ImzaTalebiImzacilari tablosu")
 
 @app.post("/virman-yap")
 def virman_yap(req: VirmanRequest, current_user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
@@ -5307,6 +5344,200 @@ def dokuman_versiyon_indir(versiyon_id: int, user: dict = Depends(get_current_us
         if not os.path.exists(dosya_yolu):
             raise HTTPException(status_code=404, detail="Dosya sunucuda bulunamadı (silinmiş olabilir).")
         return FileResponse(dosya_yolu, filename=dosya_adi)
+    finally:
+        conn.close()
+
+# --- ELEKTRONİK İMZA (BELGE İMZA TALEBİ) ---
+# KAPSAM SINIRI: Bu, Nitelikli Elektronik İmza (5070 sayılı kanun, ESHS tarafından
+# verilen kriptografik imza - e-Güven, TÜRKTRUST vb.) DEĞİLDİR - o gerçek bir ESHS
+# sözleşmesi + entegrasyonu gerektirir. Bu modül İÇ SİSTEM onay/imza akışıdır:
+# kullanıcı kendi ERP hesabıyla (zaten JWT ile kimliği doğrulanmış) bir belgeyi
+# "imzalar", bu KullaniciAdi+Tarih+IPAdresi ile kayıt altına alınır - "kim ne zaman
+# onayladı" kanıtı sağlar (KVKK/ticari uyuşmazlık senaryoları için değerli) ama
+# resmi/hukuki bağlayıcılığı nitelikli e-imzayla aynı değildir. Mevcut Çok Kademeli
+# Onay Motoru'ndan (tutar eşiğine göre OTOMATİK tetiklenir) farklıdır - bu MANUEL
+# olarak herhangi bir belgeye bağlanabilen, çok imzalı bir akıştır.
+IMZA_BELGE_KLASORU = os.path.join(BELGE_KLASORU, "imza")
+
+class ImzalaRequest(BaseModel):
+    Not: Optional[str] = None
+
+class ReddetRequest(BaseModel):
+    Not: str
+
+@app.post("/imza-talebi-olustur")
+def imza_talebi_olustur(BelgeAdi: str = Form(...), Aciklama: Optional[str] = Form(None),
+                         Imzacilar: str = Form(...), dosya: Optional[UploadFile] = File(None),
+                         user: dict = Depends(get_current_user)):
+    """Imzacilar: virgülle ayrılmış kullanıcı adları (örn. 'ahmet,ayse') - multipart
+    form üzerinden liste göndermenin en basit yolu."""
+    imzaci_listesi = [k.strip() for k in Imzacilar.split(",") if k.strip()]
+    if not imzaci_listesi:
+        raise HTTPException(status_code=400, detail="En az bir imzacı belirtmelisiniz.")
+
+    dosya_yolu = None
+    if dosya is not None:
+        try:
+            os.makedirs(IMZA_BELGE_KLASORU, exist_ok=True)
+            guvenli_ad = f"{int(time.time()*1000)}_{dosya.filename}"
+            dosya_yolu = os.path.join(IMZA_BELGE_KLASORU, guvenli_ad)
+            with open(dosya_yolu, "wb") as f:
+                f.write(dosya.file.read())
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Dosya kaydedilemedi: {e}")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""INSERT INTO ImzaTalepleri (BelgeAdi, BelgeYolu, Aciklama, OlusturanKullanici)
+                           OUTPUT inserted.ImzaTalepID VALUES (?, ?, ?, ?)""",
+                       (BelgeAdi, dosya_yolu, Aciklama, user["username"]))
+        imza_talep_id = int(cursor.fetchone()[0])
+        for kullanici_adi in imzaci_listesi:
+            cursor.execute("INSERT INTO ImzaTalebiImzacilari (ImzaTalepID, KullaniciAdi) VALUES (?, ?)",
+                           (imza_talep_id, kullanici_adi))
+        log_islem(cursor, f"İmza talebi açıldı: {BelgeAdi} ({len(imzaci_listesi)} imzacı)", user["username"])
+        conn.commit()
+        return {"mesaj": "İmza talebi oluşturuldu.", "ImzaTalepID": imza_talep_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/imza-talepleri")
+def imza_talepleri_getir(benim_imzalayacaklarim: bool = False, durum: Optional[str] = None,
+                          user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if benim_imzalayacaklarim:
+            sorgu = """SELECT DISTINCT t.ImzaTalepID, t.BelgeAdi, t.Durum, t.OlusturanKullanici, t.OlusturmaTarihi
+                       FROM ImzaTalepleri t JOIN ImzaTalebiImzacilari i ON t.ImzaTalepID = i.ImzaTalepID
+                       WHERE i.KullaniciAdi=? AND i.Durum='BEKLIYOR' AND t.Durum='BEKLIYOR'"""
+            parametreler = [user["username"]]
+        else:
+            sorgu = "SELECT ImzaTalepID, BelgeAdi, Durum, OlusturanKullanici, OlusturmaTarihi FROM ImzaTalepleri WHERE 1=1"
+            parametreler = []
+            if durum:
+                sorgu += " AND Durum=?"
+                parametreler.append(durum)
+        sorgu += " ORDER BY OlusturmaTarihi DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"talepler": [{"ImzaTalepID": r[0], "BelgeAdi": r[1], "Durum": r[2], "OlusturanKullanici": r[3],
+                               "OlusturmaTarihi": str(r[4])[:16]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/imza-talebi/{imza_talep_id}")
+def imza_talebi_detay(imza_talep_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT BelgeAdi, BelgeYolu, Aciklama, OlusturanKullanici, Durum, OlusturmaTarihi FROM ImzaTalepleri WHERE ImzaTalepID=?",
+                       (imza_talep_id,))
+        talep = cursor.fetchone()
+        if not talep:
+            raise HTTPException(status_code=404, detail="İmza talebi bulunamadı.")
+        cursor.execute("""SELECT ImzaciID, KullaniciAdi, Durum, ImzaTarihi, IPAdresi, Not_
+                           FROM ImzaTalebiImzacilari WHERE ImzaTalepID=? ORDER BY ImzaciID""", (imza_talep_id,))
+        imzacilar = [{"ImzaciID": r[0], "KullaniciAdi": r[1], "Durum": r[2], "ImzaTarihi": str(r[3])[:16] if r[3] else None,
+                      "IPAdresi": r[4] or "-", "Not": r[5] or ""} for r in cursor.fetchall()]
+        return {"BelgeAdi": talep[0], "BelgeVarMi": bool(talep[1]), "Aciklama": talep[2] or "", "OlusturanKullanici": talep[3],
+                "Durum": talep[4], "OlusturmaTarihi": str(talep[5])[:16], "Imzacilar": imzacilar}
+    finally:
+        conn.close()
+
+@app.put("/imza-talebi/{imza_talep_id}/imzala")
+def imza_talebi_imzala(imza_talep_id: int, veri: ImzalaRequest, request: Request, user: dict = Depends(get_current_user)):
+    ip_adresi = request.client.host if request.client else None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Durum FROM ImzaTalepleri WHERE ImzaTalepID=?", (imza_talep_id,))
+        talep = cursor.fetchone()
+        if not talep:
+            raise HTTPException(status_code=404, detail="İmza talebi bulunamadı.")
+        if talep[0] != "BEKLIYOR":
+            raise HTTPException(status_code=400, detail=f"Bu talep zaten '{talep[0]}' durumunda.")
+
+        cursor.execute("SELECT ImzaciID, Durum FROM ImzaTalebiImzacilari WHERE ImzaTalepID=? AND KullaniciAdi=?",
+                       (imza_talep_id, user["username"]))
+        imzaci = cursor.fetchone()
+        if not imzaci:
+            raise HTTPException(status_code=403, detail="Bu imza talebinde imzacı olarak listelenmediniz.")
+        if imzaci[1] != "BEKLIYOR":
+            raise HTTPException(status_code=400, detail=f"Zaten '{imzaci[1]}' olarak işaretlemişsiniz.")
+
+        cursor.execute("""UPDATE ImzaTalebiImzacilari SET Durum='IMZALANDI', ImzaTarihi=GETDATE(), IPAdresi=?, Not_=?
+                           WHERE ImzaciID=?""", (ip_adresi, veri.Not, imzaci[0]))
+
+        cursor.execute("SELECT COUNT(*) FROM ImzaTalebiImzacilari WHERE ImzaTalepID=? AND Durum<>'IMZALANDI'", (imza_talep_id,))
+        bekleyen_sayisi = cursor.fetchone()[0]
+        tamamlandi = bekleyen_sayisi == 0
+        if tamamlandi:
+            cursor.execute("UPDATE ImzaTalepleri SET Durum='TAMAMLANDI' WHERE ImzaTalepID=?", (imza_talep_id,))
+
+        log_islem(cursor, f"İmza talebi #{imza_talep_id} imzalandı" + (" (tüm imzalar tamamlandı)" if tamamlandi else ""), user["username"])
+        conn.commit()
+        return {"mesaj": "İmzalandı." + (" Tüm imzacılar tamamladı, talep kapandı." if tamamlandi else " Diğer imzacılar bekleniyor."),
+                "TamamlandiMi": tamamlandi}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.put("/imza-talebi/{imza_talep_id}/reddet")
+def imza_talebi_reddet(imza_talep_id: int, veri: ReddetRequest, request: Request, user: dict = Depends(get_current_user)):
+    ip_adresi = request.client.host if request.client else None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Durum FROM ImzaTalepleri WHERE ImzaTalepID=?", (imza_talep_id,))
+        talep = cursor.fetchone()
+        if not talep:
+            raise HTTPException(status_code=404, detail="İmza talebi bulunamadı.")
+        if talep[0] != "BEKLIYOR":
+            raise HTTPException(status_code=400, detail=f"Bu talep zaten '{talep[0]}' durumunda.")
+
+        cursor.execute("SELECT ImzaciID FROM ImzaTalebiImzacilari WHERE ImzaTalepID=? AND KullaniciAdi=?",
+                       (imza_talep_id, user["username"]))
+        imzaci = cursor.fetchone()
+        if not imzaci:
+            raise HTTPException(status_code=403, detail="Bu imza talebinde imzacı olarak listelenmediniz.")
+
+        cursor.execute("""UPDATE ImzaTalebiImzacilari SET Durum='REDDEDILDI', ImzaTarihi=GETDATE(), IPAdresi=?, Not_=?
+                           WHERE ImzaciID=?""", (ip_adresi, veri.Not, imzaci[0]))
+        cursor.execute("UPDATE ImzaTalepleri SET Durum='REDDEDILDI' WHERE ImzaTalepID=?", (imza_talep_id,))
+        log_islem(cursor, f"İmza talebi #{imza_talep_id} reddedildi: {veri.Not}", user["username"])
+        conn.commit()
+        return {"mesaj": "İmza talebi reddedildi."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/imza-talebi/{imza_talep_id}/belge-indir")
+def imza_talebi_belge_indir(imza_talep_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT BelgeAdi, BelgeYolu FROM ImzaTalepleri WHERE ImzaTalepID=?", (imza_talep_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="İmza talebi bulunamadı.")
+        belge_adi, dosya_yolu = row
+        if not dosya_yolu or not os.path.exists(dosya_yolu):
+            raise HTTPException(status_code=404, detail="Bu talebe bağlı bir dosya yok ya da dosya sunucuda bulunamadı.")
+        return FileResponse(dosya_yolu, filename=belge_adi)
     finally:
         conn.close()
 

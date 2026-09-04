@@ -5003,6 +5003,9 @@ class MainApp(ctk.CTkToplevel):
         self.tab_onay_bekleyenler = yeni_sekme("✅ Onay Bekleyenler")
         self.init_onay_bekleyenler()
 
+        self.tab_elektronik_imza = yeni_sekme("✍️ Elektronik İmza")
+        self.init_elektronik_imza()
+
         self.tab_ted_ekle = yeni_sekme("🏭 Tedarikçi")
         self.init_tedarikci()
 
@@ -11864,6 +11867,227 @@ class MainApp(ctk.CTkToplevel):
                 self.supheli_giris_tree.insert("", "end", values=(s["KullaniciAdi"], s["DenemeSayisi"], s["SonDeneme"]))
         except Exception:
             pass
+
+    def init_elektronik_imza(self):
+        self._ei_imzacilar = []
+
+        ust = ctk.CTkFrame(self.tab_elektronik_imza, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="✍️ Elektronik İmza", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+        ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=self.imza_talepleri_yukle).pack(side="right")
+        ctk.CTkLabel(self.tab_elektronik_imza,
+                     text="Bir belgeyi (sözleşme, teklif vb.) birden fazla kişiye imzaya gönderir. NOT: Bu Nitelikli "
+                          "Elektronik İmza (e-Güven/TÜRKTRUST gibi bir sağlayıcının verdiği kriptografik imza) DEĞİLDİR - "
+                          "kendi hesabınızla 'imzaladım' onayınızı IP adresi ve tarihle kayıt altına alan bir iç onay akışıdır.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+
+        self.ei_filtre_var = ctk.BooleanVar(value=True)
+        filtre_satiri = ctk.CTkFrame(self.tab_elektronik_imza, fg_color="transparent")
+        filtre_satiri.pack(fill="x", padx=20, pady=(0, 5))
+        ctk.CTkCheckBox(filtre_satiri, text="Sadece benim imzalayacaklarım", variable=self.ei_filtre_var,
+                         command=self.imza_talepleri_yukle).pack(side="left")
+
+        form = ctk.CTkFrame(self.tab_elektronik_imza, fg_color=RENK_KART, corner_radius=8)
+        form.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(form, text="Yeni İmza Talebi Aç", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        satir1 = ctk.CTkFrame(form, fg_color="transparent")
+        satir1.pack(fill="x", padx=10, pady=(0, 5))
+        self.ei_belge_adi = ctk.CTkEntry(satir1, placeholder_text="Belge Adı (örn: 2026 Distribütörlük Sözleşmesi)", width=300)
+        self.ei_belge_adi.pack(side="left", padx=(0, 8))
+        self.ei_dosya_yolu = ctk.StringVar(value="")
+        ctk.CTkButton(satir1, text="📎 Dosya Seç (opsiyonel)", fg_color="#7c3aed", hover_color="#6d28d9",
+                      command=self.ei_dosya_sec).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(satir1, textvariable=self.ei_dosya_yolu, font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=200).pack(side="left")
+        satir2 = ctk.CTkFrame(form, fg_color="transparent")
+        satir2.pack(fill="x", padx=10, pady=(0, 5))
+        self.ei_aciklama = ctk.CTkEntry(satir2, placeholder_text="Açıklama (opsiyonel)", width=300)
+        self.ei_aciklama.pack(side="left", padx=(0, 8))
+        satir3 = ctk.CTkFrame(form, fg_color="transparent")
+        satir3.pack(fill="x", padx=10, pady=(0, 5))
+        self.ei_imzaci_entry = ctk.CTkEntry(satir3, placeholder_text="İmzacı kullanıcı adı", width=180)
+        self.ei_imzaci_entry.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(satir3, text="+ İmzacı Ekle", fg_color=RENK_KENARLIK, hover_color=RENK_IKINCIL,
+                      command=self.ei_imzaci_ekle).pack(side="left", padx=(0, 8))
+        self.ei_imzacilar_label = ctk.CTkLabel(satir3, text="İmzacılar: (henüz yok)", font=("Arial", 10), text_color=RENK_METIN_SOLUK)
+        self.ei_imzacilar_label.pack(side="left")
+        satir4 = ctk.CTkFrame(form, fg_color="transparent")
+        satir4.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(satir4, text="✍️ İmza Talebi Aç", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.imza_talebi_olustur_islem).pack(side="left")
+
+        ctk.CTkLabel(self.tab_elektronik_imza, text="Bir talebe çift tıklayarak detayları/imzalama ekranını açabilirsiniz.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
+        liste_cerceve, self.imza_talep_tree = tablo_olustur(
+            self.tab_elektronik_imza, ["ID", "Belge Adı", "Durum", "Oluşturan", "Tarih"], [50, 260, 100, 130, 130], height=12)
+        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.imza_talep_tree.bind("<Double-Button-1>", lambda e: self.imza_talebi_detay_penceresi())
+
+        self.imza_talepleri_yukle()
+
+    def ei_dosya_sec(self):
+        yol = filedialog.askopenfilename(title="Belgeyi Seçin")
+        if yol:
+            self.ei_dosya_yolu.set(os.path.basename(yol))
+            self._ei_secili_dosya_tam_yol = yol
+
+    def ei_imzaci_ekle(self):
+        kullanici = self.ei_imzaci_entry.get().strip()
+        if not kullanici:
+            return
+        if kullanici not in self._ei_imzacilar:
+            self._ei_imzacilar.append(kullanici)
+        self.ei_imzaci_entry.delete(0, "end")
+        self.ei_imzacilar_label.configure(text="İmzacılar: " + ", ".join(self._ei_imzacilar))
+
+    def imza_talebi_olustur_islem(self):
+        belge_adi = self.ei_belge_adi.get().strip()
+        if not belge_adi:
+            messagebox.showwarning("Eksik Bilgi", "Belge adı zorunludur.")
+            return
+        if not self._ei_imzacilar:
+            messagebox.showwarning("Eksik Bilgi", "En az bir imzacı eklemelisiniz.")
+            return
+        form_data = {"BelgeAdi": belge_adi, "Aciklama": self.ei_aciklama.get().strip() or "",
+                     "Imzacilar": ",".join(self._ei_imzacilar)}
+        tam_yol = getattr(self, "_ei_secili_dosya_tam_yol", None)
+        try:
+            if tam_yol:
+                with open(tam_yol, "rb") as f:
+                    dosyalar = {"dosya": (os.path.basename(tam_yol), f)}
+                    res = requests.post(f"{API}/imza-talebi-olustur", data=form_data, files=dosyalar, headers=self.req_headers(), timeout=30)
+            else:
+                res = requests.post(f"{API}/imza-talebi-olustur", data=form_data, headers=self.req_headers(), timeout=15)
+            if res.status_code == 200:
+                self.ei_belge_adi.delete(0, "end")
+                self.ei_aciklama.delete(0, "end")
+                self.ei_dosya_yolu.set("")
+                self._ei_secili_dosya_tam_yol = None
+                self._ei_imzacilar = []
+                self.ei_imzacilar_label.configure(text="İmzacılar: (henüz yok)")
+                self.imza_talepleri_yukle()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "İmza talebi oluşturuldu."))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def imza_talepleri_yukle(self):
+        try:
+            params = {"benim_imzalayacaklarim": self.ei_filtre_var.get()}
+            res = requests.get(f"{API}/imza-talepleri", params=params, headers=self.req_headers(), timeout=6)
+            for i in self.imza_talep_tree.get_children():
+                self.imza_talep_tree.delete(i)
+            DURUM_ETIKET = {"BEKLIYOR": "Bekliyor", "TAMAMLANDI": "Onaylandı", "REDDEDILDI": "İptal"}
+            for t in res.json().get("talepler", []):
+                tag = DURUM_ETIKET.get(t["Durum"], "Bekliyor")
+                self.imza_talep_tree.insert("", "end", iid=str(t["ImzaTalepID"]), tags=(tag,),
+                                             values=(t["ImzaTalepID"], t["BelgeAdi"], t["Durum"], t["OlusturanKullanici"], t["OlusturmaTarihi"]))
+        except Exception:
+            pass
+
+    def imza_talebi_detay_penceresi(self):
+        secili = self.imza_talep_tree.selection()
+        if not secili:
+            return
+        imza_talep_id = secili[0]
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title(f"İmza Talebi #{imza_talep_id}")
+        pencere.geometry("620x480")
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        baslik_label = ctk.CTkLabel(pencere, text="", font=("Arial", 14, "bold"), text_color="#f97316")
+        baslik_label.pack(pady=(15, 5))
+        aciklama_label = ctk.CTkLabel(pencere, text="", font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=560)
+        aciklama_label.pack(pady=(0, 10))
+
+        cerceve, tree = tablo_olustur(pencere, ["Kullanıcı", "Durum", "İmza Tarihi", "IP Adresi", "Not"], [120, 100, 130, 110, 150], height=8)
+        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        durum_bilgisi = {}
+
+        def detayi_yukle():
+            for i in tree.get_children():
+                tree.delete(i)
+            try:
+                res = requests.get(f"{API}/imza-talebi/{imza_talep_id}", headers=self.req_headers(), timeout=6)
+                if res.status_code != 200:
+                    return
+                veri = res.json()
+                durum_bilgisi["Durum"] = veri["Durum"]
+                baslik_label.configure(text=f"✍️ {veri['BelgeAdi']} — {veri['Durum']}")
+                aciklama_label.configure(text=veri.get("Aciklama") or "")
+                for im in veri.get("Imzacilar", []):
+                    tree.insert("", "end", values=(im["KullaniciAdi"], im["Durum"], im["ImzaTarihi"] or "-", im["IPAdresi"], im["Not"]))
+                    if im["KullaniciAdi"] == self.username and im["Durum"] == "BEKLIYOR":
+                        durum_bilgisi["BenimSiramVarMi"] = True
+                if veri.get("BelgeVarMi"):
+                    indir_btn.pack(side="left", padx=6)
+                else:
+                    indir_btn.pack_forget()
+                if durum_bilgisi.get("BenimSiramVarMi") and veri["Durum"] == "BEKLIYOR":
+                    imzala_btn.pack(side="left", padx=6)
+                    reddet_btn.pack(side="left", padx=6)
+                else:
+                    imzala_btn.pack_forget()
+                    reddet_btn.pack_forget()
+            except Exception:
+                pass
+
+        def imzala():
+            if not messagebox.askyesno("Onay", "Bu belgeyi imzalamış sayılacaksınız (kullanıcı adınız, IP adresiniz ve tarih kaydedilir). Emin misiniz?"):
+                return
+            try:
+                res = requests.put(f"{API}/imza-talebi/{imza_talep_id}/imzala", json={}, headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    detayi_yukle()
+                    self.imza_talepleri_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        def reddet():
+            not_metni = simpledialog.askstring("Reddet", "Red gerekçesi (zorunlu):")
+            if not not_metni:
+                return
+            try:
+                res = requests.put(f"{API}/imza-talebi/{imza_talep_id}/reddet", json={"Not": not_metni}, headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    detayi_yukle()
+                    self.imza_talepleri_yukle()
+                    messagebox.showinfo("Reddedildi", res.json().get("mesaj"))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        def indir():
+            try:
+                res = requests.get(f"{API}/imza-talebi/{imza_talep_id}/belge-indir", headers=self.req_headers(), timeout=15)
+                if res.status_code == 200:
+                    hedef = filedialog.asksaveasfilename(initialfile=f"imza_talebi_{imza_talep_id}")
+                    if hedef:
+                        with open(hedef, "wb") as f:
+                            f.write(res.content)
+                        messagebox.showinfo("İndirildi", f"Dosya kaydedildi: {hedef}")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        buton_satiri = ctk.CTkFrame(pencere, fg_color="transparent")
+        buton_satiri.pack(pady=10)
+        imzala_btn = ctk.CTkButton(buton_satiri, text="✅ İmzala", fg_color="#16a34a", hover_color="#15803d", command=imzala)
+        reddet_btn = ctk.CTkButton(buton_satiri, text="❌ Reddet", fg_color="#ef4444", hover_color="#b91c1c", command=reddet)
+        indir_btn = ctk.CTkButton(buton_satiri, text="⬇️ Belgeyi İndir", fg_color="#2563eb", hover_color="#1d4ed8", command=indir)
+
+        detayi_yukle()
 
 if __name__ == "__main__":
     app = LoginWindow()
