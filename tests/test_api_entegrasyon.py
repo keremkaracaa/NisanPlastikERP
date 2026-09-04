@@ -474,7 +474,9 @@ class TestStokHizliHareket:
         assert "Uyari" not in veri
 
     def test_cikis_stok_eksiye_duserse_uyari_doner_ama_basarili(self, client, monkeypatch):
-        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("PP-001", "Test Ürünü", 5.0))
+        conn, cursor = sahte_cursor_olustur()
+        # 1) Barkod/StokKod arama sonucu, 2) kalite kontrolü RED lot toplamı (yok)
+        cursor.fetchone.side_effect = [("PP-001", "Test Ürünü", 5.0), (0.0,)]
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
         yanit = client.post("/stok-hizli-hareket", json={"Kod": "PP-001", "Miktar": 10, "Yon": "CIKIS"})
@@ -482,6 +484,18 @@ class TestStokHizliHareket:
         veri = yanit.json()
         assert veri["YeniMevcutMiktar"] == -5.0
         assert "Uyari" in veri
+
+    def test_cikis_red_lot_varsa_engellenir(self, client, monkeypatch):
+        """Kalite kontrolünde RED alan bir lotun kalan miktarı satılabilir stoktan
+        ayrılmış sayılmalı - bu miktara dokunan bir çıkış işlemi reddedilmeli."""
+        conn, cursor = sahte_cursor_olustur()
+        # 1) Barkod/StokKod arama, 2) RED lot toplamı (8 birim), 3) mevcut stok (10)
+        cursor.fetchone.side_effect = [("PP-001", "Test Ürünü", 10.0), (8.0,), (10.0,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/stok-hizli-hareket", json={"Kod": "PP-001", "Miktar": 5, "Yon": "CIKIS"})
+        assert yanit.status_code == 400
+        assert "REDDED" in yanit.json()["detail"].upper()
 
     def test_urun_bulunamadi_404_doner(self, client, monkeypatch):
         conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
@@ -617,6 +631,343 @@ class TestKontrolluDokuman:
         dokuman = yanit.json()["dokumanlar"][0]
         assert dokuman["GuncelVersiyonNo"] == 2
         assert dokuman["Durum"] == "YURURLUKTE"
+
+
+class TestStokKaliteKontrolEt:
+    """stok_kalite_kontrol_et'i doğrudan test eder - bu, RED kalite kontrolü alan
+    lotların TÜM satış/sevkiyat yollarından (evrak-isleme, fatura-kes, ihraç
+    faturası, toplu faturalama, konsinye çıkış, hızlı barkod çıkışı) korunmasını
+    sağlayan ortak güvenlik fonksiyonu."""
+
+    def test_red_lot_yoksa_hicbir_sey_yapmaz(self):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(0.0,))
+        main.stok_kalite_kontrol_et(cursor, "PP-001", 10)  # exception fırlatmamalı
+
+    def test_red_lot_miktarina_dokunmayan_satis_gecer(self):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(8.0,), (10.0,)]  # RED kalan=8, mevcut=10 -> satılabilir=2
+        main.stok_kalite_kontrol_et(cursor, "PP-001", 2)  # tam sınırda, geçmeli
+
+    def test_red_lot_miktarina_dokunan_satis_engellenir(self):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(8.0,), (10.0,)]  # satılabilir=2
+        with pytest.raises(Exception) as hata:
+            main.stok_kalite_kontrol_et(cursor, "PP-001", 3)  # satılabilirden fazla
+        assert hata.value.status_code == 400
+
+    def test_bos_stok_kod_veya_sifir_miktar_atlanir(self):
+        conn, cursor = sahte_cursor_olustur()
+        main.stok_kalite_kontrol_et(cursor, "", 10)
+        main.stok_kalite_kontrol_et(cursor, "PP-001", 0)
+        cursor.execute.assert_not_called()
+
+
+class TestFaturaKesSiparisIDDamgalama:
+    """/fatura-kes önceden Faturalar.SiparisID'yi hiç doldurmuyordu - bu da
+    Belge Zinciri özelliğinin normal yoldan kesilen faturalarda çalışmamasına
+    sebep oluyordu. Artık ilk bağlı sipariş damgalanıyor."""
+
+    def test_siparis_id_ler_verilince_ilki_damgalanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("Test Firma", "Yetkili", "Adres", "VD", "1234567890"),  # müşteri
+            (0.0,),   # risk limiti
+            (1,),     # yeni FaturaID
+            (0.0,),   # kalite kontrolü: RED lot toplamı yok (erken çıkış)
+            None,     # kritik stok kontrolü sorgusu
+            None,     # SiparisIDler döngüsü: sipariş bulunamadı (continue)
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/fatura-kes", json={
+            "MusteriID": 1, "ParaBirimi": "TL", "SiparisIDler": [42],
+            "Kalemler": [{"StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 1, "BirimFiyat": 100, "KdvOrani": 20}]
+        })
+        assert yanit.status_code == 200
+
+        insert_cagrisi = next(c for c in cursor.execute.call_args_list if "INSERT INTO Faturalar" in c.args[0])
+        assert 42 in insert_cagrisi.args[1]  # SiparisID parametreler arasında geçmeli
+
+
+class TestFaturaKesKaliteKapisi:
+    def test_red_lot_varken_fatura_kesme_engellenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("Test Firma", "Yetkili", "Adres", "VD", "1234567890"),  # müşteri bilgisi
+            (0.0,),   # risk limiti
+            (1,),     # yeni FaturaID (OUTPUT inserted.FaturaID)
+            (5.0,),   # RED lot toplamı (kalite kontrolü)
+            (5.0,),   # mevcut stok (kalite kontrolü)
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/fatura-kes", json={
+            "MusteriID": 1, "ParaBirimi": "TL",
+            "Kalemler": [{"StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 10, "BirimFiyat": 100, "KdvOrani": 20}]
+        })
+        assert yanit.status_code == 400
+        assert "REDDED" in yanit.json()["detail"].upper()
+
+
+class TestFiyatPolitikasiKontrolEt:
+    """fiyat_politikasi_kontrol_et'i doğrudan test eder - Fiyat Listeleri/İskonto
+    Kademeleri'nin artık gerçekten sipariş/teklif akışını etkilediğini (önceden
+    tamamen dekoratifti) doğrulayan güvenlik fonksiyonu."""
+
+    def test_yonetici_her_zaman_gecer(self):
+        conn, cursor = sahte_cursor_olustur()
+        main.fiyat_politikasi_kontrol_et(cursor, "PP-001", 1, 5.0, 0.5, {"rol": "Yönetici", "username": "x"})
+        cursor.execute.assert_not_called()  # politika hiç sorgulanmaz bile
+
+    def test_urun_fiyat_politikasinda_yoksa_gecer(self):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        main.fiyat_politikasi_kontrol_et(cursor, "YOK-001", None, 5.0, 1.0, {"rol": "Satış", "username": "x"})
+
+    def test_politika_fiyatinin_altindaki_fiyat_engellenir(self):
+        conn, cursor = sahte_cursor_olustur()
+        # 1) StokKartlari.BirimFiyat=100, 2) müşteri özel fiyat yok, 3) iskonto kademesi yok
+        cursor.fetchone.side_effect = [(100.0,), None, None]
+        with pytest.raises(Exception) as hata:
+            main.fiyat_politikasi_kontrol_et(cursor, "PP-001", 1, 5.0, 50.0, {"rol": "Satış", "username": "x"})
+        assert hata.value.status_code == 400
+
+    def test_politika_fiyatina_esit_veya_ustu_gecer(self):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(100.0,), None, None]
+        main.fiyat_politikasi_kontrol_et(cursor, "PP-001", 1, 5.0, 100.0, {"rol": "Satış", "username": "x"})
+
+    def test_iskonto_kademesi_dogru_uygulanir(self):
+        """100 birim alan bir müşteri için %10 iskonto kademesi varsa, 90 TL'ye
+        kadar satış politika ihlali SAYILMAMALI (kademe zaten izin veriyor)."""
+        conn, cursor = sahte_cursor_olustur()
+        # musteri_id=None olduğu için özel fiyat listesi sorgusu hiç çalışmaz -
+        # sadece BirimFiyat ve İskontoKademeleri sorguları çalışır.
+        cursor.fetchone.side_effect = [(100.0,), (100, 10.0)]  # MinMiktar=100, %10 iskonto
+        main.fiyat_politikasi_kontrol_et(cursor, "PP-001", None, 100.0, 90.0, {"rol": "Satış", "username": "x"})
+
+
+class TestSiparisEkleFiyatKapisi:
+    def test_politika_disi_fiyatla_siparis_reddedilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(100.0,), None, None]  # taban fiyat 100, özel liste/iskonto yok
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "satisci", "rol": "Satış"}
+        try:
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+            gecici_client = TestClient(main.app)
+            yanit = gecici_client.post("/siparis-ekle", json={
+                "MusteriID": 1, "StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 5, "BirimFiyat": 50
+            })
+            assert yanit.status_code == 400
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_yonetici_politika_disi_fiyatla_siparis_girebilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/siparis-ekle", json={
+            "MusteriID": 1, "StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 5, "BirimFiyat": 1
+        })
+        assert yanit.status_code == 200
+
+
+class TestYevmiyeFisiCiftYazma:
+    """yevmiye_fisi_olustur artık HEM YevmiyeSatirlari HEM HesapHareketleri'ne
+    yazmalı - önceden bu ikisi birbirinden habersiz iki ayrı defter oluşturuyordu
+    (Mizan/Bilanço sadece birini, Mizan Raporu/Kâr-Zarar sadece diğerini okuyordu)."""
+
+    def test_her_iki_tabloya_da_yazilir(self):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        main.yevmiye_fisi_olustur(cursor, "Test Fişi", "Test", 1, [
+            ("120", 100.0, 0, "Alıcılar"), ("600", 0, 100.0, "Satışlar"),
+        ], "test_kullanici")
+
+        yevmiye_satirlari_yazildi = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        hesap_hareketleri_yazildi = [c for c in cursor.execute.call_args_list if "INTO HesapHareketleri" in c.args[0]]
+        assert len(yevmiye_satirlari_yazildi) == 2
+        assert len(hesap_hareketleri_yazildi) == 2
+
+    def test_dengesiz_fis_ikisine_de_yazilmaz(self):
+        conn, cursor = sahte_cursor_olustur()
+        with pytest.raises(Exception):
+            main.yevmiye_fisi_olustur(cursor, "Dengesiz", "Test", 1, [
+                ("120", 100.0, 0, "Alıcılar"), ("600", 0, 50.0, "Satışlar"),
+            ], "test_kullanici")
+        cursor.execute.assert_not_called()
+
+
+class TestYetkiKontroluDuzeltmeleri:
+    """Denetimde bulunan, yetki kontrolü eksik/tutarsız olan endpoint'lerin
+    artık gerçekten korunduğunu doğrular."""
+
+    def test_virman_yap_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/virman-yap", json={"CikisHesapID": 1, "GirisHesapID": 2, "Tutar": 100})
+        assert yanit.status_code in (401, 403)
+
+    def test_virman_yap_yetkisiz_rolde_403_doner(self, monkeypatch):
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "depocu", "rol": "Depo"}
+        try:
+            yanit = TestClient(main.app).post("/virman-yap", json={"CikisHesapID": 1, "GirisHesapID": 2, "Tutar": 100})
+            assert yanit.status_code == 403
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_demirbas_ekle_yetkisiz_rolde_403_doner(self, monkeypatch):
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "depocu", "rol": "Depo"}
+        try:
+            yanit = TestClient(main.app).post("/demirbas-ekle", json={"Ad": "Forklift", "AlisTutari": 100000})
+            assert yanit.status_code == 403
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_urun_maliyeti_sil_yollar_listesinde(self):
+        """Master'ın fiyat/maliyet yönetimi ekranlarında yazamamasını sağlayan
+        _FIYAT_YONETIM_YOLLARI listesine /urun-maliyeti-sil'in eklendiğini
+        doğrular (asıl 403 mantığı get_current_user içinde, request path'e göre
+        çalışıyor - dependency_override ile mock'lanamıyor, bu yüzden burada
+        sadece listeye eklendiği doğrulanıyor)."""
+        assert any(yol.startswith("/urun-maliyeti-sil") for yol in main._FIYAT_YONETIM_YOLLARI)
+
+
+class TestBankaCekSenetMuhasebeEntegrasyonu:
+    """Banka hareketleri ve çek/senet kayıtları önceden muhasebeye (yevmiyeye)
+    hiç işlenmiyordu - artık gerçek, dengeli bir yevmiye kaydı oluşturuyorlar."""
+
+    def test_gelen_havale_musteriyle_dogru_hesaplara_islenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/banka-hareket-ekle", json={
+            "HesapID": 1, "MusteriID": 5, "IslemTuru": "Gelen Havale", "Tutar": 1000, "Aciklama": "Test"
+        })
+        assert yanit.status_code == 200
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        hesap_kodlari = {c.args[1][1] for c in yevmiye_satirlari}
+        assert hesap_kodlari == {"102", "120"}
+
+    def test_giden_havale_tedarikciyle_dogru_hesaplara_islenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/banka-hareket-ekle", json={
+            "HesapID": 1, "TedarikciID": 3, "IslemTuru": "Giden Havale", "Tutar": 500, "Aciklama": "Ödeme"
+        })
+        assert yanit.status_code == 200
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        hesap_kodlari = {c.args[1][1] for c in yevmiye_satirlari}
+        assert hesap_kodlari == {"320", "102"}
+
+    def test_cek_senet_ekle_yevmiyeye_islenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/cek-senet-ekle", json={
+            "EvrakTipi": "Çek", "EvrakNo": "CK-001", "AlinanMusteriID": 5, "Tutar": 2000,
+            "VadeTarihi": "2026-12-01", "BankaBilgisi": "X Bankası"
+        })
+        assert yanit.status_code == 200
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        hesap_kodlari = {c.args[1][1] for c in yevmiye_satirlari}
+        assert hesap_kodlari == {"101", "120"}
+
+    def test_cek_senet_ciro_bulunamayan_evrak_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/cek-senet-ciro", json={"EvrakID": 999, "VerilenTedarikciID": 3})
+        assert yanit.status_code == 404
+
+    def test_cek_senet_ciro_dogru_hesaplara_islenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        # 1) evrak bilgisi (EvrakNo, Tutar), 2) yevmiye_fisi_olustur'un yeni FisID'si
+        cursor.fetchone.side_effect = [("CK-001", 2000.0), (1,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/cek-senet-ciro", json={"EvrakID": 1, "VerilenTedarikciID": 3})
+        assert yanit.status_code == 200
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        hesap_kodlari = {c.args[1][1] for c in yevmiye_satirlari}
+        assert hesap_kodlari == {"320", "101"}
+
+
+class TestCokluDepoSenkronizasyonu:
+    """Negatif stok düzeltme, üretim tamamlama ve stok sayımı önceden
+    StokDepoMiktarlari'nı hiç güncellemiyordu - genel toplam (StokKartlari.
+    MevcutMiktar) ile depo bazlı toplam zamanla birbirinden sapıyordu (drift).
+    Artık varsayılan depo üzerinden senkronize ediliyor."""
+
+    def test_negatif_stok_duzelt_depo_senkronize_eder(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(-5.0, 10.0), (1,), None]  # eski miktar/maliyet, varsayılan depo, StokDepoMiktarlari satırı yok
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/negatif-stok-duzelt", json={"StokKod": "PP-001", "YeniMiktar": 5, "Aciklama": "test"})
+        assert yanit.status_code == 200
+        depo_cagrilari = [c for c in cursor.execute.call_args_list if "StokDepoMiktarlari" in c.args[0]]
+        assert len(depo_cagrilari) >= 1
+
+
+class TestUretimMamulMaliyetiRollUp:
+    """Üretim tamamlanınca artık mamulün OrtalamaMaliyet'i tüketilen hammaddelerin
+    gerçek maliyetinden hesaplanıyor - önceden bu adım hiç yapılmıyordu, mamul
+    maliyeti donuk kalıyor, kâr marjı raporları yanıltıcı oluyordu."""
+
+    def test_mamul_maliyeti_tuketilen_hammaddeden_hesaplanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            (10, 100.0, "Planlandı"),  # UretimEmirleri: ReceteID, PlanlananMiktar, Durum
+            (1,),                        # varsayılan depo
+            ("MAMUL1",),                 # MamulKodu
+            (5.0,),                      # HAM1'in OrtalamaMaliyet'i
+            None,                        # depo_stok_guncelle (HAM1): StokDepoMiktarlari satırı yok
+            (0.0, 0.0),                  # stok_ortalama_maliyet_guncelle (MAMUL1): eski miktar/ortalama
+            None,                        # depo_stok_guncelle (MAMUL1): StokDepoMiktarlari satırı yok
+            ("Mamul Ürün",),             # mamul adı
+        ]
+        cursor.fetchall.return_value = [("HAM1", 2.0, 0.0)]  # tek bileşen: 1 birim mamul için 2 birim HAM1
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/uretim-emri-tamamla/1")
+        assert yanit.status_code == 200
+
+        maliyet_guncelleme = next(
+            c for c in cursor.execute.call_args_list
+            if "UPDATE StokKartlari SET OrtalamaMaliyet" in c.args[0]
+        )
+        # 100 birim üretim * 2 birim HAM1/birim * 5 TL/HAM1 = 1000 TL toplam / 100 birim = 10 TL/birim
+        assert maliyet_guncelleme.args[1][0] == 10.0
+
+
+class TestSatinalmaTalebiTeslimAlindiIsaretleme:
+    """Mal fiilen geldiğinde (alış irsaliyesi/faturası) ilgili onaylı satınalma
+    talebinin artık 'Teslim Alındı'ya çekildiğini doğrular - önceden onaylı bir
+    talep mal geldikten sonra bile sonsuza kadar 'Onaylandı' kalıyordu, bu da
+    MRP'nin gerçek eksik miktarı olduğundan az göstermesine sebep oluyordu."""
+
+    def test_fonksiyon_dogru_sorguyu_calistirir(self):
+        conn, cursor = sahte_cursor_olustur()
+        main.satinalma_talebi_teslim_alindi_isaretle(cursor, "PP-001")
+        cagri = cursor.execute.call_args_list[0]
+        assert "Teslim Alındı" in cagri.args[0]
+        assert "Onaylandı" in cagri.args[0]
+        assert cagri.args[1] == ("PP-001",)
+
+    def test_hata_olsa_bile_exception_disari_sizmaz(self):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.execute.side_effect = Exception("DB hatası")
+        main.satinalma_talebi_teslim_alindi_isaretle(cursor, "PP-001")  # exception fırlatırsa test başarısız olur
+
+    def test_alis_irsaliyesi_kes_talebi_teslim_aldi_olarak_isaretler(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/alis-irsaliyesi-kes", json={
+            "TedarikciID": 1, "Kalemler": [{"StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 100}]
+        })
+        assert yanit.status_code == 200
+        teslim_cagrisi = [c for c in cursor.execute.call_args_list if "Teslim Alındı" in c.args[0]]
+        assert len(teslim_cagrisi) == 1
 
 
 class _MrpSahteCursor:

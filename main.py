@@ -479,6 +479,7 @@ app.add_middleware(
 _FIYAT_YONETIM_YOLLARI = (
     "/fiyat-listesi-ekle", "/fiyat-listesi-kalem-ekle", "/musteri-fiyat-listesi-ata",
     "/iskonto-kademe-ekle", "/fiyat-onerisi-hesapla", "/urun-maliyeti-kaydet",
+    "/urun-maliyeti-sil",
 )
 
 security = HTTPBearer()
@@ -717,7 +718,16 @@ def log_degisiklik(cursor, tablo_adi: str, kayit_id, alan_adi: str, eski_deger, 
 def yevmiye_fisi_olustur(cursor, aciklama: str, kaynak_modul: str, kaynak_id, satirlar: list, kullanici: str = "Sistem"):
     """Çift taraflı muhasebe kaydı oluşturur. satirlar: [(hesap_kodu, borc, alacak, satir_aciklama), ...]
     Toplam borç ile toplam alacak eşit değilse kayıt reddedilir (temel muhasebe kuralı).
-    Başarılı olursa ilgili hesapların HesapPlani.Bakiye alanını da günceller (Borç-Alacak farkı)."""
+    Başarılı olursa ilgili hesapların HesapPlani.Bakiye alanını da günceller (Borç-Alacak farkı).
+
+    ÖNEMLİ (bölünmüş defter düzeltmesi): Önceden bu fonksiyon SADECE YevmiyeFisleri/
+    YevmiyeSatirlari'na yazıyordu; /fatura-kes ve /pos-tahsilat-ekle ise SADECE
+    HesapHareketleri'ne doğrudan yazıyordu - iki ayrı, birbirini hiç görmeyen defter
+    oluşuyordu (Mizan/Bilanço sadece YevmiyeSatirlari'nı, Mizan Raporu/Kâr-Zarar/
+    Hesap Detayı sadece HesapHareketleri'ni okuyordu - hangi ekranı açtığınıza göre
+    FARKLI ve EKSİK mali tablolar görünüyordu). Artık HER İKİ tabloya da AYNI ANDA
+    yazılıyor - bundan böyle hangi endpoint üzerinden girilirse girilsin, her
+    finansal hareket her iki rapor grubunda da tutarlı şekilde görünür."""
     toplam_borc = sum(s[1] for s in satirlar)
     toplam_alacak = sum(s[2] for s in satirlar)
     if abs(toplam_borc - toplam_alacak) > 0.01:
@@ -727,10 +737,13 @@ def yevmiye_fisi_olustur(cursor, aciklama: str, kaynak_modul: str, kaynak_id, sa
                            OUTPUT inserted.FisID VALUES (?, ?, ?, ?)""",
                        (aciklama, kaynak_modul, str(kaynak_id) if kaynak_id is not None else None, kullanici))
         fis_id = int(cursor.fetchone()[0])
+        fis_no_str = f"YEV-{fis_id}"
         for hesap_kodu, borc, alacak, satir_aciklama in satirlar:
             cursor.execute("INSERT INTO YevmiyeSatirlari (FisID, HesapKodu, Borc, Alacak, Aciklama) VALUES (?, ?, ?, ?, ?)",
                            (fis_id, hesap_kodu, borc, alacak, satir_aciklama))
             cursor.execute("UPDATE HesapPlani SET Bakiye = Bakiye + ? - ? WHERE HesapKodu = ?", (borc, alacak, hesap_kodu))
+            cursor.execute("INSERT INTO HesapHareketleri (HesapKodu, Aciklama, Borc, Alacak, FisNo) VALUES (?, ?, ?, ?, ?)",
+                           (hesap_kodu, satir_aciklama or aciklama, borc, alacak, fis_no_str))
         return fis_id
     except Exception:
         # Yevmiye kaydı, ana işlemi (fatura/tahsilat vb.) bloke etmemeli - hesap planı henüz
@@ -832,6 +845,37 @@ def stok_kullanilabilir_miktar(cursor, stok_kod: str) -> float:
     if not row:
         return 0.0
     return float(row[0]) - float(row[1])
+
+def stok_kalite_kontrol_et(cursor, stok_kod: str, miktar: float):
+    """KRİTİK GÜVENLİK KONTROLÜ: Bu StokKod'a ait, kalite kontrolünde REDDEDİLMİŞ ve
+    hâlâ elde duran (KalanMiktar>0) lot miktarını 'satılabilir' havuzdan çıkarır ve
+    bu satışın o miktara dokunup dokunmadığını kontrol eder.
+
+    ÖNCEDEN bu kontrol SADECE /lot-sevkiyat-ekle (ayrı, izole bir izlenebilirlik
+    ekranı) içinde vardı - asıl satış/sevkiyat yolları (evrak-isleme, fatura-kes,
+    ihraç faturası, toplu faturalama, hızlı barkod çıkışı) bundan tamamen habersizdi,
+    yani kalite kontrolünde REDDEDİLEN bir parti normal fatura ekranından hiçbir
+    engelle karşılaşmadan satılabiliyordu. Bu fonksiyon TÜM bu yollardan çağrılarak
+    o boşluğu kapatır - StokKod bazında (satır bazında lot seçimi gerektirmeden)
+    çalışır: RED lotların toplam KalanMiktar'ı kadar bir miktar satılabilir stoktan
+    daima çıkarılmış sayılır, bu miktara dokunan HİÇBİR satış (hangi ekrandan
+    yapılırsa yapılsın) geçemez."""
+    if not stok_kod or miktar <= 0:
+        return
+    cursor.execute("SELECT ISNULL(SUM(KalanMiktar),0) FROM UretimLotlari WHERE StokKod=? AND KaliteDurumu='RED'", (stok_kod,))
+    red_kalan = float(cursor.fetchone()[0] or 0)
+    if red_kalan <= 0:
+        return
+    cursor.execute("SELECT ISNULL(MevcutMiktar,0) FROM StokKartlari WHERE StokKod=?", (stok_kod,))
+    mevcut_satiri = cursor.fetchone()
+    mevcut = float(mevcut_satiri[0]) if mevcut_satiri else 0.0
+    satilabilir = mevcut - red_kalan
+    if miktar > satilabilir + 0.0001:
+        raise HTTPException(status_code=400, detail=(
+            f"'{stok_kod}' için {red_kalan:g} birim kalite kontrolünde REDDEDİLDİ ve satılabilir stoktan "
+            f"ayrılmış durumda. Bu satış ({miktar:g} birim) reddedilen miktara dokunmadan karşılanamaz "
+            f"(satılabilir miktar: {satilabilir:g}). Lütfen lot/kalite durumunu kontrol edin."
+        ))
 
 def siparis_fatura_tutarlilik_kontrol_et(cursor, siparis_id: int, fatura_id: int, stok_kod: str, stok_adi: str,
                                           fatura_fiyati: float, tolerans_yuzde: float = 1.0):
@@ -1109,14 +1153,15 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (fatura_id, stok_kod, k.urun_ad, k.miktar, k.fiyat, satir_toplami, k.kdv_orani))
                 
+                stok_kalite_kontrol_et(cursor, stok_kod, k.miktar)
                 cursor.execute("""
                     INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Tarih, Aciklama)
                     VALUES (?, 'ÇIKIŞ', ?, ?, ?)
                 """, (stok_kod, k.miktar, db_tarih, f"Satış Faturası #{data.belge_no}"))
-                
+
                 cursor.execute("""
-                    UPDATE StokKartlari 
-                    SET MevcutMiktar = MevcutMiktar - ? 
+                    UPDATE StokKartlari
+                    SET MevcutMiktar = MevcutMiktar - ?
                     WHERE StokKod = ?
                 """, (k.miktar, stok_kod))
                 if stok_kod:
@@ -1268,14 +1313,15 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
                     sk_row = cursor.fetchone()
                     stok_kod = sk_row[0] if sk_row else ""
 
+                stok_kalite_kontrol_et(cursor, stok_kod, k.miktar)
                 cursor.execute("""
                     INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Tarih, Aciklama)
                     VALUES (?, 'ÇIKIŞ', ?, ?, ?)
                 """, (stok_kod, k.miktar, db_tarih, f"Perakende Satış #{data.belge_no}"))
-                
+
                 cursor.execute("""
-                    UPDATE StokKartlari 
-                    SET MevcutMiktar = MevcutMiktar - ? 
+                    UPDATE StokKartlari
+                    SET MevcutMiktar = MevcutMiktar - ?
                     WHERE StokKod = ?
                 """, (k.miktar, stok_kod))
                 if stok_kod:
@@ -1320,14 +1366,15 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
                     sk_row = cursor.fetchone()
                     stok_kod = sk_row[0] if sk_row else ""
 
+                stok_kalite_kontrol_et(cursor, stok_kod, k.miktar)
                 cursor.execute("""
                     INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Tarih, Aciklama)
                     VALUES (?, 'SEVK', ?, ?, ?)
                 """, (stok_kod, k.miktar, db_tarih, f"İrsaliye #{data.belge_no}"))
-                
+
                 cursor.execute("""
-                    UPDATE StokKartlari 
-                    SET MevcutMiktar = MevcutMiktar - ? 
+                    UPDATE StokKartlari
+                    SET MevcutMiktar = MevcutMiktar - ?
                     WHERE StokKod = ?
                 """, (k.miktar, stok_kod))
                 if stok_kod:
@@ -1347,6 +1394,9 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
             }
         }
         
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -2771,7 +2821,7 @@ def _dokuman_kontrol_migrationlari(cursor):
     """, "DokumanVersiyonlari tablosu")
 
 @app.post("/virman-yap")
-def virman_yap(req: VirmanRequest, current_user: dict = Depends(get_current_user)):
+def virman_yap(req: VirmanRequest, current_user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
     if req.CikisHesapID == req.GirisHesapID:
         raise HTTPException(status_code=400, detail="Çıkış ve Giriş hesapları aynı olamaz.")
     if req.Tutar <= 0:
@@ -2839,7 +2889,7 @@ class DemirbasRequest(BaseModel):
     Durumu: Optional[str] = "Aktif"
     Aciklama: Optional[str] = ""
 @app.post("/demirbas-ekle")
-def demirbas_ekle(req: DemirbasRequest, current_user: str = Depends(get_current_user)):
+def demirbas_ekle(req: DemirbasRequest, current_user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
     if req.AlisTutari < 0:
         raise HTTPException(status_code=400, detail="Alış tutarı negatif olamaz.")
 
@@ -3052,25 +3102,20 @@ def pos_tahsilat_ekle(req: PosTahsilatRequest, current_user: str = Depends(get_c
         ))
 
         # --- MALİ ERP MUHASEBE ENTEGRASYONU (YEVMİYE FİŞİ) ---
+        # NOT: Önceden bu blok HesapHareketleri'ne DOĞRUDAN yazıyordu, yevmiye_fisi_olustur'u
+        # hiç kullanmıyordu - bu yüzden POS tahsilatları Mizan/Bilanço gibi YevmiyeSatirlari
+        # okuyan raporlarda HİÇ görünmüyordu (bölünmüş defter sorunu). Artık ortak fonksiyon
+        # kullanılıyor - hem YevmiyeSatirlari'na hem HesapHareketleri'ne aynı anda yazıyor.
         fis_aciklama = f"POS Tahsilat ({firma_adi}): Brüt {req.BrutTutar} TL"
-        fis_no_str = f"POS-{datetime.datetime.now().strftime('%m%d%H%M%S')}"
-
-        # A. 102 Bankalar Hesabı (Net Tutar Kasaya/Bankaya Girer - Borç)
-        cursor.execute("INSERT INTO HesapHareketleri (HesapKodu, Aciklama, Borc, Alacak, FisNo) VALUES ('102', ?, ?, 0, ?)", 
-                       (fis_aciklama, net_tutar, fis_no_str))
-        cursor.execute("UPDATE HesapPlani SET Bakiye = Bakiye + ? WHERE HesapKodu = '102'", (net_tutar,))
-
-        # B. 770 Banka Komisyon Giderleri (Varsa komisyon tutarı gider yazılır - Borç)
         if komisyon_tutari > 0:
             cursor.execute("IF NOT EXISTS (SELECT 1 FROM HesapPlani WHERE HesapKodu='770') INSERT INTO HesapPlani (HesapKodu, HesapAdi, Bakiye) VALUES ('770', 'Genel Yönetim Giderleri (Komisyonlar)', 0)")
-            cursor.execute("INSERT INTO HesapHareketleri (HesapKodu, Aciklama, Borc, Alacak, FisNo) VALUES ('770', ?, ?, 0, ?)", 
-                           (f"POS Komisyonu: {req.Aciklama}", komisyon_tutari, fis_no_str))
-            cursor.execute("UPDATE HesapPlani SET Bakiye = Bakiye + ? WHERE HesapKodu = '770'", (komisyon_tutari,))
-
-        # C. 120 Alıcılar Hesabı (Müşterinin Borcu Brüt Tutar Kadar Düşer - Alacak)
-        cursor.execute("INSERT INTO HesapHareketleri (HesapKodu, Aciklama, Borc, Alacak, FisNo) VALUES ('120', ?, 0, ?, ?)", 
-                       (fis_aciklama, req.BrutTutar, fis_no_str))
-        cursor.execute("UPDATE HesapPlani SET Bakiye = Bakiye - ? WHERE HesapKodu = '120'", (req.BrutTutar,))
+        yevmiye_satirlari = [
+            ("102", net_tutar, 0, "Bankalar - net tahsilat"),
+        ]
+        if komisyon_tutari > 0:
+            yevmiye_satirlari.append(("770", komisyon_tutari, 0, f"POS Komisyonu: {req.Aciklama}"))
+        yevmiye_satirlari.append(("120", 0, req.BrutTutar, "Alıcılar - tahsil edilen"))
+        yevmiye_fisi_olustur(cursor, fis_aciklama, "PosTahsilat", None, yevmiye_satirlari, current_user["username"])
         # --- MUHASEBE ENTEGRASYONU SONU ---
 
         conn.commit()
@@ -3996,6 +4041,7 @@ def ihrac_kayitli_fatura_kes(veri: IhracFaturaKesRequest, user: dict = Depends(y
             cursor.execute("""INSERT INTO FaturaSatirlari (FaturaID, StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami, KdvOrani)
                                VALUES (?, ?, ?, ?, ?, ?, 0)""",
                            (fatura_id, k.StokKod, k.StokAdi, k.Miktar, k.BirimFiyat, k.Miktar * k.BirimFiyat))
+            stok_kalite_kontrol_et(cursor, k.StokKod, k.Miktar)
             cursor.execute("UPDATE StokKartlari SET MevcutMiktar = MevcutMiktar - ? WHERE StokKod = ?", (k.Miktar, k.StokKod))
             cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'ÇIKIŞ', ?, ?)",
                            (k.StokKod, k.Miktar, f"İhraç Kayıtlı Fatura #{fatura_id}"))
@@ -4379,6 +4425,13 @@ def negatif_stok_duzelt(veri: NegatifStokDuzeltRequest, user: dict = Depends(yet
         cursor.execute("UPDATE StokKartlari SET MevcutMiktar=? WHERE StokKod=?", (veri.YeniMiktar, veri.StokKod))
         cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'GİRİŞ', ?, ?)",
                        (veri.StokKod, fark, f"Negatif stok düzeltmesi: {veri.Aciklama or 'açıklama girilmedi'}"))
+        # NOT: Bu endpoint hangi depoda düzeltme yapıldığını sormuyor (StokKartlari.MevcutMiktar
+        # genel toplam üzerinden çalışıyor) - önceden StokDepoMiktarlari hiç güncellenmiyordu,
+        # bu da genel toplam ile depo bazlı toplamın zamanla birbirinden sapmasına (drift)
+        # yol açıyordu. Düzeltme varsayılan depoya yazılır (en azından iki toplam tekrar
+        # eşitlenir); gerçekten başka bir depoda olduğu biliniyorsa Depo Transfer ile
+        # ayrıca dağıtılabilir.
+        depo_stok_guncelle(cursor, veri.StokKod, varsayilan_depo_id(cursor), fark)
 
         fark_tutari = fark * birim_maliyet
         if abs(fark_tutari) > 0.01:
@@ -4618,6 +4671,9 @@ def stok_hizli_hareket(veri: StokHizliHareketRequest, user: dict = Depends(yetki
         if not row:
             raise HTTPException(status_code=404, detail=f"'{veri.Kod}' ile eşleşen bir ürün bulunamadı.")
         stok_kod, stok_adi, mevcut = row[0], row[1], float(row[2])
+
+        if veri.Yon == "CIKIS":
+            stok_kalite_kontrol_et(cursor, stok_kod, veri.Miktar)
 
         miktar_degisim = veri.Miktar if veri.Yon == "GIRIS" else -veri.Miktar
         yeni_mevcut = mevcut + miktar_degisim
@@ -5420,40 +5476,81 @@ def iskonto_kademeleri_getir(user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
-@app.get("/urun-fiyati-hesapla")
-def urun_fiyati_hesapla(stok_kod: str, miktar: float = 1, musteri_id: Optional[int] = None, user: dict = Depends(get_current_user)):
-    """Bir ürünün, verilen müşteri ve miktar için GERÇEK satış fiyatını hesaplar:
+def _fiyat_politikasi_hesapla(cursor, stok_kod: str, musteri_id: Optional[int], miktar: float):
+    """Bir ürünün, verilen müşteri ve miktar için POLİTİKA fiyatını hesaplar - hem
+    /urun-fiyati-hesapla (manuel sorgu) hem de fiyat_politikasi_kontrol_et (sipariş/
+    teklif oluştururken otomatik doğrulama) tarafından ORTAK kullanılır, aynı
+    mantığın iki yerde ayrı yazılıp zamanla sapmasını önlemek için buraya çıkarıldı.
     1) Müşterinin özel bir fiyat listesi varsa ve o listede bu ürün tanımlıysa, o fiyat kullanılır
     2) Yoksa StokKartlari.BirimFiyat (standart fiyat) kullanılır
-    3) Ardından miktar kademeli iskonto (varsa) uygulanır"""
+    3) Ardından miktar kademeli iskonto (varsa) uygulanır
+    Ürün bulunamazsa None döner (çağıran, dilerse 404'e çevirir)."""
+    cursor.execute("SELECT BirimFiyat FROM StokKartlari WHERE StokKod=?", (stok_kod,))
+    row = cursor.fetchone()
+    if not row:
+        return None
+    taban_fiyat = float(row[0])
+    kaynak = "Standart Fiyat"
+
+    if musteri_id:
+        cursor.execute("""SELECT k.Fiyat FROM MusteriFiyatListesi m
+                           JOIN FiyatListesiKalemleri k ON m.ListeID = k.ListeID
+                           WHERE m.MusteriID=? AND k.StokKod=?""", (musteri_id, stok_kod))
+        ozel = cursor.fetchone()
+        if ozel:
+            taban_fiyat = float(ozel[0])
+            kaynak = "Müşteri Özel Fiyat Listesi"
+
+    cursor.execute("SELECT MinMiktar, IskontoOrani FROM IskontoKademeleri WHERE MinMiktar <= ? ORDER BY MinMiktar DESC", (miktar,))
+    kademe = cursor.fetchone()
+    iskonto_orani = float(kademe[1]) if kademe else 0
+    nihai_fiyat = taban_fiyat * (1 - iskonto_orani / 100)
+    return {"TabanFiyat": taban_fiyat, "FiyatKaynagi": kaynak, "IskontoOrani": iskonto_orani, "NihaiFiyat": nihai_fiyat}
+
+@app.get("/urun-fiyati-hesapla")
+def urun_fiyati_hesapla(stok_kod: str, miktar: float = 1, musteri_id: Optional[int] = None, user: dict = Depends(get_current_user)):
+    """Bir ürünün, verilen müşteri ve miktar için GERÇEK satış fiyatını hesaplar -
+    bkz. _fiyat_politikasi_hesapla için tam mantık."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT BirimFiyat FROM StokKartlari WHERE StokKod=?", (stok_kod,))
-        row = cursor.fetchone()
-        if not row:
+        sonuc = _fiyat_politikasi_hesapla(cursor, stok_kod, musteri_id, miktar)
+        if sonuc is None:
             raise HTTPException(status_code=404, detail="Ürün bulunamadı.")
-        taban_fiyat = float(row[0])
-        kaynak = "Standart Fiyat"
-
-        if musteri_id:
-            cursor.execute("""SELECT k.Fiyat FROM MusteriFiyatListesi m
-                               JOIN FiyatListesiKalemleri k ON m.ListeID = k.ListeID
-                               WHERE m.MusteriID=? AND k.StokKod=?""", (musteri_id, stok_kod))
-            ozel = cursor.fetchone()
-            if ozel:
-                taban_fiyat = float(ozel[0])
-                kaynak = "Müşteri Özel Fiyat Listesi"
-
-        cursor.execute("SELECT MinMiktar, IskontoOrani FROM IskontoKademeleri WHERE MinMiktar <= ? ORDER BY MinMiktar DESC", (miktar,))
-        kademe = cursor.fetchone()
-        iskonto_orani = float(kademe[1]) if kademe else 0
-        nihai_fiyat = taban_fiyat * (1 - iskonto_orani / 100)
-
-        return {"StokKod": stok_kod, "TabanFiyat": round(taban_fiyat, 2), "FiyatKaynagi": kaynak,
-                "IskontoOrani": iskonto_orani, "NihaiFiyat": round(nihai_fiyat, 2)}
+        return {"StokKod": stok_kod, "TabanFiyat": round(sonuc["TabanFiyat"], 2), "FiyatKaynagi": sonuc["FiyatKaynagi"],
+                "IskontoOrani": sonuc["IskontoOrani"], "NihaiFiyat": round(sonuc["NihaiFiyat"], 2)}
     finally:
         conn.close()
+
+def fiyat_politikasi_kontrol_et(cursor, stok_kod: str, musteri_id: Optional[int], miktar: float, girilen_fiyat: float, user: dict):
+    """KRİTİK GÜVENLİK KONTROLÜ: Fiyat Listeleri/İskonto Kademeleri ekranları
+    önceden doğru hesaplıyordu ama /siparis-ekle, /siparis-grup-ekle, /teklif-olustur
+    hiçbirinde HİÇ danışılmıyordu - yani bir satış elemanı herhangi bir müşteriye
+    herhangi bir fiyatı sisteme hiçbir engelle karşılaşmadan girebiliyordu ('fiyat
+    politikası' tamamen dekoratifti). Bu fonksiyon, girilen fiyatın politika
+    fiyatının (küçük bir tolerans payıyla) ALTINDA olup olmadığını kontrol eder;
+    öyleyse - tıpkı yetki_kontrol/onay_gerekli_mi'deki tutarlı davranışla aynı
+    şekilde - Yönetici/Master HER ZAMAN geçer (üst yönetim politika dışı özel
+    fiyat verebilir), diğer roller ENGELLENİR (400) ve doğru politika fiyatı
+    mesajda gösterilir. Ürün fiyat politikasına (StokKartlari.BirimFiyat) hiç
+    kayıtlı değilse ya da girilen fiyat politika fiyatına eşit/üzerindeyse
+    sessizce geçer."""
+    if user["rol"] in ("Yönetici", "Master"):
+        return
+    if not stok_kod or girilen_fiyat is None:
+        return
+    politika = _fiyat_politikasi_hesapla(cursor, stok_kod, musteri_id, miktar)
+    if politika is None:
+        return
+    politika_fiyati = politika["NihaiFiyat"]
+    TOLERANS = 0.01
+    if girilen_fiyat + TOLERANS < politika_fiyati:
+        raise HTTPException(status_code=400, detail=(
+            f"'{stok_kod}' için girilen fiyat ({girilen_fiyat:,.2f}) fiyat politikasının "
+            f"({politika_fiyati:,.2f}, kaynak: {politika['FiyatKaynagi']}, iskonto: %{politika['IskontoOrani']:g}) "
+            f"altında. Bu indirim için ya İskonto Kademeleri/Fiyat Listeleri'ni güncelleyin ya da bir "
+            f"Yönetici'nin onaylaması gerekir."
+        ))
 
 @app.get("/belge-zinciri/{tip}/{belge_id}")
 def belge_zinciri_getir(tip: str, belge_id: int, user: dict = Depends(get_current_user)):
@@ -6038,6 +6135,7 @@ def teklif_olustur(veri: TeklifOlusturRequest, background_tasks: BackgroundTasks
         kurlar = guncel_kur_getir()
         toplam_tutar = 0.0
         for k in veri.Kalemler:
+            fiyat_politikasi_kontrol_et(cursor, k.StokKod, veri.MusteriID, k.Miktar, k.BirimFiyat, user)
             satir_tutari = k.Miktar * k.BirimFiyat
             kur = kurlar.get(k.ParaBirimi, 1.0)
             toplam_tutar += satir_tutari * kur
@@ -6329,6 +6427,11 @@ def siparis_toplu_faturaya_cevir(veri: TopluFaturayaCevirRequest, user: dict = D
                 if durum == "Tamamlandı":
                     basarisiz.append({"SiparisID": siparis_id, "Hata": "Bu sipariş zaten faturalanmış."})
                     continue
+                # Fatura satırı/başlığı henüz OLUŞTURULMADAN kontrol ediliyor - aksi halde
+                # bu döngüde rollback yapılmadığı için (tek tek başarısız/başarılı takip
+                # ediliyor) reddedilen bir lot yüzünden hata verirse, o ana kadar eklenmiş
+                # yarım (stoksuz) bir fatura kaydı commit edilmiş olarak kalırdı.
+                stok_kalite_kontrol_et(cursor, stok_kod, miktar)
 
                 cursor.execute("""INSERT INTO Faturalar (MusteriID, Tarih, AraToplam, KdvToplam, ToplamTutar, ParaBirimi, SiparisID)
                                    OUTPUT inserted.FaturaID VALUES (?, GETDATE(), ?, 0, ?, 'TL', ?)""",
@@ -6364,6 +6467,7 @@ def siparis_ekle(siparis: SiparisEkleRequest, user: dict = Depends(yetki_kontrol
     cursor = conn.cursor()
     try:
         toplam = siparis.Miktar * siparis.BirimFiyat
+        fiyat_politikasi_kontrol_et(cursor, siparis.StokKod, siparis.MusteriID, siparis.Miktar, siparis.BirimFiyat, user)
 
         esik, zincir_id = onay_gerekli_mi(cursor, toplam, user)
         if esik:
@@ -6411,6 +6515,8 @@ def siparis_grup_ekle(veri: SiparisGrupEkleRequest, user: dict = Depends(yetki_k
         # eşiği kontrolü ve grup toplamı için TÜMÜ güncel TCMB kuruyla TL'ye çevrilir.
         kurlar = guncel_kur_getir()
         grup_toplam = sum((k.Miktar * k.BirimFiyat) * kurlar.get(k.ParaBirimi, 1.0) for k in veri.Kalemler)
+        for kalem in veri.Kalemler:
+            fiyat_politikasi_kontrol_et(cursor, kalem.StokKod, veri.MusteriID, kalem.Miktar, kalem.BirimFiyat, user)
         esik, zincir_id = onay_gerekli_mi(cursor, grup_toplam, user)
         if esik:
             onay_id = onaya_gonder(cursor, "SiparisGrupEkle", veri.dict(), grup_toplam,
@@ -6583,6 +6689,7 @@ def alis_irsaliyesi_kes(req: AlisIrsaliyeKesRequest, user: dict = Depends(yetki_
             cursor.execute("""INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Tarih, Aciklama)
                                VALUES (?, 'GİRİŞ', ?, GETDATE(), ?)""",
                            (kalem.StokKod, kalem.Miktar, f"Alış İrsaliyesi #{alis_irsaliye_id} - Mal Kabul"))
+            satinalma_talebi_teslim_alindi_isaretle(cursor, kalem.StokKod)
 
         log_islem(cursor, f"Alış irsaliyesi (mal kabul) kesildi: #{alis_irsaliye_id}", user["username"])
         conn.commit()
@@ -6846,12 +6953,23 @@ def fatura_kes(veri: FaturaOlusturRequest, background_tasks: BackgroundTasks, us
                     f"Cari risk limiti aşılıyor! Mevcut bakiye: {net_bakiye:,.2f} TL, "
                     f"bu faturayla: {net_bakiye + genel_toplam:,.2f} TL, limit: {risk_limiti:,.2f} TL."))
 
-        cursor.execute("""INSERT INTO Faturalar (MusteriID, ToplamTutar, AraToplam, KdvToplam, PdfYolu, ParaBirimi)
-                           OUTPUT inserted.FaturaID VALUES (?, ?, ?, ?, 'Gecici', ?)""",
-                       (veri.MusteriID, genel_toplam, ara_toplam, kdv_toplam, veri.ParaBirimi))
+        # NOT: Faturalar.SiparisID TEK bir sipariş referansı tutabiliyor (birden fazla
+        # siparişi tek faturada birleştirmek mümkün olsa da kolon çoklu değer tutmuyor).
+        # Önceden bu kolon HİÇ doldurulmuyordu - bu yüzden Belge Zinciri özelliği (bir
+        # faturadan geriye doğru siparişe/teklife gitme) normal /fatura-kes ile kesilen
+        # faturaların BÜYÜK ÇOĞUNLUĞUNDA hep boş dönüyordu, sadece toplu-faturaya-çevirme
+        # yolunda çalışıyordu. En azından İLK bağlı siparişi damgalayarak (tam kapsamlı
+        # çoklu-sipariş izlenebilirlik için ayrı bir ilişki tablosu gerekir, MVP kapsamı
+        # dışı) asıl kullanım senaryosunun (bir sipariş -> bir fatura) izlenebilir olmasını
+        # sağlıyoruz.
+        birincil_siparis_id = veri.SiparisIDler[0] if veri.SiparisIDler else None
+        cursor.execute("""INSERT INTO Faturalar (MusteriID, ToplamTutar, AraToplam, KdvToplam, PdfYolu, ParaBirimi, SiparisID)
+                           OUTPUT inserted.FaturaID VALUES (?, ?, ?, ?, 'Gecici', ?, ?)""",
+                       (veri.MusteriID, genel_toplam, ara_toplam, kdv_toplam, veri.ParaBirimi, birincil_siparis_id))
         fatura_id = int(cursor.fetchone()[0])
 
         for kalem in veri.Kalemler:
+            stok_kalite_kontrol_et(cursor, kalem.StokKod, kalem.Miktar)
             cursor.execute("""INSERT INTO FaturaSatirlari (FaturaID, StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami, KdvOrani) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                            (fatura_id, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.BirimFiyat, kalem.Miktar * kalem.BirimFiyat, kalem.KdvOrani))
             cursor.execute("UPDATE StokKartlari SET MevcutMiktar = MevcutMiktar - ? WHERE StokKod = ?", (kalem.Miktar, kalem.StokKod))
@@ -6916,25 +7034,20 @@ def fatura_kes(veri: FaturaOlusturRequest, background_tasks: BackgroundTasks, us
         cursor.execute("UPDATE Faturalar SET PdfYolu = ? WHERE FaturaID = ?", (pdf_yolu, fatura_id))
 
         # --- MUHASEBE ENTEGRASYONU (YEVMİYE FİŞİ) BAŞLANGICI ---
+        # NOT: Önceden bu blok HesapHareketleri'ne DOĞRUDAN yazıyordu, yevmiye_fisi_olustur'u
+        # hiç kullanmıyordu - bu yüzden buradan kesilen faturalar Mizan/Bilanço gibi
+        # YevmiyeSatirlari okuyan raporlarda HİÇ görünmüyordu (bölünmüş defter sorunu,
+        # bkz. yevmiye_fisi_olustur docstring'i). Artık ortak fonksiyon kullanılıyor.
         fis_aciklama = f"Fatura Kesimi: {firma_adi}"
-        fis_no_str = f"FT-{fatura_id}"
-        
-        # 1. 120 Alıcılar (Müşteri Borçlanır - Genel Toplam)
-        cursor.execute("INSERT INTO HesapHareketleri (HesapKodu, Aciklama, Borc, Alacak, FisNo) VALUES ('120', ?, ?, 0, ?)", 
-                       (fis_aciklama, genel_toplam, fis_no_str))
-        cursor.execute("UPDATE HesapPlani SET Bakiye = Bakiye + ? WHERE HesapKodu = '120'", (genel_toplam,))
-
-        # 2. 600 Yurtiçi Satışlar (Şirket Geliri - Ara Toplam)
-        cursor.execute("INSERT INTO HesapHareketleri (HesapKodu, Aciklama, Borc, Alacak, FisNo) VALUES ('600', ?, 0, ?, ?)", 
-                       (fis_aciklama, ara_toplam, fis_no_str))
-        cursor.execute("UPDATE HesapPlani SET Bakiye = Bakiye + ? WHERE HesapKodu = '600'", (ara_toplam,))
-
-        # 3. KDV varsa: 391 Hesaplanan KDV (Sisteme yansıtılır)
         if kdv_toplam > 0:
             cursor.execute("IF NOT EXISTS (SELECT 1 FROM HesapPlani WHERE HesapKodu='391') INSERT INTO HesapPlani (HesapKodu, HesapAdi, Bakiye) VALUES ('391', 'Hesaplanan KDV', 0)")
-            cursor.execute("INSERT INTO HesapHareketleri (HesapKodu, Aciklama, Borc, Alacak, FisNo) VALUES ('391', ?, 0, ?, ?)", 
-                           (fis_aciklama, kdv_toplam, fis_no_str))
-            cursor.execute("UPDATE HesapPlani SET Bakiye = Bakiye + ? WHERE HesapKodu = '391'", (kdv_toplam,))
+        yevmiye_satirlari = [
+            ("120", genel_toplam, 0, "Alıcılar - fatura tutarı"),
+            ("600", 0, ara_toplam, "Yurtiçi Satışlar"),
+        ]
+        if kdv_toplam > 0:
+            yevmiye_satirlari.append(("391", 0, kdv_toplam, "Hesaplanan KDV"))
+        yevmiye_fisi_olustur(cursor, fis_aciklama, "SatisFaturasi", fatura_id, yevmiye_satirlari, user["username"])
         # --- MUHASEBE ENTEGRASYONU SONU ---
 
         log_islem(cursor, f"Fatura kesildi: #{fatura_id}", user["username"])
@@ -7243,6 +7356,12 @@ def uretim_emri_tamamla(emir_id: int, veri: UretimTamamlaRequest = UretimTamamla
         # örn. üretim tam olsa bile ayrı bir kalite/fire kaybı yaşandıysa).
         uretilen_miktar = veri.GerceklesenMiktar if veri.GerceklesenMiktar is not None else emir[1]
         fire_miktar = veri.FireMiktar if veri.FireMiktar else max(0, emir[1] - uretilen_miktar)
+        # NOT: Bu üretim akışında hangi depoda çalışıldığı sorulmuyor - önceden bu yüzden
+        # StokDepoMiktarlari HİÇ güncellenmiyordu, bu da genel toplam (StokKartlari.MevcutMiktar)
+        # ile depo bazlı toplamların zamanla birbirinden sapmasına (drift) yol açıyordu.
+        # Varsayılan depo üzerinden senkronize ediliyor - gerçekten başka bir depoda
+        # üretiliyorsa Depo Transfer ile ayrıca dağıtılabilir.
+        uretim_depo_id = varsayilan_depo_id(cursor)
 
         cursor.execute("SELECT MamulKodu FROM UretimReceteleri WHERE ReceteID = ?", (recete_id,))
         mamul_kodu = cursor.fetchone()[0]
@@ -7250,6 +7369,14 @@ def uretim_emri_tamamla(emir_id: int, veri: UretimTamamlaRequest = UretimTamamla
         cursor.execute("SELECT HammaddeKodu, Miktar, FireOrani FROM ReceteBilesenleri WHERE ReceteID = ?", (recete_id,))
         bilesenler = cursor.fetchall()
 
+        # NOT: Önceden üretimde tamamlanan mamulün maliyeti (StokKartlari.OrtalamaMaliyet)
+        # HİÇ hesaplanmıyordu - hammaddeler stoktan düşüyor ama tüketilen değerleri mamule
+        # hiç aktarılmıyordu, mamul maliyeti donuk (elle girilmiş/varsayılan) kalıyordu ve
+        # bu, üretilen ürünler için Kâr Marjı raporlarını yanıltıcı hale getiriyordu. Artık
+        # tüketilen her hammaddenin GÜNCEL ortalama maliyeti toplanıp (işçilik/genel gider
+        # dahil değil - o ayrıca Ürün Maliyeti ekranından manuel eklenebilir) mamulün
+        # ağırlıklı ortalama maliyetine (AVCO) katkı olarak işleniyor.
+        toplam_hammadde_maliyeti = 0.0
         for b in bilesenler:
             hammadde_kodu = b[0]
             birim_miktar = b[1]
@@ -7258,13 +7385,25 @@ def uretim_emri_tamamla(emir_id: int, veri: UretimTamamlaRequest = UretimTamamla
             # eskiden her zaman planlanan miktar kullanıldığı için, üretim eksik/fazla
             # gerçekleşse bile hammadde tüketimi hep aynı (yanlış) rakamla düşülüyordu.
             toplam_hammadde_ihtiyaci = (uretilen_miktar * birim_miktar) * (1 + (fire_orani / 100.0))
+            cursor.execute("SELECT ISNULL(OrtalamaMaliyet, BirimFiyat) FROM StokKartlari WHERE StokKod=?", (hammadde_kodu,))
+            hammadde_maliyet_row = cursor.fetchone()
+            hammadde_birim_maliyet = float(hammadde_maliyet_row[0] or 0) if hammadde_maliyet_row else 0.0
+            toplam_hammadde_maliyeti += toplam_hammadde_ihtiyaci * hammadde_birim_maliyet
             cursor.execute("UPDATE StokKartlari SET MevcutMiktar = MevcutMiktar - ? WHERE StokKod = ?", (toplam_hammadde_ihtiyaci, hammadde_kodu))
             cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'ÇIKIŞ', ?, ?)",
                            (hammadde_kodu, toplam_hammadde_ihtiyaci, f"Üretim #{emir_id} Sarfiyatı"))
+            depo_stok_guncelle(cursor, hammadde_kodu, uretim_depo_id, -toplam_hammadde_ihtiyaci)
+
+        if uretilen_miktar > 0:
+            birim_mamul_maliyeti = toplam_hammadde_maliyeti / uretilen_miktar
+            # stok_ortalama_maliyet_guncelle MevcutMiktar güncellenmeden ÖNCE çağrılmalı
+            # (eski miktarı hâlâ doğru okuyabilmek için) - bkz. fonksiyonun kendi docstring'i.
+            stok_ortalama_maliyet_guncelle(cursor, mamul_kodu, uretilen_miktar, birim_mamul_maliyeti)
 
         cursor.execute("UPDATE StokKartlari SET MevcutMiktar = MevcutMiktar + ? WHERE StokKod = ?", (uretilen_miktar, mamul_kodu))
         cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'GİRİŞ', ?, ?)",
                        (mamul_kodu, uretilen_miktar, f"Üretim #{emir_id} Mamul"))
+        depo_stok_guncelle(cursor, mamul_kodu, uretim_depo_id, uretilen_miktar)
 
         # Her tamamlanan üretim, izlenebilirlik (traceability) için otomatik bir LOT numarası alır.
         # Lot No formatı: LOT-{StokKod}-{YYYYAAGG}-{EmirID} - benzersizliği garanti eder.
@@ -7415,11 +7554,17 @@ def stok_sayim_tamamla(sayim_id: int, user: dict = Depends(yetki_kontrol(["Yöne
                            WHERE SayimID=? AND SayilanMiktar IS NOT NULL AND Fark <> 0""", (sayim_id,))
         farklar = cursor.fetchall()
         toplam_fark_tutari = 0.0
+        sayim_depo_id = varsayilan_depo_id(cursor)
         for stok_kod, sistem_miktar, sayilan_miktar, fark in farklar:
             cursor.execute("UPDATE StokKartlari SET MevcutMiktar=? WHERE StokKod=?", (sayilan_miktar, stok_kod))
             cursor.execute("""INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama)
                                VALUES (?, ?, ?, ?)""",
                            (stok_kod, 'GİRİŞ' if fark > 0 else 'ÇIKIŞ', abs(fark), f"Stok Sayımı #{sayim_id} düzeltmesi"))
+            # NOT: Sayım depo bazlı değil, genel toplam üzerinden yapılıyor - önceden bu
+            # yüzden StokDepoMiktarlari hiç güncellenmiyordu (drift sorunu, bkz. negatif
+            # stok düzeltme ve üretim tamamlama'daki aynı notlar). Varsayılan depo üzerinden
+            # senkronize edilir.
+            depo_stok_guncelle(cursor, stok_kod, sayim_depo_id, fark)
             cursor.execute("SELECT ISNULL(OrtalamaMaliyet, BirimFiyat) FROM StokKartlari WHERE StokKod=?", (stok_kod,))
             maliyet_row = cursor.fetchone()
             birim_maliyet = float(maliyet_row[0]) if maliyet_row and maliyet_row[0] else 0
@@ -8208,6 +8353,8 @@ def konsinye_cikis_ekle(veri: KonsinyeCikisRequest, user: dict = Depends(yetki_k
         if stok[1] < veri.Miktar:
             raise HTTPException(status_code=400, detail=f"Yetersiz stok. Mevcut: {stok[1]:g}")
 
+        stok_kalite_kontrol_et(cursor, veri.StokKod, veri.Miktar)
+
         cursor.execute("""INSERT INTO KonsinyeStoklar (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, Aciklama, KullaniciAdi)
                            OUTPUT inserted.KonsinyeID VALUES (?, ?, ?, ?, ?, ?, ?)""",
                        (veri.MusteriID, veri.StokKod, stok[0], veri.Miktar, veri.BirimFiyat, veri.Aciklama, user["username"]))
@@ -8363,15 +8510,40 @@ def banka_hareket_ekle(veri: BankaHareketiEkle, user: dict = Depends(yetki_kontr
             INSERT INTO BankaHareketleri (HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (veri.HesapID, veri.MusteriID, veri.TedarikciID, veri.IslemTuru, veri.Tutar, veri.Aciklama))
-        
+
+        # NOT: Önceden banka hareketleri sadece BankaHesaplari.Bakiye'yi güncelliyordu,
+        # muhasebeye (yevmiyeye) HİÇ işlenmiyordu - Mizan/Bilanço'da izi kalmıyordu.
+        # Karşı hesap, hareketin bağlı olduğu tarafa göre belirlenir: müşteri verilmişse
+        # 120 Alıcılar, tedarikçi verilmişse 320 Satıcılar, ikisi de yoksa tanımsız bir
+        # genel gelir/gider (649/770) olarak kaydedilir - yine de HER ZAMAN dengeli,
+        # gerçek bir kayıt oluşur.
         if veri.IslemTuru == 'Gelen Havale':
             cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID = ?", (veri.Tutar, veri.HesapID))
             if veri.MusteriID:
                 cursor.execute("INSERT INTO Tahsilatlar (MusteriID, Tutar, OdemeTuru, Aciklama) VALUES (?, ?, 'Banka Havalesi', ?)",
                                (veri.MusteriID, veri.Tutar, veri.Aciklama))
+                karsi_hesap, karsi_aciklama = "120", "Alıcılar - banka havalesi ile tahsilat"
+            elif veri.TedarikciID:
+                karsi_hesap, karsi_aciklama = "320", "Satıcılar - gelen iade/fazla ödeme"
+            else:
+                karsi_hesap, karsi_aciklama = "649", "Diğer Olağan Gelirler - tanımsız banka girişi"
+            yevmiye_fisi_olustur(cursor, f"Gelen Havale: {veri.Aciklama or veri.IslemTuru}", "BankaHareketi", veri.HesapID, [
+                ("102", veri.Tutar, 0, "Bankalar - gelen havale"),
+                (karsi_hesap, 0, veri.Tutar, karsi_aciklama),
+            ], user["username"])
         elif veri.IslemTuru == 'Giden Havale':
             cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye - ? WHERE HesapID = ?", (veri.Tutar, veri.HesapID))
-            
+            if veri.TedarikciID:
+                karsi_hesap, karsi_aciklama = "320", "Satıcılar - banka havalesi ile ödeme"
+            elif veri.MusteriID:
+                karsi_hesap, karsi_aciklama = "120", "Alıcılar - müşteriye iade"
+            else:
+                karsi_hesap, karsi_aciklama = "770", "Genel Yönetim Giderleri - tanımsız banka çıkışı"
+            yevmiye_fisi_olustur(cursor, f"Giden Havale: {veri.Aciklama or veri.IslemTuru}", "BankaHareketi", veri.HesapID, [
+                (karsi_hesap, veri.Tutar, 0, karsi_aciklama),
+                ("102", 0, veri.Tutar, "Bankalar - giden havale"),
+            ], user["username"])
+
         log_islem(cursor, f"Banka Hareketi: {veri.IslemTuru} - {veri.Tutar} TL", user["username"])
         conn.commit()
         return {"mesaj": "Banka hareketi işlendi."}
@@ -8390,6 +8562,14 @@ def cek_senet_ekle(veri: CekSenetEkle, user: dict = Depends(yetki_kontrol(["Yön
             INSERT INTO CekSenetKartlari (EvrakTipi, EvrakNo, AlinanMusteriID, Tutar, VadeTarihi, BankaBilgisi)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (veri.EvrakTipi, veri.EvrakNo, veri.AlinanMusteriID, veri.Tutar, veri.VadeTarihi, veri.BankaBilgisi))
+        # NOT: Önceden çek/senet kabulü hiç muhasebeye (yevmiyeye) işlenmiyordu - portföye
+        # giriyordu ama Mizan/Bilanço'da hiçbir iz bırakmıyordu. Müşteriden nakit yerine
+        # çek/senet alınması, o müşterinin borcunun (120) bir tahsilat aracıyla (101 Alınan
+        # Çekler ve Senetler) karşılanması demektir - gerçek bir muhasebe olayıdır.
+        yevmiye_fisi_olustur(cursor, f"Çek/Senet Kabulü: {veri.EvrakNo}", "CekSenetKabul", veri.EvrakNo, [
+            ("101", veri.Tutar, 0, f"Alınan Çekler ve Senetler - {veri.EvrakNo}"),
+            ("120", 0, veri.Tutar, f"Alıcılar - {veri.EvrakNo} ile tahsil"),
+        ], user["username"])
         log_islem(cursor, f"Yeni Çek/Senet eklendi: {veri.EvrakNo}", user["username"])
         conn.commit()
         return {"mesaj": "Evrak portföye eklendi."}
@@ -8417,12 +8597,25 @@ def cek_senet_ciro(veri: CekSenetCiro, user: dict = Depends(yetki_kontrol(["Yön
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("UPDATE CekSenetKartlari SET Durum = 'Ciro Edildi', VerilenTedarikciID = ? WHERE EvrakID = ?", (veri.VerilenTedarikciID, veri.EvrakID))
-        if cursor.rowcount == 0:
+        cursor.execute("SELECT EvrakNo, Tutar FROM CekSenetKartlari WHERE EvrakID=?", (veri.EvrakID,))
+        evrak = cursor.fetchone()
+        if not evrak:
             raise HTTPException(status_code=404, detail="Evrak bulunamadı.")
+        evrak_no, tutar = evrak[0], float(evrak[1])
+
+        cursor.execute("UPDATE CekSenetKartlari SET Durum = 'Ciro Edildi', VerilenTedarikciID = ? WHERE EvrakID = ?", (veri.VerilenTedarikciID, veri.EvrakID))
+        # Elde tutulan bir çekin tedarikçiye ciro edilmesi (ödeme yerine devredilmesi):
+        # 101 Alınan Çekler'den çıkar, o tedarikçiye olan borcumuzu (320) kapatır.
+        yevmiye_fisi_olustur(cursor, f"Çek/Senet Cirosu: {evrak_no}", "CekSenetCiro", veri.EvrakID, [
+            ("320", tutar, 0, f"Satıcılar - {evrak_no} ile ödeme"),
+            ("101", 0, tutar, f"Alınan Çekler ve Senetler - {evrak_no} cirosu"),
+        ], user["username"])
         log_islem(cursor, f"Evrak ciro edildi: #{veri.EvrakID}", user["username"])
         conn.commit()
         return {"mesaj": "Evrak ciro edildi."}
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -8437,6 +8630,25 @@ def _satinalma_talebi_olustur(cursor, stok_kod: str, miktar: float, aciklama: st
     cursor.execute("INSERT INTO SatinAlmaTalepleri (StokKod, Miktar, Aciklama, TalepEden) OUTPUT inserted.TalepID VALUES (?, ?, ?, ?)",
                    (stok_kod, miktar, aciklama, talep_eden))
     return int(cursor.fetchone()[0])
+
+def satinalma_talebi_teslim_alindi_isaretle(cursor, stok_kod: str):
+    """Bir ürün fiilen depoya girdiğinde (alış irsaliyesi/faturası), o ürün için
+    ONAYLANMIŞ ama henüz teslim alınmamış EN ESKİ satınalma talebini 'Teslim Alındı'
+    durumuna çeker.
+
+    NEDEN GEREKLİ: Şemada gerçek bir mal kabul/GRN ilişkisi (hangi teslimat hangi
+    talebi karşıladı) yok - bu fonksiyon StokKod eşleşmesiyle EN ESKİ onaylı talebi
+    kapatan basit bir yaklaşıklıktır (FIFO). ÖNCEDEN bu hiç yapılmıyordu - onaylanan
+    bir talep mal fiilen geldikten SONRA BİLE sonsuza kadar 'Onaylandı' kalıyordu ve
+    MRP (_mrp_hesapla, Durum='Onaylandı' talepleri hep 'yolda/gelecek arz' sayıyor)
+    bu talebi hep tekrar tekrar 'gelecek' arz olarak sayıp gerçek eksik miktarı
+    OLDUĞUNDAN AZ göstermeye devam ediyordu."""
+    try:
+        cursor.execute("""UPDATE SatinAlmaTalepleri SET Durum='Teslim Alındı'
+                           WHERE TalepID = (SELECT TOP 1 TalepID FROM SatinAlmaTalepleri
+                                             WHERE StokKod=? AND Durum='Onaylandı' ORDER BY Tarih ASC)""", (stok_kod,))
+    except Exception:
+        pass
 
 @app.post("/satinalma-talep-ekle")
 def satinalma_talep_ekle(veri: SatinAlmaTalepEkle, user: dict = Depends(get_current_user)):
@@ -9024,6 +9236,7 @@ def alis_faturasi_gir(veri: AlisFaturaEkle, user: dict = Depends(yetki_kontrol([
         depo_stok_guncelle(cursor, veri.StokKod, (veri.DepoID or varsayilan_depo_id(cursor)), veri.Miktar)
         cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'GİRİŞ', ?, ?)",
                        (veri.StokKod, veri.Miktar, f"Alış Faturası: {veri.FaturaNo}"))
+        satinalma_talebi_teslim_alindi_isaretle(cursor, veri.StokKod)
         yevmiye_fisi_olustur(cursor, f"Alış Faturası: {veri.FaturaNo}", "AlisFaturasi", fatura_id, [
             ("153", satir_toplami, 0, "Ticari Mallar - alış"),
             ("320", 0, satir_toplami, "Satıcılar"),
