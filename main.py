@@ -2554,6 +2554,15 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _butce_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Bütçe migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -2947,6 +2956,114 @@ def _imza_migrationlari(cursor):
             Not_ NVARCHAR(500) NULL
         )
     """, "ImzaTalebiImzacilari tablosu")
+
+def _butce_migrationlari(cursor):
+    """Bütçe Yönetimi (Hesap Planı bazlı aylık hedef/gerçekleşen karşılaştırma) için
+    tablo eklemesi - diğer yeni özellik migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ButceHedefleri' and xtype='U')
+        CREATE TABLE ButceHedefleri (
+            ButceID INT IDENTITY(1,1) PRIMARY KEY,
+            Yil INT NOT NULL,
+            Ay INT NOT NULL,
+            HesapKodu VARCHAR(20) NOT NULL FOREIGN KEY REFERENCES HesapPlani(HesapKodu),
+            HedefTutar DECIMAL(18,2) NOT NULL,
+            OlusturanKullanici NVARCHAR(50) NULL,
+            GuncellemeTarihi DATETIME NOT NULL DEFAULT GETDATE(),
+            CONSTRAINT UQ_Butce_YilAyHesap UNIQUE (Yil, Ay, HesapKodu)
+        )
+    """, "ButceHedefleri tablosu")
+
+def butce_gerceklesen_hesapla(cursor, hesap_kodu: str, yil: int, ay: int) -> float:
+    """Bir hesap kodunun belirli bir ay içindeki gerçekleşen tutarını HesapHareketleri'nden
+    hesaplar. Gelir hesapları (6 ile başlayanlar, /kar-zarar-tablosu'ndaki (main.py ~3362)
+    aynı 6%/7% ayrımı) alacak-natured olduğundan işareti ters çevrilir - böylece "500.000 TL
+    satış hedefi" gibi doğal pozitif bir hedefle karşılaştırılabilir; gider/varlık hesapları
+    borç-natured olduğundan olduğu gibi bırakılır."""
+    cursor.execute("""
+        SELECT ISNULL(SUM(Borc), 0), ISNULL(SUM(Alacak), 0) FROM HesapHareketleri
+        WHERE HesapKodu = ? AND YEAR(Tarih) = ? AND MONTH(Tarih) = ?
+    """, (hesap_kodu, yil, ay))
+    row = cursor.fetchone()
+    toplam_borc, toplam_alacak = (float(row[0]), float(row[1])) if row else (0.0, 0.0)
+    if hesap_kodu.startswith("6"):
+        return toplam_alacak - toplam_borc
+    return toplam_borc - toplam_alacak
+
+class ButceHedefiRequest(BaseModel):
+    Yil: int = Field(ge=2000, le=2100)
+    Ay: int = Field(ge=1, le=12)
+    HesapKodu: str
+    HedefTutar: float
+
+@app.post("/butce-hedefi-belirle")
+def butce_hedefi_belirle(veri: ButceHedefiRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 FROM HesapPlani WHERE HesapKodu=?", (veri.HesapKodu,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Hesap kodu bulunamadı.")
+        cursor.execute("SELECT ButceID FROM ButceHedefleri WHERE Yil=? AND Ay=? AND HesapKodu=?", (veri.Yil, veri.Ay, veri.HesapKodu))
+        mevcut = cursor.fetchone()
+        if mevcut:
+            cursor.execute("UPDATE ButceHedefleri SET HedefTutar=?, OlusturanKullanici=?, GuncellemeTarihi=GETDATE() WHERE ButceID=?",
+                           (veri.HedefTutar, user["username"], mevcut[0]))
+        else:
+            cursor.execute("""INSERT INTO ButceHedefleri (Yil, Ay, HesapKodu, HedefTutar, OlusturanKullanici)
+                               VALUES (?, ?, ?, ?, ?)""", (veri.Yil, veri.Ay, veri.HesapKodu, veri.HedefTutar, user["username"]))
+        log_islem(cursor, f"Bütçe hedefi belirlendi: {veri.HesapKodu} {veri.Ay}/{veri.Yil} - {veri.HedefTutar:,.2f} TL", user["username"])
+        conn.commit()
+        return {"mesaj": "Bütçe hedefi kaydedildi."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/butce-raporu")
+def butce_raporu(yil: int, ay: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans", "Patron"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT b.ButceID, b.HesapKodu, h.HesapAdi, b.HedefTutar
+            FROM ButceHedefleri b JOIN HesapPlani h ON b.HesapKodu = h.HesapKodu
+            WHERE b.Yil=? AND b.Ay=? ORDER BY b.HesapKodu
+        """, (yil, ay))
+        satirlar = cursor.fetchall()
+        rapor = []
+        for butce_id, hesap_kodu, hesap_adi, hedef in satirlar:
+            gerceklesen = butce_gerceklesen_hesapla(cursor, hesap_kodu, yil, ay)
+            hedef = float(hedef)
+            fark = gerceklesen - hedef
+            fark_yuzde = (fark / hedef * 100) if hedef != 0 else 0.0
+            rapor.append({"ButceID": butce_id, "HesapKodu": hesap_kodu, "HesapAdi": hesap_adi, "HedefTutar": hedef,
+                          "Gerceklesen": gerceklesen, "Fark": fark, "FarkYuzde": fark_yuzde})
+        return {"rapor": rapor}
+    finally:
+        conn.close()
+
+@app.delete("/butce-hedefi-sil/{butce_id}")
+def butce_hedefi_sil(butce_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM ButceHedefleri WHERE ButceID=?", (butce_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Bütçe hedefi bulunamadı.")
+        log_islem(cursor, f"Bütçe hedefi silindi: ID {butce_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Bütçe hedefi silindi."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
 
 @app.post("/virman-yap")
 def virman_yap(req: VirmanRequest, current_user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):

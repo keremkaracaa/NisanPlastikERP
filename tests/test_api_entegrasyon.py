@@ -1397,6 +1397,74 @@ class _MrpSahteCursor:
         return [] if self._son_sonuc is None else [self._son_sonuc]
 
 
+class TestButceYonetimi:
+    """Bütçe Yönetimi önceden hiç yoktu - Hesap Planı bazlı aylık hedef/gerçekleşen
+    karşılaştırma için sıfırdan eklendi. Gerçekleşen, HesapHareketleri'nden hesaplanır;
+    gelir hesapları (6xx) alacak-natured olduğundan işareti ters çevrilir."""
+
+    def test_gelir_hesabinda_isaret_ters_cevrilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1000.0, 5000.0))  # Borc=1000, Alacak=5000
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        sonuc = main.butce_gerceklesen_hesapla(cursor, "600", 2026, 9)
+        assert sonuc == 4000.0  # Alacak - Borc (gelir hesabı)
+
+    def test_gider_hesabinda_isaret_degismez(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(7000.0, 500.0))  # Borc=7000, Alacak=500
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        sonuc = main.butce_gerceklesen_hesapla(cursor, "770", 2026, 9)
+        assert sonuc == 6500.0  # Borc - Alacak (gider hesabı)
+
+    def test_hedef_yoksa_insert_yapilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1,), None]  # HesapPlani var, ButceHedefleri yok
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/butce-hedefi-belirle", json={"Yil": 2026, "Ay": 9, "HesapKodu": "600", "HedefTutar": 500000})
+        assert yanit.status_code == 200
+        insert_cagrisi = [c for c in cursor.execute.call_args_list if "INSERT INTO ButceHedefleri" in c.args[0]]
+        assert len(insert_cagrisi) == 1
+
+    def test_hedef_varsa_update_yapilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1,), (7,)]  # HesapPlani var, ButceHedefleri var (ButceID=7)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/butce-hedefi-belirle", json={"Yil": 2026, "Ay": 9, "HesapKodu": "600", "HedefTutar": 600000})
+        assert yanit.status_code == 200
+        update_cagrisi = [c for c in cursor.execute.call_args_list if "UPDATE ButceHedefleri" in c.args[0]]
+        assert len(update_cagrisi) == 1
+
+    def test_gecersiz_hesap_kodunda_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/butce-hedefi-belirle", json={"Yil": 2026, "Ay": 9, "HesapKodu": "999", "HedefTutar": 100})
+        assert yanit.status_code == 404
+
+    def test_rapor_fark_dogru_hesaplanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[(1, "600", "Yurtiçi Satışlar", 500000.0)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "butce_gerceklesen_hesapla", lambda cursor, kod, yil, ay: 450000.0)
+
+        yanit = client.get("/butce-raporu", params={"yil": 2026, "ay": 9})
+        assert yanit.status_code == 200
+        satir = yanit.json()["rapor"][0]
+        assert satir["Fark"] == -50000.0
+        assert round(satir["FarkYuzde"], 1) == -10.0
+
+    def test_hedefi_belirle_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/butce-hedefi-belirle", json={"Yil": 2026, "Ay": 9, "HesapKodu": "600", "HedefTutar": 100})
+        assert yanit.status_code in (401, 403)
+
+    def test_rapor_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/butce-raporu", params={"yil": 2026, "ay": 9})
+        assert yanit.status_code in (401, 403)
+
+
 class TestMrpHesapla:
     """_mrp_hesapla/_mrp_bilesen_patlat'ı doğrudan (HTTP katmanı olmadan) test eder -
     MRP birden çok sorgu adımından oluştuğu için bu, HTTP üzerinden mock'lamaktan

@@ -3430,6 +3430,125 @@ class MainApp(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def init_butce(self):
+        frame = self.tab_butce
+        ust = ctk.CTkFrame(frame, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="📊 Bütçe Yönetimi (Hesap Planı Bazlı)", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+
+        form_cerceve = ctk.CTkFrame(frame, fg_color=RENK_KART, corner_radius=8)
+        form_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(form_cerceve, text="Bütçe Hedefi Belirle", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        form_satiri = ctk.CTkFrame(form_cerceve, fg_color="transparent")
+        form_satiri.pack(fill="x", padx=10, pady=(0, 10))
+
+        simdi = datetime.datetime.now()
+        self.bt_yil = ctk.CTkEntry(form_satiri, placeholder_text="Yıl", width=80)
+        self.bt_yil.insert(0, str(simdi.year))
+        self.bt_yil.pack(side="left", padx=(0, 8))
+        self.bt_ay = ctk.CTkOptionMenu(form_satiri, values=[str(i) for i in range(1, 13)], width=70)
+        self.bt_ay.set(str(simdi.month))
+        self.bt_ay.pack(side="left", padx=(0, 8))
+        self.bt_hesap_secim = ctk.CTkOptionMenu(form_satiri, values=["Yükleniyor..."], width=220)
+        self.bt_hesap_secim.pack(side="left", padx=(0, 8))
+        self.bt_hedef_tutar = ctk.CTkEntry(form_satiri, placeholder_text="Hedef Tutar (TL)", width=150)
+        self.bt_hedef_tutar.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(form_satiri, text="💾 Hedefi Kaydet", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.butce_hedefi_kaydet_islem).pack(side="left")
+
+        rapor_ust = ctk.CTkFrame(frame, fg_color="transparent")
+        rapor_ust.pack(fill="x", padx=20, pady=(0, 5))
+        ctk.CTkLabel(rapor_ust, text="Bütçe Raporu", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkButton(rapor_ust, text="🔄 Raporu Getir", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=self.butce_raporu_yukle).pack(side="left", padx=10)
+        ctk.CTkButton(rapor_ust, text="🗑️ Seçili Hedefi Sil", fg_color="#ef4444", hover_color="#b91c1c",
+                      command=self.butce_hedefi_sil_islem).pack(side="left")
+
+        rapor_cerceve, self.butce_tree = tablo_olustur(
+            frame, ["Hesap Kodu", "Hesap Adı", "Hedef", "Gerçekleşen", "Fark", "Fark %"],
+            [90, 200, 120, 120, 120, 90], height=14)
+        rapor_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.butce_tree.tag_configure("dusuk_marj", foreground="#ef4444")
+
+        self._bt_hesap_cache = []
+        self.butce_hesap_secenekleri_yukle()
+        self.butce_raporu_yukle()
+
+    def butce_hesap_secenekleri_yukle(self):
+        try:
+            res = requests.get(f"{API}/hesap-plani", headers=self.req_headers(), timeout=5)
+            hesaplar = res.json() if res.status_code == 200 else []
+            self._bt_hesap_cache = hesaplar
+            secenekler = [f"{h['HesapKodu']} - {h['HesapAdi']}" for h in hesaplar] or ["Hesap Yok"]
+            self.bt_hesap_secim.configure(values=secenekler)
+            if hesaplar:
+                self.bt_hesap_secim.set(secenekler[0])
+        except Exception:
+            pass
+
+    def butce_hedefi_kaydet_islem(self):
+        secim = self.bt_hesap_secim.get()
+        hesap_kodu = secim.split(" - ")[0] if " - " in secim else None
+        if not hesap_kodu:
+            messagebox.showwarning("Eksik Bilgi", "Bir hesap seçin.")
+            return
+        try:
+            yil, ay = int(self.bt_yil.get()), int(self.bt_ay.get())
+            hedef = float(self.bt_hedef_tutar.get())
+        except ValueError:
+            messagebox.showwarning("Eksik/Hatalı Bilgi", "Yıl, Ay ve Hedef Tutar sayısal olmalıdır.")
+            return
+        try:
+            res = requests.post(f"{API}/butce-hedefi-belirle", json={"Yil": yil, "Ay": ay, "HesapKodu": hesap_kodu, "HedefTutar": hedef},
+                                 headers=self.req_headers(), timeout=6)
+            if res.status_code == 200:
+                self.bt_hedef_tutar.delete(0, "end")
+                self.butce_raporu_yukle()
+                messagebox.showinfo("Başarılı", "Bütçe hedefi kaydedildi.")
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def butce_raporu_yukle(self):
+        try:
+            yil, ay = int(self.bt_yil.get()), int(self.bt_ay.get())
+        except ValueError:
+            return
+        for i in self.butce_tree.get_children():
+            self.butce_tree.delete(i)
+        try:
+            res = requests.get(f"{API}/butce-raporu", params={"yil": yil, "ay": ay}, headers=self.req_headers(), timeout=6)
+            if res.status_code != 200:
+                self.api_hata_goster(res)
+                return
+            for satir in res.json().get("rapor", []):
+                # Gelir hesabında (6xx) hedefin altında kalmak, gider/diğer hesaplarda
+                # hedefi aşmak olumsuz sayılır - ikisi de kırmızı vurgulanır.
+                olumsuz = satir["Fark"] < 0 if satir["HesapKodu"].startswith("6") else satir["Fark"] > 0
+                etiket = "dusuk_marj" if olumsuz else ""
+                self.butce_tree.insert("", "end", iid=str(satir["ButceID"]), tags=(etiket,),
+                    values=(satir["HesapKodu"], satir["HesapAdi"], f"{satir['HedefTutar']:,.2f}",
+                            f"{satir['Gerceklesen']:,.2f}", f"{satir['Fark']:,.2f}", f"%{satir['FarkYuzde']:.1f}"))
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def butce_hedefi_sil_islem(self):
+        secili = self.butce_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen silmek için bir bütçe hedefi seçin.")
+            return
+        if not messagebox.askyesno("Onay", "Seçili bütçe hedefi kalıcı olarak silinecek. Emin misiniz?"):
+            return
+        try:
+            res = requests.delete(f"{API}/butce-hedefi-sil/{secili[0]}", headers=self.req_headers(), timeout=6)
+            if res.status_code == 200:
+                self.butce_raporu_yukle()
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
     def init_mali_tablolar(self):
         ust = ctk.CTkFrame(self.tab_mali_tablolar, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
@@ -5022,6 +5141,7 @@ class MainApp(ctk.CTkToplevel):
             self.tab_yevmiye = yeni_sekme("📖 Yevmiye Defteri")
             self.tab_mizan = yeni_sekme("⚖️ Mizan")
             self.tab_mali_tablolar = yeni_sekme("📊 Mali Tablolar")
+            self.tab_butce = yeni_sekme("📊 Bütçe")
             self.tab_diger_fisler = yeni_sekme("📋 Diğer Muhasebe Fişleri")
             self.init_hesap_plani()
             self.init_masraf()
@@ -5030,6 +5150,7 @@ class MainApp(ctk.CTkToplevel):
             self.init_yevmiye()
             self.init_mizan()
             self.init_mali_tablolar()
+            self.init_butce()
             self.init_diger_fisler()
 
             kategori_basligi("FATURALAR")
