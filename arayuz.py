@@ -3074,7 +3074,62 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkLabel(eposta_cerceve, text="Not: Gmail kullanıyorsanız normal şifreniz değil, Google hesabınızdan oluşturduğunuz 'Uygulama Şifresi' girilmelidir.",
                      font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 10))
 
+        efatura_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=8)
+        efatura_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(efatura_cerceve, text="e-Fatura/e-Arşiv Entegratör Ayarları",
+                     font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        efatura_satiri1 = ctk.CTkFrame(efatura_cerceve, fg_color="transparent")
+        efatura_satiri1.pack(fill="x", padx=10, pady=(0, 5))
+        self.efatura_url_entry = ctk.CTkEntry(efatura_satiri1, placeholder_text="Entegratör API URL", width=280)
+        self.efatura_url_entry.pack(side="left", padx=(0, 8))
+        self.efatura_kullanici_entry = ctk.CTkEntry(efatura_satiri1, placeholder_text="Kullanıcı Adı", width=160)
+        self.efatura_kullanici_entry.pack(side="left", padx=(0, 8))
+        self.efatura_apikey_entry = ctk.CTkEntry(efatura_satiri1, placeholder_text="API Key", width=180, show="•")
+        self.efatura_apikey_entry.pack(side="left", padx=(0, 8))
+        efatura_satiri2 = ctk.CTkFrame(efatura_cerceve, fg_color="transparent")
+        efatura_satiri2.pack(fill="x", padx=10, pady=(0, 10))
+        self.efatura_seri_entry = ctk.CTkEntry(efatura_satiri2, placeholder_text="Seri Kodu (örn. NIS)", width=160)
+        self.efatura_seri_entry.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(efatura_satiri2, text="Kaydet", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.efatura_ayarlarini_kaydet).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(efatura_cerceve,
+                     text="Not: Bu ayarlar sadece XML'in gönderileceği entegratör bağlantısını tanımlar - gerçek GİB\n"
+                          "iletimi/imzalama için özel bir entegratörle (Uyumsoft, Foriba, Logo vb.) sözleşme yapılmalıdır.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=10, pady=(0, 10))
+
         self._eposta_ayarlarini_yukle()
+        self._efatura_ayarlarini_yukle()
+
+    def _efatura_ayarlarini_yukle(self):
+        try:
+            res = requests.get(f"{API}/sistem-ayarlari", headers=self.req_headers(), timeout=5)
+            ayarlar = res.json().get("ayarlar", {})
+            self.efatura_url_entry.delete(0, "end")
+            self.efatura_url_entry.insert(0, ayarlar.get("EFaturaEntegratorURL", ""))
+            self.efatura_kullanici_entry.delete(0, "end")
+            self.efatura_kullanici_entry.insert(0, ayarlar.get("EFaturaKullaniciAdi", ""))
+            self.efatura_seri_entry.delete(0, "end")
+            self.efatura_seri_entry.insert(0, ayarlar.get("EFaturaSeriKodu", "NIS"))
+            if ayarlar.get("EFaturaApiKey"):
+                self.efatura_apikey_entry.configure(placeholder_text="•••••••••••• (kayıtlı, değiştirmek için yeniden yazın)")
+        except Exception:
+            pass
+
+    def efatura_ayarlarini_kaydet(self):
+        url = self.efatura_url_entry.get().strip()
+        kullanici = self.efatura_kullanici_entry.get().strip()
+        apikey = self.efatura_apikey_entry.get().strip()
+        seri = self.efatura_seri_entry.get().strip() or "NIS"
+        try:
+            requests.put(f"{API}/sistem-ayarlari/EFaturaEntegratorURL", params={"deger": url}, headers=self.req_headers(), timeout=5)
+            requests.put(f"{API}/sistem-ayarlari/EFaturaKullaniciAdi", params={"deger": kullanici}, headers=self.req_headers(), timeout=5)
+            requests.put(f"{API}/sistem-ayarlari/EFaturaSeriKodu", params={"deger": seri}, headers=self.req_headers(), timeout=5)
+            if apikey:
+                requests.put(f"{API}/sistem-ayarlari/EFaturaApiKey", params={"deger": apikey}, headers=self.req_headers(), timeout=5)
+            messagebox.showinfo("Başarılı", "e-Fatura entegratör ayarları kaydedildi.")
+            self._efatura_ayarlarini_yukle()
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def _eposta_ayarlarini_yukle(self):
         try:
@@ -4801,10 +4856,12 @@ class MainApp(ctk.CTkToplevel):
             self.tab_uretim_fisi = yeni_sekme("🧾 Üretim Sipariş Fişi")
             self.tab_uretim_planlama = yeni_sekme("📅 Üretim Planlama")
             self.tab_lot_takibi = yeni_sekme("🏷️ Lot Takibi")
+            self.tab_kalite_kontrol = yeni_sekme("✅ Kalite Kontrol")
             self.init_uretim()
             self.init_uretim_fisi()
             self.init_uretim_planlama()
             self.init_lot_takibi()
+            self.init_kalite_kontrol()
 
         if self.rol in ["Yönetici", "Master", "Üretim", "Depo", "Satınalma"]:
             if self.rol not in ["Yönetici", "Üretim", "Patron"]:
@@ -4825,6 +4882,10 @@ class MainApp(ctk.CTkToplevel):
             self.tab_alis_irsaliye = yeni_sekme("📥 Alış İrsaliyesi")
             self.init_satinalma()
             self.init_alis_irsaliye()
+
+        if self.rol in ["Yönetici", "Master", "Satınalma", "Üretim"]:
+            self.tab_mrp = yeni_sekme("📐 MRP Planlama")
+            self.init_mrp()
 
         if self.rol in ["Yönetici", "Master", "Satış", "Muhasebe", "Üretim", "Patron"]:
             kategori_basligi("ÜRÜN & MALİYET")
@@ -6164,8 +6225,8 @@ class MainApp(ctk.CTkToplevel):
                      font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         liste_cerceve, self.lot_tree = tablo_olustur(
-            self.tab_lot_takibi, ["Lot No", "Ürün", "Üretim Emri", "Üretilen", "Kalan", "Üretim Tarihi"],
-            [220, 180, 90, 90, 90, 140], height=8)
+            self.tab_lot_takibi, ["Lot No", "Ürün", "Üretim Emri", "Üretilen", "Kalan", "Üretim Tarihi", "Kalite Durumu"],
+            [200, 160, 90, 80, 80, 130, 100], height=8)
         liste_cerceve.pack(fill="x", padx=20, pady=(0, 10))
         self.lot_tree.bind("<Double-Button-1>", self.lot_sevkiyat_gecmisi_goster)
 
@@ -6216,18 +6277,19 @@ class MainApp(ctk.CTkToplevel):
             for l in res.json().get("lotlar", []):
                 self.lot_tree.insert("", "end", iid=str(l["LotID"]),
                                       values=(l["LotNo"], l["StokAdi"], l["UretimEmirID"] or "-", f"{l['UretilenMiktar']:g}",
-                                              f"{l['KalanMiktar']:g}", l["UretimTarihi"]))
+                                              f"{l['KalanMiktar']:g}", l["UretimTarihi"], l.get("KaliteDurumu", "KONTROLSUZ")))
         except Exception:
             pass
 
-    def lot_sevkiyat_ekle_islem(self):
+    def lot_sevkiyat_ekle_islem(self, zorla_gonder=False):
         secili = self.lot_tree.selection()
         if not secili:
             messagebox.showinfo("Seçim Yok", "Lütfen listeden bir lot seçin.")
             return
         try:
             data = {"LotID": int(secili[0]), "MusteriID": int(self.lot_musteri.get()),
-                    "Miktar": float(self.lot_miktar.get()), "BelgeNo": self.lot_belge_no.get().strip() or None}
+                    "Miktar": float(self.lot_miktar.get()), "BelgeNo": self.lot_belge_no.get().strip() or None,
+                    "ZorlaGonder": zorla_gonder}
         except ValueError:
             messagebox.showwarning("Eksik/Hatalı Bilgi", "Müşteri ID ve Miktar sayısal olmalıdır.")
             return
@@ -6239,6 +6301,15 @@ class MainApp(ctk.CTkToplevel):
                 self.lot_belge_no.delete(0, "end")
                 self.lotlari_yukle()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+            elif res.status_code == 400:
+                detay = res.json().get("detail", "")
+                # RED (reddedilmiş) lotlar için asla zorlama seçeneği sunma - sadece
+                # hiç kontrol edilmemiş ("KONTROLSUZ") lotlar için tekrar deneme teklif edilir.
+                if not zorla_gonder and "RED" not in detay.upper() and "KONTROL" in detay.upper():
+                    if messagebox.askyesno("Kalite Kontrolü Yapılmamış", f"{detay}\n\nYine de göndermek istiyor musunuz?"):
+                        self.lot_sevkiyat_ekle_islem(zorla_gonder=True)
+                else:
+                    messagebox.showerror("Sevkiyat Engellendi", detay)
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -6293,6 +6364,186 @@ class MainApp(ctk.CTkToplevel):
                 self.lot_sorgu_tree.insert("", "end", values=(s["LotNo"], s["StokAdi"], s["FirmaAdi"], f"{s['Miktar']:g}", s["BelgeNo"], s["SevkTarihi"]))
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def init_kalite_kontrol(self):
+        ust = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="✅ Kalite Kontrol", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+        ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=lambda: (self.kalite_kontrol_listesini_yukle(), self.uygunsuzluk_listesini_yukle())).pack(side="right")
+        ctk.CTkLabel(self.tab_kalite_kontrol,
+                     text="Bir üretim lotu için ölçüm/gözlem sonucu kaydedin. REDDEDİLEN lotlar sevkiyata kapatılır "
+                          "(Lot Takibi ekranında sevkiyat engellenir); hiç kontrol edilmemiş lotlar için sevkiyat sırasında "
+                          "onay istenir.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+
+        form = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color=RENK_KART, corner_radius=8)
+        form.pack(fill="x", padx=20, pady=(0, 10))
+        satir1 = ctk.CTkFrame(form, fg_color="transparent")
+        satir1.pack(fill="x", padx=10, pady=(10, 5))
+        self.kk_lot_id = ctk.CTkEntry(satir1, placeholder_text="Lot ID", width=90)
+        self.kk_lot_id.pack(side="left", padx=(0, 8))
+        self.kk_kontrol_turu = ctk.CTkOptionMenu(satir1, values=["OLCUM", "GOZLEM"], width=110)
+        self.kk_kontrol_turu.pack(side="left", padx=(0, 8))
+        self.kk_sonuc = ctk.CTkOptionMenu(satir1, values=["KABUL", "RED", "SARTLI_KABUL"], width=130)
+        self.kk_sonuc.pack(side="left", padx=(0, 8))
+        self.kk_olculen = ctk.CTkEntry(satir1, placeholder_text="Ölçülen Değer", width=110)
+        self.kk_olculen.pack(side="left", padx=(0, 8))
+        self.kk_birim = ctk.CTkEntry(satir1, placeholder_text="Birim (mm, gr...)", width=110)
+        self.kk_birim.pack(side="left", padx=(0, 8))
+        satir2 = ctk.CTkFrame(form, fg_color="transparent")
+        satir2.pack(fill="x", padx=10, pady=(0, 10))
+        self.kk_min = ctk.CTkEntry(satir2, placeholder_text="Min Değer", width=100)
+        self.kk_min.pack(side="left", padx=(0, 8))
+        self.kk_max = ctk.CTkEntry(satir2, placeholder_text="Max Değer", width=100)
+        self.kk_max.pack(side="left", padx=(0, 8))
+        self.kk_aciklama = ctk.CTkEntry(satir2, placeholder_text="Açıklama", width=260)
+        self.kk_aciklama.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(satir2, text="✅ Kontrol Kaydet", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.kalite_kontrol_ekle_islem).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(satir2, text="⚠️ Uygunsuzluk Aç", fg_color="#ef4444", hover_color="#b91c1c",
+                      command=self.uygunsuzluk_ekle_penceresi).pack(side="left")
+
+        kk_cerceve, self.kalite_kontrol_tree = tablo_olustur(
+            self.tab_kalite_kontrol, ["Kontrol ID", "Lot No", "Ürün", "Tür", "Sonuç", "Ölçülen", "Kontrol Eden", "Tarih"],
+            [80, 180, 150, 80, 100, 90, 110, 130], height=8)
+        kk_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+
+        ctk.CTkLabel(self.tab_kalite_kontrol, text="Uygunsuzluklar (NCR)", font=("Arial", 14, "bold"), text_color="#f97316").pack(anchor="w", padx=22, pady=(5, 0))
+        uyg_buton_satiri = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color="transparent")
+        uyg_buton_satiri.pack(fill="x", padx=20, pady=(5, 5))
+        ctk.CTkButton(uyg_buton_satiri, text="🔒 Seçileni Kapat", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=self.uygunsuzluk_kapat_islem).pack(side="left")
+        uyg_cerceve, self.uygunsuzluk_tree = tablo_olustur(
+            self.tab_kalite_kontrol, ["ID", "Lot ID", "Hata Kodu", "Şiddet", "Durum", "Açan", "Açılış", "Kapanış"],
+            [50, 70, 140, 80, 90, 110, 130, 130], height=6)
+        uyg_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        self.kalite_kontrol_listesini_yukle()
+        self.uygunsuzluk_listesini_yukle()
+
+    def kalite_kontrol_ekle_islem(self):
+        try:
+            lot_id = int(self.kk_lot_id.get())
+        except ValueError:
+            messagebox.showwarning("Eksik/Hatalı Bilgi", "Geçerli bir Lot ID girin.")
+            return
+        data = {
+            "LotID": lot_id, "KontrolTuru": self.kk_kontrol_turu.get(), "Sonuc": self.kk_sonuc.get(),
+            "Birim": self.kk_birim.get().strip() or None, "Aciklama": self.kk_aciklama.get().strip() or None,
+        }
+        for alan, kaynak in [("OlculenDeger", self.kk_olculen), ("BeklenenMinDeger", self.kk_min), ("BeklenenMaxDeger", self.kk_max)]:
+            deger = kaynak.get().strip()
+            if deger:
+                try:
+                    data[alan] = float(deger)
+                except ValueError:
+                    messagebox.showwarning("Hatalı Değer", f"{alan} sayısal olmalıdır.")
+                    return
+        try:
+            res = requests.post(f"{API}/kalite-kontrol-ekle", json=data, headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                for e in (self.kk_lot_id, self.kk_olculen, self.kk_min, self.kk_max, self.kk_aciklama):
+                    e.delete(0, "end")
+                self.kalite_kontrol_listesini_yukle()
+                if hasattr(self, "lot_tree"):
+                    self.lotlari_yukle()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kontrol kaydedildi."))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def kalite_kontrol_listesini_yukle(self):
+        try:
+            res = requests.get(f"{API}/kalite-kontrol-listesi", headers=self.req_headers(), timeout=5)
+            for i in self.kalite_kontrol_tree.get_children():
+                self.kalite_kontrol_tree.delete(i)
+            for k in res.json().get("kontroller", []):
+                self.kalite_kontrol_tree.insert("", "end", iid=str(k["KontrolID"]),
+                                                 values=(k["KontrolID"], k["LotNo"], k["StokAdi"], k["KontrolTuru"], k["Sonuc"],
+                                                          k["OlculenDeger"] if k["OlculenDeger"] is not None else "-",
+                                                          k["KontrolEden"], k["KontrolTarihi"]))
+        except Exception:
+            pass
+
+    def uygunsuzluk_ekle_penceresi(self):
+        secili_lot = self.kk_lot_id.get().strip()
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Uygunsuzluk Aç")
+        pencere.geometry("420x260")
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+        ctk.CTkLabel(pencere, text="⚠️ Yeni Uygunsuzluk Kaydı", font=("Arial", 14, "bold"), text_color="#ef4444").pack(pady=(15, 10))
+        lot_entry = ctk.CTkEntry(pencere, placeholder_text="Lot ID", width=200)
+        lot_entry.pack(pady=5)
+        if secili_lot:
+            lot_entry.insert(0, secili_lot)
+        hata_entry = ctk.CTkEntry(pencere, placeholder_text="Hata Kodu (örn: YUZEY_HATASI)", width=280)
+        hata_entry.pack(pady=5)
+        siddet_secim = ctk.CTkOptionMenu(pencere, values=["DUSUK", "ORTA", "YUKSEK"], width=150)
+        siddet_secim.set("ORTA")
+        siddet_secim.pack(pady=5)
+        aciklama_entry = ctk.CTkEntry(pencere, placeholder_text="Açıklama", width=280)
+        aciklama_entry.pack(pady=5)
+
+        def kaydet():
+            try:
+                lot_id = int(lot_entry.get())
+            except ValueError:
+                messagebox.showwarning("Hatalı Değer", "Geçerli bir Lot ID girin.")
+                return
+            if not hata_entry.get().strip():
+                messagebox.showwarning("Eksik Bilgi", "Hata kodu zorunludur.")
+                return
+            try:
+                res = requests.post(f"{API}/uygunsuzluk-ekle", json={
+                    "LotID": lot_id, "HataKodu": hata_entry.get().strip(), "Siddet": siddet_secim.get(),
+                    "HataAciklama": aciklama_entry.get().strip() or None,
+                }, headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.uygunsuzluk_listesini_yukle()
+                    messagebox.showinfo("Başarılı", "Uygunsuzluk kaydı açıldı.")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="Kaydet", fg_color="#16a34a", hover_color="#15803d", command=kaydet).pack(pady=15)
+
+    def uygunsuzluk_kapat_islem(self):
+        secili = self.uygunsuzluk_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen listeden bir uygunsuzluk kaydı seçin.")
+            return
+        faaliyet = simpledialog.askstring("Uygunsuzluğu Kapat", "Düzeltici faaliyet açıklaması:")
+        if not faaliyet:
+            return
+        try:
+            res = requests.put(f"{API}/uygunsuzluk-kapat/{secili[0]}", json={"DuzelticiFaaliyet": faaliyet},
+                                headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                self.uygunsuzluk_listesini_yukle()
+                messagebox.showinfo("Başarılı", "Uygunsuzluk kapatıldı.")
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def uygunsuzluk_listesini_yukle(self):
+        try:
+            res = requests.get(f"{API}/uygunsuzluk-listesi", headers=self.req_headers(), timeout=5)
+            for i in self.uygunsuzluk_tree.get_children():
+                self.uygunsuzluk_tree.delete(i)
+            for u in res.json().get("uygunsuzluklar", []):
+                self.uygunsuzluk_tree.insert("", "end", iid=str(u["UygunsuzlukID"]),
+                                              values=(u["UygunsuzlukID"], u["LotID"] or "-", u["HataKodu"], u["Siddet"],
+                                                       u["Durum"], u["AcanKullanici"], u["AcilisTarihi"], u["KapanisTarihi"] or "-"))
+        except Exception:
+            pass
 
     def init_uretim_planlama(self):
         ust = ctk.CTkFrame(self.tab_uretim_planlama, fg_color="transparent")
@@ -9228,9 +9479,17 @@ class MainApp(ctk.CTkToplevel):
                           "hızlandırmak veya ileride bir entegratöre (Foriba/Nesbilgi/QNB eFinans vb.) veri beslemek içindir.",
                      font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=10, pady=(0, 5))
 
+        efatura_satiri = ctk.CTkFrame(self.tab_fatura_liste, fg_color="transparent")
+        efatura_satiri.pack(pady=(0, 10), padx=10, fill="x")
+        ctk.CTkLabel(efatura_satiri, text="e-Fatura/e-Arşiv:", font=("Arial", 11, "bold")).pack(side="left", padx=(5, 10))
+        ctk.CTkButton(efatura_satiri, text="🧾 e-Fatura XML Oluştur", fg_color="#f97316", hover_color="#c2410c",
+                      command=self.secili_fatura_efatura_olustur).pack(side="left", padx=4)
+        ctk.CTkButton(efatura_satiri, text="📤 Entegratöre Gönder", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=self.secili_fatura_efatura_gonder).pack(side="left", padx=4)
+
         fat_cerceve, self.fatura_tree = tablo_olustur(
-            self.tab_fatura_liste, ["Fatura No", "Firma", "Tarih", "Toplam Tutar"],
-            [110, 300, 180, 150], height=17)
+            self.tab_fatura_liste, ["Fatura No", "Firma", "Tarih", "Toplam Tutar", "e-Fatura Durumu"],
+            [100, 260, 160, 130, 130], height=17)
         fat_cerceve.pack(pady=5, padx=10, fill="both", expand=True)
         self.fatura_pdf_yollari = {}
         self.faturalari_yukle()
@@ -9309,10 +9568,49 @@ class MainApp(ctk.CTkToplevel):
             for f in res.json()["faturalar"]:
                 iid = str(f["FaturaID"])
                 self.fatura_tree.insert("", "end", iid=iid,
-                                         values=(f"#FT-{f['FaturaID']}", f["FirmaAdi"], f["Tarih"], f"{f['ToplamTutar']:,.2f} TL"))
+                                         values=(f"#FT-{f['FaturaID']}", f["FirmaAdi"], f["Tarih"], f"{f['ToplamTutar']:,.2f} TL",
+                                                  f.get("EFaturaDurum", "TASLAK")))
                 self.fatura_pdf_yollari[iid] = f["PdfYolu"]
         except Exception:
             pass
+
+    def secili_fatura_efatura_olustur(self):
+        secili = self.fatura_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen listeden bir fatura seçin.")
+            return
+        fatura_id = secili[0]
+        try:
+            res = requests.post(f"{API}/fatura/{fatura_id}/efatura-olustur", json={"Senaryo": "EARSIV"},
+                                 headers=self.req_headers(), timeout=10)
+            if res.status_code == 200:
+                veri = res.json()
+                messagebox.showinfo("e-Fatura XML Oluşturuldu", f"e-Fatura No: {veri['EFaturaNo']}\nDosya: {veri['EFaturaXmlYolu']}")
+                self.faturalari_yukle()
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def secili_fatura_efatura_gonder(self):
+        secili = self.fatura_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen listeden bir fatura seçin.")
+            return
+        fatura_id = secili[0]
+        try:
+            res = requests.post(f"{API}/fatura/{fatura_id}/efatura-gonder", headers=self.req_headers(), timeout=20)
+            if res.status_code == 200:
+                veri = res.json()
+                if veri.get("EFaturaDurum") == "GONDERILDI":
+                    messagebox.showinfo("Gönderildi", veri.get("mesaj", "e-Fatura entegratöre gönderildi."))
+                else:
+                    messagebox.showerror("Gönderim Başarısız", veri.get("Hata", "Entegratör hatası."))
+                self.faturalari_yukle()
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     
 
@@ -10639,6 +10937,94 @@ class MainApp(ctk.CTkToplevel):
                 self.fiyatlandirma_listesi_yukle()
             else:
                 self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def init_mrp(self):
+        ust = ctk.CTkFrame(self.tab_mrp, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="📐 MRP / Malzeme İhtiyaç Planlama", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+        ctk.CTkButton(ust, text="▶️ MRP Çalıştır", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.mrp_calistir_islem).pack(side="right")
+        ctk.CTkLabel(self.tab_mrp,
+                     text="Açık satış siparişlerini reçetelere (BOM) göre hammadde/bileşen ihtiyacına böler, mevcut stok + "
+                          "açık üretim + onaylı satınalma talepleriyle netleştirir. Bu bir ÖNERİ raporudur - hiçbir satınalma "
+                          "talebi burada OTOMATİK oluşmaz, sadece seçtiğiniz önerileri 'Talebe Dönüştür' ile serbest bırakırsınız.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+
+        buton_satiri = ctk.CTkFrame(self.tab_mrp, fg_color="transparent")
+        buton_satiri.pack(fill="x", padx=20, pady=(0, 5))
+        ctk.CTkLabel(buton_satiri, text="Seçili öneriler için:", font=("Arial", 11)).pack(side="left", padx=(5, 10))
+        ctk.CTkButton(buton_satiri, text="📦 Satınalma Talebine Dönüştür", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=self.mrp_oneri_donustur_islem).pack(side="left", padx=4)
+        ctk.CTkButton(buton_satiri, text="✖️ Reddet", fg_color="#ef4444", hover_color="#b91c1c",
+                      command=self.mrp_oneri_reddet_islem).pack(side="left", padx=4)
+        ctk.CTkButton(buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, hover_color=RENK_IKINCIL,
+                      command=self.mrp_onerilerini_yukle).pack(side="left", padx=4)
+
+        mrp_cerceve, self.mrp_tree = tablo_olustur(
+            self.tab_mrp, ["Öneri ID", "Stok Kod", "Stok Adı", "Net İhtiyaç", "Mevcut Stok", "Önerilen Satınalma", "Kaynak Siparişler", "Durum"],
+            [70, 100, 200, 100, 100, 130, 150, 100], height=16)
+        mrp_cerceve.pack(pady=10, padx=20, fill="both", expand=True)
+        ctk.CTkLabel(self.tab_mrp, text="Not: Birden fazla öneri seçmek için Ctrl (veya Shift) tuşunu kullanabilirsiniz.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 10))
+
+        self.mrp_onerilerini_yukle()
+
+    def mrp_calistir_islem(self):
+        try:
+            res = requests.post(f"{API}/mrp-calistir", headers=self.req_headers(), timeout=30)
+            if res.status_code == 200:
+                veri = res.json()
+                self.mrp_onerilerini_yukle()
+                messagebox.showinfo("MRP Çalıştırıldı", veri.get("mesaj", f"{veri.get('OneriSayisi', 0)} öneri üretildi."))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def mrp_onerilerini_yukle(self):
+        try:
+            res = requests.get(f"{API}/mrp-onerileri", headers=self.req_headers(), timeout=8)
+            for i in self.mrp_tree.get_children():
+                self.mrp_tree.delete(i)
+            DURUM_ETIKET = {"BEKLIYOR": "Bekliyor", "ONAYLANDI": "Onaylandı", "REDDEDILDI": "İptal"}
+            for o in res.json().get("oneriler", []):
+                tag = DURUM_ETIKET.get(o["Durum"], "Bekliyor")
+                self.mrp_tree.insert("", "end", iid=str(o["OneriID"]), tags=(tag,),
+                                      values=(o["OneriID"], o["StokKod"], o["StokAdi"], f"{o['NetIhtiyacMiktari']:g}",
+                                              f"{o['MevcutStok']:g}", f"{o['OnerilenSatinalmaMiktari']:g}",
+                                              o["KaynakSiparisIDleri"] or "-", o["Durum"]))
+        except Exception:
+            pass
+
+    def mrp_oneri_donustur_islem(self):
+        secili = self.mrp_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen listeden bir ya da daha fazla öneri seçin.")
+            return
+        if not messagebox.askyesno("Onay", f"{len(secili)} öneri satınalma talebine dönüştürülecek. Emin misiniz?"):
+            return
+        try:
+            oneri_id_listesi = [int(oid) for oid in secili]
+            res = requests.post(f"{API}/mrp-oneri-donustur", json={"OneriIDleri": oneri_id_listesi}, headers=self.req_headers(), timeout=15)
+            if res.status_code == 200:
+                self.mrp_onerilerini_yukle()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Öneriler dönüştürüldü."))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def mrp_oneri_reddet_islem(self):
+        secili = self.mrp_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen listeden bir ya da daha fazla öneri seçin.")
+            return
+        try:
+            for oneri_id in secili:
+                requests.put(f"{API}/mrp-oneri-reddet/{oneri_id}", headers=self.req_headers(), timeout=8)
+            self.mrp_onerilerini_yukle()
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 

@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from datetime import date
 bugun = date.today()
 import xml.etree.ElementTree as ET
+import uuid
 from fpdf import FPDF
 from passlib.context import CryptContext
 from jose import JWTError, jwt
@@ -59,6 +60,164 @@ def eposta_ayarlarini_getir():
     except Exception:
         pass
     return None
+
+def efatura_ayarlarini_getir():
+    """e-Fatura özel entegratör ayarlarını SistemAyarlari tablosundan okur.
+    Hiç ayarlanmamışsa (kullanıcı henüz bir entegratörle sözleşme yapıp bilgilerini
+    girmemişse) None döner - eposta_ayarlarini_getir() ile aynı desen, çağıran kod
+    ayarsız durumda sessizce atlayabilsin diye."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""SELECT AyarAnahtari, AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari IN
+                           ('EFaturaEntegratorURL', 'EFaturaKullaniciAdi', 'EFaturaApiKey', 'EFaturaTestOrtami', 'EFaturaSeriKodu')""")
+        ayarlar = {r[0]: r[1] for r in cursor.fetchall()}
+        conn.close()
+        url = ayarlar.get("EFaturaEntegratorURL")
+        if not url:
+            return None
+        return {
+            "url": url,
+            "kullanici_adi": ayarlar.get("EFaturaKullaniciAdi") or "",
+            "api_key": ayarlar.get("EFaturaApiKey") or "",
+            "test_ortami": (ayarlar.get("EFaturaTestOrtami") or "1") == "1",
+            "seri_kodu": ayarlar.get("EFaturaSeriKodu") or "NIS",
+        }
+    except Exception:
+        return None
+
+def efatura_sonraki_no_al(cursor, seri_kodu: str) -> str:
+    """EFaturaSayaci tablosundan bu seri için atomik şekilde bir sonraki e-Fatura
+    numarasını üretir (GİB formatı: 3 harf seri + yıl + 9 haneli sıra no, örn.
+    NIS2026000000001). FaturaID identity sütununa güvenilmez çünkü GİB seri
+    numarasının hiç atlanmaması/tekrarlanmaması gerekir - iptal edilen bir fatura
+    bile numarasını korur."""
+    yil = datetime.datetime.now().year
+    seri = f"{seri_kodu}{yil}"
+    cursor.execute("SELECT SonSira FROM EFaturaSayaci WHERE SeriKodu=?", (seri,))
+    row = cursor.fetchone()
+    if row is None:
+        cursor.execute("INSERT INTO EFaturaSayaci (SeriKodu, SonSira) VALUES (?, 1)", (seri,))
+        sira = 1
+    else:
+        sira = int(row[0]) + 1
+        cursor.execute("UPDATE EFaturaSayaci SET SonSira=? WHERE SeriKodu=?", (sira, seri))
+    return f"{seri}{sira:09d}"
+
+def ubl_tr_fatura_xml_olustur(fatura_id: int, ettn: str, efatura_no: str, senaryo: str,
+                               fatura_tarihi, para_birimi: str, ara_toplam: float, kdv_toplam: float, genel_toplam: float,
+                               musteri_bilgi: dict, kalemler: list) -> ET.Element:
+    """GİB'in beklediği UBL-TR 2.1 şemasına uygun ŞEKİLDE (cbc/cac ad alanları,
+    Invoice kök elemanı, AccountingSupplierParty/CustomerParty, InvoiceLine,
+    TaxTotal, LegalMonetaryTotal) bir XML ağacı üretir.
+
+    ÖNEMLİ KAPSAM SINIRI: Bu, GİB'e doğrudan gönderilebilecek İMZALI (XAdES) bir
+    belge DEĞİLDİR - dijital imzalama ve gerçek GİB/entegratör iletimi, kullanıcının
+    ayrıca sözleşme yapacağı özel entegratörün sorumluluğundadır. Bu fonksiyon,
+    o entegratörün API'sine gönderilebilecek doğru ŞEKİLDE yapılandırılmış bir
+    UBL-TR gövdesi üretir; entegratöre özel kimlik doğrulama/zarf (envelope) alanları
+    efatura_entegrator_gonder() içinde, entegratör seçildiğinde uyarlanmalıdır."""
+    NS = {
+        "": "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2",
+        "cac": "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
+        "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
+    }
+    for prefix, uri in NS.items():
+        ET.register_namespace(prefix, uri)
+
+    def cbc(parent, tag, text):
+        el = ET.SubElement(parent, f"{{{NS['cbc']}}}{tag}")
+        el.text = "" if text is None else str(text)
+        return el
+
+    def cac(parent, tag):
+        return ET.SubElement(parent, f"{{{NS['cac']}}}{tag}")
+
+    kok = ET.Element(f"{{{NS['']}}}Invoice")
+    cbc(kok, "UBLVersionID", "2.1")
+    cbc(kok, "CustomizationID", "TR1.2")
+    cbc(kok, "ProfileID", "TEMELFATURA" if senaryo == "EFATURA" else "EARSIVFATURA")
+    cbc(kok, "ID", efatura_no)
+    cbc(kok, "UUID", ettn)
+    cbc(kok, "IssueDate", fatura_tarihi.strftime("%Y-%m-%d") if hasattr(fatura_tarihi, "strftime") else str(fatura_tarihi)[:10])
+    cbc(kok, "InvoiceTypeCode", "SATIS")
+    cbc(kok, "DocumentCurrencyCode", para_birimi or "TRY")
+
+    tedarikci = cac(kok, "AccountingSupplierParty")
+    tedarikci_parti = cac(tedarikci, "Party")
+    tedarikci_isim = cac(tedarikci_parti, "PartyName")
+    cbc(tedarikci_isim, "Name", "NISAN PLASTIK A.S.")
+
+    musteri = cac(kok, "AccountingCustomerParty")
+    musteri_parti = cac(musteri, "Party")
+    musteri_vergi = cac(musteri_parti, "PartyTaxScheme")
+    cbc(musteri_vergi, "RegistrationName", musteri_bilgi.get("FirmaAdi") or "")
+    vergi_kimlik = cac(musteri_vergi, "TaxScheme")
+    cbc(vergi_kimlik, "Name", musteri_bilgi.get("VergiDairesi") or "")
+    musteri_isim = cac(musteri_parti, "PartyName")
+    cbc(musteri_isim, "Name", musteri_bilgi.get("FirmaAdi") or "")
+    musteri_adres = cac(musteri_parti, "PostalAddress")
+    cbc(musteri_adres, "StreetName", musteri_bilgi.get("Adres") or "")
+    cbc(musteri_adres, "CitySubdivisionName", musteri_bilgi.get("Ilce") or "")
+    cbc(musteri_adres, "CityName", musteri_bilgi.get("Il") or "")
+    musteri_ulke = cac(musteri_adres, "Country")
+    cbc(musteri_ulke, "Name", "Türkiye")
+    musteri_vkn_id = cac(musteri_parti, "PartyIdentification")
+    vkn_id_el = ET.SubElement(musteri_vkn_id, f"{{{NS['cbc']}}}ID")
+    vkn_id_el.set("schemeID", musteri_bilgi.get("VergiKimlikTipi") or "VKN")
+    vkn_id_el.text = musteri_bilgi.get("VergiNo") or ""
+
+    for idx, k in enumerate(kalemler, start=1):
+        satir = cac(kok, "InvoiceLine")
+        cbc(satir, "ID", str(idx))
+        miktar_el = cbc(satir, "InvoicedQuantity", k["Miktar"])
+        miktar_el.set("unitCode", "C62")
+        cbc(satir, "LineExtensionAmount", f"{k['SatirToplami']:.2f}")
+        satir_vergi = cac(satir, "TaxTotal")
+        cbc(satir_vergi, "TaxAmount", f"{(k['SatirToplami'] * (k['KdvOrani'] / 100)):.2f}")
+        satir_urun = cac(satir, "Item")
+        cbc(satir_urun, "Name", k["StokAdi"])
+        satir_fiyat = cac(satir, "Price")
+        cbc(satir_fiyat, "PriceAmount", f"{k['BirimFiyat']:.2f}")
+
+    vergi_toplam = cac(kok, "TaxTotal")
+    cbc(vergi_toplam, "TaxAmount", f"{kdv_toplam:.2f}")
+
+    parasal_toplam = cac(kok, "LegalMonetaryTotal")
+    cbc(parasal_toplam, "LineExtensionAmount", f"{ara_toplam:.2f}")
+    cbc(parasal_toplam, "TaxExclusiveAmount", f"{ara_toplam:.2f}")
+    cbc(parasal_toplam, "TaxInclusiveAmount", f"{genel_toplam:.2f}")
+    cbc(parasal_toplam, "PayableAmount", f"{genel_toplam:.2f}")
+
+    return kok
+
+def efatura_entegrator_gonder(xml_yolu: str, ayarlar: dict) -> dict:
+    """Üretilen UBL-TR XML dosyasını yapılandırılmış özel entegratör API'sine
+    gönderir. KAPSAM: Bu bir İSKELET'tir - gerçek entegratörün (örn. Uyumsoft,
+    Foriba, Logo vb.) kendine özgü kimlik doğrulama/istek gövdesi/yanıt şeması
+    burada henüz uyarlanmamıştır (TODO: entegratör seçildiğinde bu fonksiyonun
+    içini o entegratörün API kontratına göre güncelleyin). Şu an sadece
+    yapılandırılan URL'e XML içeriğini POST eder.
+
+    KRİTİK: Bu fonksiyon HİÇBİR ZAMAN exception fırlatmaz - entegratör API'si
+    çökse/yanıt vermese bile çağıran kodun (fatura kesme akışının) bloklanmaması
+    için tüm hatalar burada yakalanıp {'basarili': False, 'hata': ...} olarak
+    döner (eposta_gonder_pdf_ekli ile aynı 'sessizce başarısız ol' felsefesi)."""
+    try:
+        with open(xml_yolu, "rb") as f:
+            xml_icerik = f.read()
+        yanit = requests.post(
+            ayarlar["url"],
+            headers={"Authorization": f"Bearer {ayarlar['api_key']}", "Content-Type": "application/xml"},
+            auth=(ayarlar["kullanici_adi"], ayarlar["api_key"]) if not ayarlar["api_key"].startswith("Bearer") else None,
+            data=xml_icerik,
+            timeout=15,
+        )
+        if yanit.status_code in (200, 201, 202):
+            return {"basarili": True}
+        return {"basarili": False, "hata": f"Entegratör HTTP {yanit.status_code}: {yanit.text[:300]}"}
+    except Exception as e:
+        return {"basarili": False, "hata": str(e)}
 
 def otomatik_rapor_gonder():
     ayar = eposta_ayarlarini_getir()
@@ -1326,6 +1485,9 @@ class FaturaOlusturRequest(BaseModel):
     SiparisIDler: list[int] = []
     ParaBirimi: str = "TL"
 
+class EFaturaOlusturRequest(BaseModel):
+    Senaryo: str = "EARSIV"  # EFATURA | EARSIV
+
 class BilesenEkle(BaseModel):
     HammaddeKodu: str
     Miktar: float = Field(gt=0)
@@ -2226,6 +2388,33 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _efatura_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> e-Fatura migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _kalite_kontrol_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Kalite Kontrol migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _mrp_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> MRP migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -2346,6 +2535,94 @@ def _demirbas_ve_diger_eski_tablolari_olustur(cursor):
     for tablo in ['MaliyetKalemleri', 'FiyatSecenekleri']:
         guvenli_sutun_ekle(cursor, tablo, "ParaBirimi", "NVARCHAR(10) DEFAULT 'TL'")
         guvenli_migrasyon(cursor, f"UPDATE {tablo} SET ParaBirimi = 'TL' WHERE ParaBirimi IS NULL", f"{tablo} ParaBirimi varsayılan")
+
+def _efatura_migrationlari(cursor):
+    """e-Fatura/e-Arşiv altyapısı için gereken sütun/tablo eklemeleri. Diğer yeni
+    özellik migration'ları gibi (bkz. _konsinye_ve_sonraki_ozellik_migrationlari'nin
+    docstring'i) kendi başına, önceki/sonraki migration bloklarından bağımsız
+    çağrılır - burada bir hata olsa bile diğer migration'lar etkilenmez."""
+    guvenli_sutun_ekle(cursor, "Faturalar", "EFaturaUUID", "NVARCHAR(50) NULL")
+    guvenli_sutun_ekle(cursor, "Faturalar", "EFaturaNo", "NVARCHAR(20) NULL")
+    guvenli_sutun_ekle(cursor, "Faturalar", "EFaturaSenaryo", "NVARCHAR(20) NOT NULL DEFAULT 'EARSIV'")
+    guvenli_sutun_ekle(cursor, "Faturalar", "EFaturaDurum", "NVARCHAR(20) NOT NULL DEFAULT 'TASLAK'")
+    guvenli_sutun_ekle(cursor, "Faturalar", "EFaturaXmlYolu", "NVARCHAR(300) NULL")
+    guvenli_sutun_ekle(cursor, "Faturalar", "EFaturaHataMesaji", "NVARCHAR(500) NULL")
+    guvenli_sutun_ekle(cursor, "Faturalar", "EFaturaGonderimTarihi", "DATETIME NULL")
+
+    guvenli_sutun_ekle(cursor, "Musteriler", "VergiKimlikTipi", "NVARCHAR(10) NOT NULL DEFAULT 'VKN'")
+    guvenli_sutun_ekle(cursor, "Musteriler", "EFaturaMukellefi", "BIT NOT NULL DEFAULT 0")
+    guvenli_sutun_ekle(cursor, "Musteriler", "Il", "NVARCHAR(50) NULL")
+    guvenli_sutun_ekle(cursor, "Musteriler", "Ilce", "NVARCHAR(50) NULL")
+
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='EFaturaSayaci' and xtype='U')
+        CREATE TABLE EFaturaSayaci (
+            SeriKodu NVARCHAR(10) PRIMARY KEY,
+            SonSira INT NOT NULL DEFAULT 0
+        )
+    """, "EFaturaSayaci tablosu")
+
+def _kalite_kontrol_migrationlari(cursor):
+    """Kalite Kontrol modülü için tablo/sütun eklemeleri - diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='KaliteKontrolKayitlari' and xtype='U')
+        CREATE TABLE KaliteKontrolKayitlari (
+            KontrolID INT IDENTITY(1,1) PRIMARY KEY,
+            LotID INT NOT NULL FOREIGN KEY REFERENCES UretimLotlari(LotID),
+            UretimEmirID INT NULL,
+            KontrolTuru NVARCHAR(30) NOT NULL,
+            Sonuc NVARCHAR(15) NOT NULL,
+            OlculenDeger FLOAT NULL,
+            BeklenenMinDeger FLOAT NULL,
+            BeklenenMaxDeger FLOAT NULL,
+            Birim NVARCHAR(20) NULL,
+            Aciklama NVARCHAR(500) NULL,
+            KontrolEden NVARCHAR(50) NOT NULL,
+            KontrolTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "KaliteKontrolKayitlari tablosu")
+
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='UygunsuzlukKayitlari' and xtype='U')
+        CREATE TABLE UygunsuzlukKayitlari (
+            UygunsuzlukID INT IDENTITY(1,1) PRIMARY KEY,
+            KontrolID INT NULL FOREIGN KEY REFERENCES KaliteKontrolKayitlari(KontrolID),
+            LotID INT NULL,
+            HataKodu NVARCHAR(30) NOT NULL,
+            HataAciklama NVARCHAR(500) NULL,
+            Siddet NVARCHAR(10) NOT NULL DEFAULT 'ORTA',
+            DuzelticiFaaliyet NVARCHAR(500) NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'ACIK',
+            AcanKullanici NVARCHAR(50) NOT NULL,
+            AcilisTarihi DATETIME NOT NULL DEFAULT GETDATE(),
+            KapanisTarihi DATETIME NULL
+        )
+    """, "UygunsuzlukKayitlari tablosu")
+
+    guvenli_sutun_ekle(cursor, "UretimLotlari", "KaliteDurumu", "NVARCHAR(15) NOT NULL DEFAULT 'KONTROLSUZ'")
+
+def _mrp_migrationlari(cursor):
+    """MRP (Malzeme İhtiyaç Planlaması) için tablo eklemesi - diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='MrpOnerileri' and xtype='U')
+        CREATE TABLE MrpOnerileri (
+            OneriID INT IDENTITY(1,1) PRIMARY KEY,
+            CalismaID UNIQUEIDENTIFIER NOT NULL,
+            StokKod NVARCHAR(50) NOT NULL,
+            StokAdi NVARCHAR(200) NULL,
+            NetIhtiyacMiktari FLOAT NOT NULL,
+            MevcutStok FLOAT NOT NULL,
+            AcikTalepMiktari FLOAT NOT NULL DEFAULT 0,
+            OnerilenSatinalmaMiktari FLOAT NOT NULL,
+            KaynakSiparisIDleri NVARCHAR(500) NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'BEKLIYOR',
+            OlusanTalepID INT NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE(),
+            OlusturanKullanici NVARCHAR(50) NOT NULL
+        )
+    """, "MrpOnerileri tablosu")
 
 @app.post("/virman-yap")
 def virman_yap(req: VirmanRequest, current_user: dict = Depends(get_current_user)):
@@ -6060,10 +6337,10 @@ def fatura_listesi_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhas
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT f.FaturaID, m.FirmaAdi, f.Tarih, f.ToplamTutar, f.PdfYolu, ISNULL(f.ParaBirimi, 'TL')
+            SELECT f.FaturaID, m.FirmaAdi, f.Tarih, f.ToplamTutar, f.PdfYolu, ISNULL(f.ParaBirimi, 'TL'), ISNULL(f.EFaturaDurum, 'TASLAK')
             FROM Faturalar f JOIN Musteriler m ON f.MusteriID = m.MusteriID ORDER BY f.Tarih DESC
         """)
-        return {"faturalar": [{"FaturaID": r[0], "FirmaAdi": r[1], "Tarih": str(r[2]), "ToplamTutar": r[3], "PdfYolu": r[4], "ParaBirimi": r[5]} for r in cursor.fetchall()]}
+        return {"faturalar": [{"FaturaID": r[0], "FirmaAdi": r[1], "Tarih": str(r[2]), "ToplamTutar": r[3], "PdfYolu": r[4], "ParaBirimi": r[5], "EFaturaDurum": r[6]} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -6360,6 +6637,118 @@ def fatura_xml_disa_aktar(fatura_id: int, user: dict = Depends(yetki_kontrol(["Y
     finally:
         conn.close()
 
+@app.post("/fatura/{fatura_id}/efatura-olustur")
+def efatura_olustur(fatura_id: int, veri: EFaturaOlusturRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    """GİB-uyumlu ŞEKİLDE (UBL-TR 2.1) e-Fatura/e-Arşiv XML'i üretir ve diske yazar.
+    KAPSAM: Bu adım GİB'e/entegratöre GÖNDERMEZ, sadece XML'i hazırlar - gönderim
+    ayrı bir adımdır (/fatura/{id}/efatura-gonder), bkz. ubl_tr_fatura_xml_olustur
+    docstring'i için tam kapsam açıklaması."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT f.FaturaID, f.Tarih, f.AraToplam, f.KdvToplam, f.ToplamTutar, f.ParaBirimi,
+                   m.FirmaAdi, m.VergiDairesi, m.VergiNo, m.Adres, m.VergiKimlikTipi, m.Il, m.Ilce
+            FROM Faturalar f JOIN Musteriler m ON f.MusteriID = m.MusteriID WHERE f.FaturaID=?
+        """, (fatura_id,))
+        f = cursor.fetchone()
+        if not f:
+            raise HTTPException(status_code=404, detail="Fatura bulunamadı.")
+        musteri_bilgi = {
+            "FirmaAdi": f[6], "VergiDairesi": f[7], "VergiNo": f[8], "Adres": f[9],
+            "VergiKimlikTipi": f[10], "Il": f[11], "Ilce": f[12],
+        }
+        if not musteri_bilgi["VergiNo"] or not musteri_bilgi["Adres"]:
+            raise HTTPException(status_code=400, detail="Müşterinin vergi no ve adres bilgisi eksik - e-Fatura oluşturulamaz. Önce müşteri kaydını tamamlayın.")
+
+        cursor.execute("SELECT StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami, ISNULL(KdvOrani,20) FROM FaturaSatirlari WHERE FaturaID=?", (fatura_id,))
+        satirlar = cursor.fetchall()
+        kalemler = [{"StokKod": s[0], "StokAdi": s[1], "Miktar": s[2], "BirimFiyat": s[3], "SatirToplami": s[4], "KdvOrani": s[5]} for s in satirlar]
+
+        ettn = str(uuid.uuid4())
+        ayarlar = efatura_ayarlarini_getir()
+        seri_kodu = ayarlar["seri_kodu"] if ayarlar else "NIS"
+        efatura_no = efatura_sonraki_no_al(cursor, seri_kodu)
+
+        xml_agaci = ubl_tr_fatura_xml_olustur(
+            fatura_id, ettn, efatura_no, veri.Senaryo, f[1], f[5] or "TL",
+            float(f[2] or 0), float(f[3] or 0), float(f[4] or 0), musteri_bilgi, kalemler)
+
+        os.makedirs(os.path.join("Faturalar", "EFatura"), exist_ok=True)
+        xml_yolu = os.path.join("Faturalar", "EFatura", f"{efatura_no}.xml")
+        ET.ElementTree(xml_agaci).write(xml_yolu, encoding="utf-8", xml_declaration=True)
+
+        cursor.execute("""UPDATE Faturalar SET EFaturaUUID=?, EFaturaNo=?, EFaturaSenaryo=?, EFaturaXmlYolu=?, EFaturaDurum='OLUSTURULDU'
+                           WHERE FaturaID=?""", (ettn, efatura_no, veri.Senaryo, xml_yolu, fatura_id))
+        log_islem(cursor, f"e-Fatura XML oluşturuldu: Fatura #{fatura_id} -> {efatura_no}", user["username"])
+        conn.commit()
+        return {"mesaj": "e-Fatura XML oluşturuldu.", "EFaturaNo": efatura_no, "EFaturaUUID": ettn, "EFaturaXmlYolu": xml_yolu}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.post("/fatura/{fatura_id}/efatura-gonder")
+def efatura_gonder(fatura_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    """Daha önce oluşturulmuş e-Fatura XML'ini yapılandırılmış özel entegratöre
+    gönderir. Entegratör API'si çökse/yanıt vermese bile bu endpoint 200 döner ve
+    hatayı EFaturaDurum='HATA' + EFaturaHataMesaji olarak KAYDEDER - asla 500 ile
+    patlamaz, çünkü faturalama akışının entegratör kesintisinden etkilenmemesi
+    gerekir (bkz. efatura_entegrator_gonder docstring'i)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT EFaturaDurum, EFaturaXmlYolu FROM Faturalar WHERE FaturaID=?", (fatura_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Fatura bulunamadı.")
+        durum, xml_yolu = row[0], row[1]
+        if durum not in ("OLUSTURULDU", "HATA"):
+            raise HTTPException(status_code=400, detail="Önce e-Fatura XML'i oluşturulmalı (/efatura-olustur).")
+
+        ayarlar = efatura_ayarlarini_getir()
+        if not ayarlar:
+            raise HTTPException(status_code=400, detail="e-Fatura entegratör ayarları yapılandırılmamış. Sistem Ayarları'ndan girin.")
+
+        sonuc = efatura_entegrator_gonder(xml_yolu, ayarlar)
+        if sonuc["basarili"]:
+            cursor.execute("UPDATE Faturalar SET EFaturaDurum='GONDERILDI', EFaturaGonderimTarihi=GETDATE(), EFaturaHataMesaji=NULL WHERE FaturaID=?", (fatura_id,))
+            log_islem(cursor, f"e-Fatura entegratöre gönderildi: Fatura #{fatura_id}", user["username"])
+            conn.commit()
+            return {"mesaj": "e-Fatura entegratöre gönderildi.", "EFaturaDurum": "GONDERILDI"}
+        else:
+            cursor.execute("UPDATE Faturalar SET EFaturaDurum='HATA', EFaturaHataMesaji=? WHERE FaturaID=?", (sonuc["hata"][:500], fatura_id))
+            log_islem(cursor, f"e-Fatura gönderim hatası: Fatura #{fatura_id} - {sonuc['hata']}", user["username"])
+            conn.commit()
+            return {"mesaj": "e-Fatura gönderimi başarısız oldu, durum kaydedildi.", "EFaturaDurum": "HATA", "Hata": sonuc["hata"]}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/fatura/{fatura_id}/efatura-durum")
+def efatura_durum(fatura_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT EFaturaDurum, EFaturaNo, EFaturaUUID, EFaturaSenaryo, EFaturaHataMesaji, EFaturaGonderimTarihi
+                           FROM Faturalar WHERE FaturaID=?""", (fatura_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Fatura bulunamadı.")
+        return {"EFaturaDurum": row[0] or "TASLAK", "EFaturaNo": row[1], "EFaturaUUID": row[2],
+                "EFaturaSenaryo": row[3], "EFaturaHataMesaji": row[4], "EFaturaGonderimTarihi": row[5]}
+    finally:
+        conn.close()
+
 @app.post("/recete-ekle")
 def recete_ekle(veri: ReceteEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "Üretim"]))):
     conn = get_db_connection()
@@ -6639,10 +7028,11 @@ def lot_listesi_getir(user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("""SELECT LotID, LotNo, StokKod, StokAdi, UretimEmirID, UretilenMiktar, KalanMiktar, UretimTarihi
+        cursor.execute("""SELECT LotID, LotNo, StokKod, StokAdi, UretimEmirID, UretilenMiktar, KalanMiktar, UretimTarihi, ISNULL(KaliteDurumu, 'KONTROLSUZ')
                            FROM UretimLotlari ORDER BY UretimTarihi DESC""")
         return {"lotlar": [{"LotID": r[0], "LotNo": r[1], "StokKod": r[2], "StokAdi": r[3] or r[2], "UretimEmirID": r[4],
-                             "UretilenMiktar": float(r[5]), "KalanMiktar": float(r[6]), "UretimTarihi": str(r[7])[:16]}
+                             "UretilenMiktar": float(r[5]), "KalanMiktar": float(r[6]), "UretimTarihi": str(r[7])[:16],
+                             "KaliteDurumu": r[8]}
                             for r in cursor.fetchall()]}
     finally:
         conn.close()
@@ -6652,21 +7042,33 @@ class LotSevkiyatEkleRequest(BaseModel):
     MusteriID: int
     Miktar: float = Field(gt=0)
     BelgeNo: Optional[str] = None
+    ZorlaGonder: bool = False
 
 @app.post("/lot-sevkiyat-ekle")
 def lot_sevkiyat_ekle(veri: LotSevkiyatEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Satış"]))):
     """Bir üretim lotundan müşteriye ne kadar sevk edildiğini kaydeder. Bu, gerçek
     stok düşümünü YAPMAZ (o zaten Fatura/İrsaliye ile ayrıca düşülüyor) - sadece
-    'hangi lot kime gitti' izlenebilirlik bilgisini tutar."""
+    'hangi lot kime gitti' izlenebilirlik bilgisini tutar.
+
+    KALİTE KONTROL KAPISI: RED (kalite kontrolünde reddedilmiş) bir lot HİÇBİR
+    ZAMAN sevk edilemez (override yok - bu, tüm QC kapısının amacı). KONTROLSUZ
+    (hiç kontrol edilmemiş) bir lot ise sadece ZorlaGonder=true ile sevk edilebilir
+    - her lotu kontrol etmeyen işletmelerin akışını kırmamak için sert blok yerine
+    açık bir onay istenir."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT KalanMiktar, LotNo FROM UretimLotlari WHERE LotID=?", (veri.LotID,))
+        cursor.execute("SELECT KalanMiktar, LotNo, ISNULL(KaliteDurumu, 'KONTROLSUZ') FROM UretimLotlari WHERE LotID=?", (veri.LotID,))
         lot = cursor.fetchone()
         if not lot:
             raise HTTPException(status_code=404, detail="Lot bulunamadı.")
         if lot[0] < veri.Miktar:
             raise HTTPException(status_code=400, detail=f"Bu lotta yeterli miktar yok. Kalan: {lot[0]:g}")
+        kalite_durumu = lot[2]
+        if kalite_durumu == "RED":
+            raise HTTPException(status_code=400, detail=f"'{lot[1]}' lotu kalite kontrolünde REDDEDİLDİ, sevk edilemez.")
+        if kalite_durumu == "KONTROLSUZ" and not veri.ZorlaGonder:
+            raise HTTPException(status_code=400, detail=f"'{lot[1]}' lotu için kalite kontrolü yapılmamış. Yine de göndermek için onaylayın (ZorlaGonder).")
 
         cursor.execute("""INSERT INTO LotSevkiyatlari (LotID, MusteriID, Miktar, BelgeNo, KullaniciAdi)
                            VALUES (?, ?, ?, ?, ?)""", (veri.LotID, veri.MusteriID, veri.Miktar, veri.BelgeNo, user["username"]))
@@ -6691,6 +7093,159 @@ def lot_sevkiyatlari_getir(lot_id: int, user: dict = Depends(get_current_user)):
                            WHERE s.LotID=? ORDER BY s.SevkTarihi DESC""", (lot_id,))
         return {"sevkiyatlar": [{"SevkiyatID": r[0], "FirmaAdi": r[1], "Miktar": float(r[2]), "BelgeNo": r[3] or "-",
                                   "SevkTarihi": str(r[4])[:16]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+# --- KALİTE KONTROL MODÜLÜ ---
+# Üretim tamamlanmasını (uretim-emri-tamamla) BLOKLAMAZ - kontrol, üretimden SONRA
+# (üret -> kontrol et -> sevkiyata onayla) bir lota karşı kaydedilir. Sevkiyat
+# kapısı /lot-sevkiyat-ekle içinde uygulanır (bkz. o endpoint'in docstring'i).
+
+class KaliteKontrolEkleRequest(BaseModel):
+    LotID: int
+    KontrolTuru: str  # 'OLCUM' | 'GOZLEM'
+    Sonuc: str        # 'KABUL' | 'RED' | 'SARTLI_KABUL'
+    OlculenDeger: Optional[float] = None
+    BeklenenMinDeger: Optional[float] = None
+    BeklenenMaxDeger: Optional[float] = None
+    Birim: Optional[str] = None
+    Aciklama: Optional[str] = None
+
+class UygunsuzlukEkleRequest(BaseModel):
+    KontrolID: Optional[int] = None
+    LotID: Optional[int] = None
+    HataKodu: str
+    HataAciklama: Optional[str] = None
+    Siddet: str = "ORTA"
+
+class UygunsuzlukKapatRequest(BaseModel):
+    DuzelticiFaaliyet: str
+
+@app.post("/kalite-kontrol-ekle")
+def kalite_kontrol_ekle(veri: KaliteKontrolEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Üretim"]))):
+    if veri.Sonuc not in ("KABUL", "RED", "SARTLI_KABUL"):
+        raise HTTPException(status_code=400, detail="Sonuç 'KABUL', 'RED' veya 'SARTLI_KABUL' olmalıdır.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT LotNo, UretimEmirID FROM UretimLotlari WHERE LotID=?", (veri.LotID,))
+        lot = cursor.fetchone()
+        if not lot:
+            raise HTTPException(status_code=404, detail="Lot bulunamadı.")
+
+        cursor.execute("""INSERT INTO KaliteKontrolKayitlari
+                           (LotID, UretimEmirID, KontrolTuru, Sonuc, OlculenDeger, BeklenenMinDeger, BeklenenMaxDeger, Birim, Aciklama, KontrolEden)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (veri.LotID, lot[1], veri.KontrolTuru, veri.Sonuc, veri.OlculenDeger,
+                        veri.BeklenenMinDeger, veri.BeklenenMaxDeger, veri.Birim, veri.Aciklama, user["username"]))
+
+        yeni_kalite_durumu = "RED" if veri.Sonuc == "RED" else "KABUL"
+        cursor.execute("UPDATE UretimLotlari SET KaliteDurumu=? WHERE LotID=?", (yeni_kalite_durumu, veri.LotID))
+
+        log_islem(cursor, f"Kalite kontrolü: {lot[0]} -> {veri.Sonuc}", user["username"])
+        conn.commit()
+        return {"mesaj": "Kalite kontrol kaydı eklendi.", "KaliteDurumu": yeni_kalite_durumu}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/kalite-kontrol-listesi")
+def kalite_kontrol_listesi(lot_id: Optional[int] = None, sonuc: Optional[str] = None, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = """SELECT k.KontrolID, l.LotNo, l.StokAdi, k.KontrolTuru, k.Sonuc, k.OlculenDeger, k.Birim, k.KontrolEden, k.KontrolTarihi
+                    FROM KaliteKontrolKayitlari k JOIN UretimLotlari l ON k.LotID = l.LotID WHERE 1=1"""
+        parametreler = []
+        if lot_id:
+            sorgu += " AND k.LotID=?"
+            parametreler.append(lot_id)
+        if sonuc:
+            sorgu += " AND k.Sonuc=?"
+            parametreler.append(sonuc)
+        sorgu += " ORDER BY k.KontrolTarihi DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"kontroller": [{"KontrolID": r[0], "LotNo": r[1], "StokAdi": r[2] or "-", "KontrolTuru": r[3], "Sonuc": r[4],
+                                 "OlculenDeger": r[5], "Birim": r[6] or "", "KontrolEden": r[7], "KontrolTarihi": str(r[8])[:16]}
+                                for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/kalite-kontrol/{lot_id}")
+def kalite_kontrol_lot_gecmisi(lot_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT KontrolID, KontrolTuru, Sonuc, OlculenDeger, BeklenenMinDeger, BeklenenMaxDeger, Birim, Aciklama, KontrolEden, KontrolTarihi
+                           FROM KaliteKontrolKayitlari WHERE LotID=? ORDER BY KontrolTarihi DESC""", (lot_id,))
+        return {"kontroller": [{"KontrolID": r[0], "KontrolTuru": r[1], "Sonuc": r[2], "OlculenDeger": r[3],
+                                 "BeklenenMinDeger": r[4], "BeklenenMaxDeger": r[5], "Birim": r[6] or "", "Aciklama": r[7] or "",
+                                 "KontrolEden": r[8], "KontrolTarihi": str(r[9])[:16]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.post("/uygunsuzluk-ekle")
+def uygunsuzluk_ekle(veri: UygunsuzlukEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Üretim"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""INSERT INTO UygunsuzlukKayitlari (KontrolID, LotID, HataKodu, HataAciklama, Siddet, AcanKullanici)
+                           OUTPUT inserted.UygunsuzlukID VALUES (?, ?, ?, ?, ?, ?)""",
+                       (veri.KontrolID, veri.LotID, veri.HataKodu, veri.HataAciklama, veri.Siddet, user["username"]))
+        uygunsuzluk_id = int(cursor.fetchone()[0])
+        log_islem(cursor, f"Uygunsuzluk açıldı: #{uygunsuzluk_id} - {veri.HataKodu}", user["username"])
+        conn.commit()
+        return {"mesaj": "Uygunsuzluk kaydı açıldı.", "UygunsuzlukID": uygunsuzluk_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.put("/uygunsuzluk-kapat/{uygunsuzluk_id}")
+def uygunsuzluk_kapat(uygunsuzluk_id: int, veri: UygunsuzlukKapatRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Üretim"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Durum FROM UygunsuzlukKayitlari WHERE UygunsuzlukID=?", (uygunsuzluk_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Uygunsuzluk kaydı bulunamadı.")
+        cursor.execute("""UPDATE UygunsuzlukKayitlari SET Durum='KAPALI', DuzelticiFaaliyet=?, KapanisTarihi=GETDATE()
+                           WHERE UygunsuzlukID=?""", (veri.DuzelticiFaaliyet, uygunsuzluk_id))
+        log_islem(cursor, f"Uygunsuzluk kapatıldı: #{uygunsuzluk_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Uygunsuzluk kapatıldı."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/uygunsuzluk-listesi")
+def uygunsuzluk_listesi(durum: Optional[str] = None, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = """SELECT UygunsuzlukID, LotID, HataKodu, HataAciklama, Siddet, Durum, AcanKullanici, AcilisTarihi, KapanisTarihi
+                    FROM UygunsuzlukKayitlari WHERE 1=1"""
+        parametreler = []
+        if durum:
+            sorgu += " AND Durum=?"
+            parametreler.append(durum)
+        sorgu += " ORDER BY AcilisTarihi DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"uygunsuzluklar": [{"UygunsuzlukID": r[0], "LotID": r[1], "HataKodu": r[2], "HataAciklama": r[3] or "",
+                                     "Siddet": r[4], "Durum": r[5], "AcanKullanici": r[6], "AcilisTarihi": str(r[7])[:16],
+                                     "KapanisTarihi": str(r[8])[:16] if r[8] else None} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -7350,13 +7905,21 @@ def cek_senet_ciro(veri: CekSenetCiro, user: dict = Depends(yetki_kontrol(["Yön
     finally:
         conn.close()
 
+def _satinalma_talebi_olustur(cursor, stok_kod: str, miktar: float, aciklama: str, talep_eden: str) -> int:
+    """Tek bir SatinAlmaTalepleri satırı ekler ve TalepID'sini döner. /satinalma-talep-ekle
+    ve MRP'nin /mrp-oneri-donustur endpoint'i tarafından ortak kullanılır - iki yerde
+    aynı INSERT mantığının ayrı ayrı yazılıp zamanla birbirinden sapmasını (kod tekrarı
+    riskini) önlemek için buraya çıkarıldı."""
+    cursor.execute("INSERT INTO SatinAlmaTalepleri (StokKod, Miktar, Aciklama, TalepEden) OUTPUT inserted.TalepID VALUES (?, ?, ?, ?)",
+                   (stok_kod, miktar, aciklama, talep_eden))
+    return int(cursor.fetchone()[0])
+
 @app.post("/satinalma-talep-ekle")
 def satinalma_talep_ekle(veri: SatinAlmaTalepEkle, user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO SatinAlmaTalepleri (StokKod, Miktar, Aciklama, TalepEden) VALUES (?, ?, ?, ?)",
-                       (veri.StokKod, veri.Miktar, veri.Aciklama, veri.TalepEden))
+        _satinalma_talebi_olustur(cursor, veri.StokKod, veri.Miktar, veri.Aciklama, veri.TalepEden)
         log_islem(cursor, f"Satınalma talebi açıldı: {veri.StokKod}", user["username"])
         conn.commit()
         return {"mesaj": "Talep oluşturuldu."}
@@ -7407,6 +7970,215 @@ def satinalma_talep_reddet(talep_id: int, user: dict = Depends(yetki_kontrol(["Y
         log_islem(cursor, f"Satınalma talebi reddedildi: #{talep_id}", user["username"])
         conn.commit()
         return {"mesaj": f"Talep #{talep_id} reddedildi."}
+    finally:
+        conn.close()
+
+# --- MRP (MALZEME İHTİYAÇ PLANLAMASI) ---
+# KAPSAM: MRP salt-okunur bir ÖNERİ raporudur, otomatik satınalma DEĞİLDİR - öneriler
+# üretilir, kullanıcı seçtiklerini /mrp-oneri-donustur ile MANUEL olarak satınalma
+# talebine dönüştürür (SAP B1'in MRP sihirbazı mantığı: öner -> kullanıcı serbest bırakır).
+_MRP_ACIK_SIPARIS_DURUMLARI = ('Bekliyor', 'Onaylandı', 'Kargoda', 'Kısmi Teslim')
+
+def _mrp_bilesen_patlat(cursor, stok_kod: str, miktar: float, ihtiyac_map: dict, ziyaret_edilen: set,
+                         kaynak_siparisler: frozenset = frozenset(), derinlik: int = 0):
+    """Bir mamulün ihtiyacını reçetesi (BOM) üzerinden hammadde/bileşenlerine böler.
+    Bileşenin kendisi de bir mamulse (ara mamul / yarı mamul) özyinelemeli olarak
+    daha da patlatılır - azami derinlik 10 ile sınırlanır ve bir dalda daha önce
+    görülen bir kod tekrar görülürse (döngüsel reçete) o dal sessizce atlanır; aksi
+    halde hatalı/döngüsel bir reçete tanımı sonsuz döngüye sokabilirdi.
+
+    ihtiyac_map değerleri {'miktar': float, 'kaynaklar': set} şeklindedir -
+    'kaynaklar', bu bileşene hangi orijinal SiparisID'lerin sebep olduğunu izler
+    (izlenebilirlik için); patlatma esnasında kaynak_siparisler kümesi aynen
+    aşağı taşınır (bir mamulün TÜM bileşenleri, o mamulü tetikleyen siparişlerin
+    kaynağıdır).
+
+    KAPSAM SINIRI: Ara seviyelerde kendi stoğu netleştirilmez (sadece brüt patlatma
+    yapılır) - tam çok seviyeli netleştirme MVP kapsamı dışındadır, sadece üst
+    seviye (mamul) ve YAPRAK (hammadde) seviyesinde netleştirme yapılır (bkz.
+    _mrp_hesapla)."""
+    if derinlik > 10 or miktar <= 0:
+        return
+    if stok_kod in ziyaret_edilen:
+        print(f">>> MRP: '{stok_kod}' için döngüsel reçete tespit edildi, bu dal atlandı.")
+        return
+    ziyaret_edilen = ziyaret_edilen | {stok_kod}
+
+    cursor.execute("SELECT TOP 1 ReceteID FROM UretimReceteleri WHERE MamulKodu=?", (stok_kod,))
+    recete = cursor.fetchone()
+    if not recete:
+        # Reçetesi yok -> bu bir hammadde/satın alınan kalem, yaprak seviyede ihtiyaca ekle.
+        kayit = ihtiyac_map.setdefault(stok_kod, {"miktar": 0.0, "kaynaklar": set()})
+        kayit["miktar"] += miktar
+        kayit["kaynaklar"] |= set(kaynak_siparisler)
+        return
+
+    cursor.execute("SELECT HammaddeKodu, Miktar, ISNULL(FireOrani,0) FROM ReceteBilesenleri WHERE ReceteID=?", (recete[0],))
+    for hammadde_kodu, birim_miktar, fire_orani in cursor.fetchall():
+        bilesen_ihtiyaci = (miktar * float(birim_miktar)) * (1 + float(fire_orani) / 100.0)
+        _mrp_bilesen_patlat(cursor, hammadde_kodu, bilesen_ihtiyaci, ihtiyac_map, ziyaret_edilen, kaynak_siparisler, derinlik + 1)
+
+def _mrp_hesapla(cursor) -> list:
+    """Açık satış siparişi talebini reçeteler (BOM) üzerinden hammadde/bileşen
+    ihtiyacına patlatır, mevcut stok + açık üretim çıktısı + onaylanmış-henüz-
+    teslim-alınmamış satınalma talepleriyle netleştirir ve pozitif net ihtiyacı
+    olan kalemler için öneri listesi döner."""
+    # 1. Açık siparişlerden mamul bazında net talep + kaynak sipariş ID'leri
+    yer_tutucular = ",".join("?" * len(_MRP_ACIK_SIPARIS_DURUMLARI))
+    cursor.execute(f"""
+        SELECT SiparisID, StokKod, Miktar - ISNULL(TeslimEdilenMiktar,0)
+        FROM Siparisler WHERE Durum IN ({yer_tutucular}) AND StokKod IS NOT NULL
+    """, _MRP_ACIK_SIPARIS_DURUMLARI)
+    talep_map = {}     # StokKod -> toplam açık talep miktarı
+    kaynak_map = {}     # StokKod -> [SiparisID, ...]
+    for sip_id, stok_kod, kalan in cursor.fetchall():
+        kalan = float(kalan or 0)
+        if kalan <= 0:
+            continue
+        talep_map[stok_kod] = talep_map.get(stok_kod, 0) + kalan
+        kaynak_map.setdefault(stok_kod, []).append(sip_id)
+
+    ihtiyac_map = {}  # patlatma sonrası: bileşen/hammadde StokKod -> brüt ihtiyaç
+    for mamul_kodu, talep in talep_map.items():
+        cursor.execute("SELECT ISNULL(MevcutMiktar,0) FROM StokKartlari WHERE StokKod=?", (mamul_kodu,))
+        stok_satiri = cursor.fetchone()
+        mevcut = float(stok_satiri[0]) if stok_satiri else 0.0
+
+        cursor.execute("""SELECT ISNULL(SUM(PlanlananMiktar - ISNULL(GerceklesenMiktar,0)),0)
+                           FROM UretimEmirleri e JOIN UretimReceteleri r ON e.ReceteID=r.ReceteID
+                           WHERE r.MamulKodu=? AND e.Durum <> 'Tamamlandı'""", (mamul_kodu,))
+        acik_uretim = float(cursor.fetchone()[0] or 0)
+
+        net_mamul_ihtiyaci = talep - mevcut - acik_uretim
+        if net_mamul_ihtiyaci > 0.0001:
+            _mrp_bilesen_patlat(cursor, mamul_kodu, net_mamul_ihtiyaci, ihtiyac_map, set(),
+                                frozenset(kaynak_map.get(mamul_kodu, [])))
+
+    # 2. Patlatılmış her bileşen/hammadde için stok + açık üretim + onaylı-henüz-
+    #    teslim-alınmamış satınalma talebiyle netleştir.
+    oneriler = []
+    for stok_kod, ihtiyac_bilgi in ihtiyac_map.items():
+        brut_ihtiyac = ihtiyac_bilgi["miktar"]
+        cursor.execute("SELECT ISNULL(StokAdi, ?), ISNULL(MevcutMiktar,0) FROM StokKartlari WHERE StokKod=?", (stok_kod, stok_kod))
+        stok_satiri = cursor.fetchone()
+        stok_adi = stok_satiri[0] if stok_satiri else stok_kod
+        mevcut = float(stok_satiri[1]) if stok_satiri else 0.0
+
+        cursor.execute("""SELECT ISNULL(SUM(PlanlananMiktar - ISNULL(GerceklesenMiktar,0)),0)
+                           FROM UretimEmirleri e JOIN UretimReceteleri r ON e.ReceteID=r.ReceteID
+                           WHERE r.MamulKodu=? AND e.Durum <> 'Tamamlandı'""", (stok_kod,))
+        acik_uretim = float(cursor.fetchone()[0] or 0)
+
+        # NOT: Onaylanmış bir satınalma talebinin GERÇEKTEN stoka girip girmediğini
+        # (mal kabul/GRN) bu şemada izleyemiyoruz - bu yüzden bu miktar bir YAKLAŞIKLIKTIR.
+        cursor.execute("SELECT ISNULL(SUM(Miktar),0) FROM SatinAlmaTalepleri WHERE StokKod=? AND Durum='Onaylandı'", (stok_kod,))
+        acik_talep = float(cursor.fetchone()[0] or 0)
+
+        net_ihtiyac = brut_ihtiyac - mevcut - acik_uretim - acik_talep
+        if net_ihtiyac > 0.0001:
+            oneriler.append({
+                "StokKod": stok_kod, "StokAdi": stok_adi, "NetIhtiyacMiktari": round(net_ihtiyac, 4),
+                "MevcutStok": mevcut, "AcikTalepMiktari": acik_talep,
+                "OnerilenSatinalmaMiktari": round(net_ihtiyac, 4),
+                "KaynakSiparisIDleri": ",".join(str(i) for i in sorted(ihtiyac_bilgi["kaynaklar"])),
+            })
+    return oneriler
+
+class MrpOneriDonusturRequest(BaseModel):
+    OneriIDleri: list[int]
+
+@app.post("/mrp-calistir")
+def mrp_calistir(user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma", "Üretim"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        oneriler = _mrp_hesapla(cursor)
+        calisma_id = str(uuid.uuid4())
+        for o in oneriler:
+            cursor.execute("""INSERT INTO MrpOnerileri
+                               (CalismaID, StokKod, StokAdi, NetIhtiyacMiktari, MevcutStok, AcikTalepMiktari,
+                                OnerilenSatinalmaMiktari, KaynakSiparisIDleri, OlusturanKullanici)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           (calisma_id, o["StokKod"], o["StokAdi"], o["NetIhtiyacMiktari"], o["MevcutStok"],
+                            o["AcikTalepMiktari"], o["OnerilenSatinalmaMiktari"], o["KaynakSiparisIDleri"], user["username"]))
+        log_islem(cursor, f"MRP çalıştırıldı: {len(oneriler)} öneri üretildi (Çalışma: {calisma_id})", user["username"])
+        conn.commit()
+        return {"mesaj": f"MRP çalıştırıldı. {len(oneriler)} öneri üretildi.", "CalismaID": calisma_id, "OneriSayisi": len(oneriler), "Oneriler": oneriler}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/mrp-onerileri")
+def mrp_onerileri_getir(calisma_id: Optional[str] = None, durum: Optional[str] = None,
+                         user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma", "Üretim"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = """SELECT OneriID, CalismaID, StokKod, StokAdi, NetIhtiyacMiktari, MevcutStok, AcikTalepMiktari,
+                          OnerilenSatinalmaMiktari, KaynakSiparisIDleri, Durum, OlusturmaTarihi, OlusanTalepID
+                   FROM MrpOnerileri WHERE 1=1"""
+        parametreler = []
+        if calisma_id:
+            sorgu += " AND CalismaID=?"
+            parametreler.append(calisma_id)
+        if durum:
+            sorgu += " AND Durum=?"
+            parametreler.append(durum)
+        sorgu += " ORDER BY OlusturmaTarihi DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"oneriler": [{"OneriID": r[0], "CalismaID": str(r[1]), "StokKod": r[2], "StokAdi": r[3],
+                               "NetIhtiyacMiktari": float(r[4]), "MevcutStok": float(r[5]), "AcikTalepMiktari": float(r[6]),
+                               "OnerilenSatinalmaMiktari": float(r[7]), "KaynakSiparisIDleri": r[8] or "",
+                               "Durum": r[9], "OlusturmaTarihi": str(r[10])[:16], "OlusanTalepID": r[11]}
+                              for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.post("/mrp-oneri-donustur")
+def mrp_oneri_donustur(veri: MrpOneriDonusturRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        donusturulen = []
+        for oneri_id in veri.OneriIDleri:
+            cursor.execute("SELECT StokKod, OnerilenSatinalmaMiktari, Durum FROM MrpOnerileri WHERE OneriID=?", (oneri_id,))
+            row = cursor.fetchone()
+            if not row or row[2] != "BEKLIYOR":
+                continue  # zaten dönüştürülmüş/reddedilmiş ya da bulunamayan öneri sessizce atlanır (idempotency)
+            stok_kod, miktar = row[0], row[1]
+            talep_id = _satinalma_talebi_olustur(cursor, stok_kod, miktar, f"MRP önerisi #{oneri_id}", user["username"])
+            cursor.execute("UPDATE MrpOnerileri SET Durum='ONAYLANDI', OlusanTalepID=? WHERE OneriID=?", (talep_id, oneri_id))
+            donusturulen.append({"OneriID": oneri_id, "TalepID": talep_id})
+        log_islem(cursor, f"MRP önerileri satınalma talebine dönüştürüldü: {len(donusturulen)} adet", user["username"])
+        conn.commit()
+        return {"mesaj": f"{len(donusturulen)} öneri satınalma talebine dönüştürüldü.", "Donusturulen": donusturulen}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.put("/mrp-oneri-reddet/{oneri_id}")
+def mrp_oneri_reddet(oneri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Durum FROM MrpOnerileri WHERE OneriID=?", (oneri_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Öneri bulunamadı.")
+        cursor.execute("UPDATE MrpOnerileri SET Durum='REDDEDILDI' WHERE OneriID=?", (oneri_id,))
+        log_islem(cursor, f"MRP önerisi reddedildi: #{oneri_id}", user["username"])
+        conn.commit()
+        return {"mesaj": f"Öneri #{oneri_id} reddedildi."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
 
