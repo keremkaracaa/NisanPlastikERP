@@ -6298,11 +6298,18 @@ def tedarikci_guncelle(tedarikci: TedarikciGuncelle, user: dict = Depends(yetki_
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        cursor.execute("SELECT FirmaAdi, YetkiliKisi, Telefon, VergiDairesi, VergiNo, Adres FROM Tedarikciler WHERE TedarikciID=?", (tedarikci.TedarikciID,))
+        eski = cursor.fetchone()
         cursor.execute("""UPDATE Tedarikciler SET FirmaAdi=?, YetkiliKisi=?, Telefon=?, VergiDairesi=?, VergiNo=?, Adres=?
                            WHERE TedarikciID=?""",
                        (tedarikci.FirmaAdi, tedarikci.YetkiliKisi, tedarikci.Telefon, tedarikci.VergiDairesi, tedarikci.VergiNo, tedarikci.Adres, tedarikci.TedarikciID))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Tedarikçi bulunamadı.")
+        if eski:
+            alanlar = ["FirmaAdi", "YetkiliKisi", "Telefon", "VergiDairesi", "VergiNo", "Adres"]
+            yeniler = [tedarikci.FirmaAdi, tedarikci.YetkiliKisi, tedarikci.Telefon, tedarikci.VergiDairesi, tedarikci.VergiNo, tedarikci.Adres]
+            for alan, e, y in zip(alanlar, eski, yeniler):
+                log_degisiklik(cursor, "Tedarikciler", tedarikci.TedarikciID, alan, e, y, user["username"])
         log_islem(cursor, f"Tedarikçi güncellendi: {tedarikci.FirmaAdi}", user["username"])
         conn.commit()
         return {"mesaj": f"'{tedarikci.FirmaAdi}' güncellendi."}

@@ -1164,6 +1164,49 @@ class TestElektronikImza:
         assert "i.KullaniciAdi=?" in cagri.args[0]
 
 
+class TestTedarikciGuncelleDenetimIzi:
+    """/tedarikci-guncelle önceden sadece düz metin log_islem yazıyordu; /musteri-guncelle
+    ile aynı yapıda olmasına rağmen alan bazlı eski/yeni değer denetim izi (log_degisiklik)
+    hiç çağrılmıyordu. Artık VergiNo/Adres gibi dispute-kritik alanlar da izleniyor."""
+
+    def _tedarikci_body(self, **overrides):
+        gövde = {"TedarikciID": 3, "FirmaAdi": "ABC Plastik", "YetkiliKisi": "Ahmet Yılmaz",
+                 "Telefon": "0555 111 22 33", "VergiDairesi": "Kadıköy", "VergiNo": "1234567890",
+                 "Adres": "Yeni Adres No:5"}
+        gövde.update(overrides)
+        return gövde
+
+    def test_alan_degisince_denetim_izi_yazilir(self, client, monkeypatch):
+        eski_satir = ("ABC Plastik", "Ahmet Yılmaz", "0555 111 22 33", "Kadıköy", "1234567890", "Eski Adres No:1")
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=eski_satir)
+        cursor.rowcount = 1
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/tedarikci-guncelle", json=self._tedarikci_body(Adres="Yeni Adres No:5"))
+        assert yanit.status_code == 200
+        denetim_cagrilari = [c for c in cursor.execute.call_args_list if "DegisiklikLoglari" in c.args[0]]
+        assert len(denetim_cagrilari) == 1
+        assert denetim_cagrilari[0].args[1][2] == "Adres"
+        assert denetim_cagrilari[0].args[1][3] == "Eski Adres No:1"
+        assert denetim_cagrilari[0].args[1][4] == "Yeni Adres No:5"
+
+    def test_hicbir_alan_degismezse_denetim_izi_yazilmaz(self, client, monkeypatch):
+        aynen_ayni = ("ABC Plastik", "Ahmet Yılmaz", "0555 111 22 33", "Kadıköy", "1234567890", "Yeni Adres No:5")
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=aynen_ayni)
+        cursor.rowcount = 1
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/tedarikci-guncelle", json=self._tedarikci_body())
+        assert yanit.status_code == 200
+        denetim_cagrilari = [c for c in cursor.execute.call_args_list if "DegisiklikLoglari" in c.args[0]]
+        assert len(denetim_cagrilari) == 0
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.put("/tedarikci-guncelle", json=self._tedarikci_body())
+        assert yanit.status_code in (401, 403)
+
+
 class TestOtomatikYedekleme:
     """Otomatik veritabanı yedeklemesi önceden hiç yoktu - /veritabani-yedekle
     sadece elle tıklanınca çalışıyordu. Artık her gece otomatik çalışan ve eski
