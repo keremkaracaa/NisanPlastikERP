@@ -4407,8 +4407,8 @@ def veritabani_yedekle(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
     cursor = conn.cursor()
     try:
         zaman_damgasi = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        yedek_klasoru = r"C:\NisanERP_Yedekler"
-        yedek_yolu = f"{yedek_klasoru}\\Yedek_{zaman_damgasi}.bak"
+        os.makedirs(YEDEK_KLASORU, exist_ok=True)
+        yedek_yolu = os.path.join(YEDEK_KLASORU, f"Yedek_{zaman_damgasi}.bak")
         try:
             cursor.execute(f"BACKUP DATABASE NisanPlastikERP TO DISK = '{yedek_yolu}'")
         except pyodbc.Error as e:
@@ -4417,6 +4417,84 @@ def veritabani_yedekle(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
         return {"mesaj": "Veritabanı başarıyla yedeklendi.", "YedekYolu": yedek_yolu}
     finally:
         conn.close()
+
+YEDEK_KLASORU = r"C:\NisanERP_Yedekler"
+
+def otomatik_veritabani_yedekle():
+    """Zamanlanmış (varsayılan: her gece 02:00) otomatik veritabanı yedeği alır -
+    ÖNCEDEN yedekleme SADECE elle, /veritabani-yedekle endpoint'i tıklanarak
+    yapılıyordu; kimse tıklamazsa hiç yedek alınmıyordu. Bu, tüm veritabanının
+    tek bir noktada (disk arızası, yanlışlık, vb.) geri dönüşsüz kaybolma riski
+    demekti - bu, eklenen diğer HERHANGİ bir özellikten daha kritik bir açıktı.
+
+    SistemAyarlari.OtomatikYedeklemeAktif='0' ise (kullanıcı bilinçli olarak
+    kapatmışsa) atlanır - varsayılan AÇIKTIR (güvenlik özelliği, aksine bir ayar
+    olmadıkça açık kalmalı). SistemAyarlari.YedekSaklamaGunu (varsayılan 14) gün
+    kaç günden eski yedeklerin otomatik silineceğini belirler - aksi halde disk
+    zamanla dolar (sonsuz saklama gerçekçi değil)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        conn.autocommit = True
+        cursor = conn.cursor()
+        cursor.execute("SELECT AyarAnahtari, AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari IN ('OtomatikYedeklemeAktif', 'YedekSaklamaGunu')")
+        ayarlar = {r[0]: r[1] for r in cursor.fetchall()}
+        if ayarlar.get("OtomatikYedeklemeAktif", "1") != "1":
+            print(">>> Otomatik yedekleme kapalı (Sistem Ayarları), atlandı.")
+            return
+        saklama_gunu = int(ayarlar.get("YedekSaklamaGunu") or 14)
+
+        os.makedirs(YEDEK_KLASORU, exist_ok=True)
+        zaman_damgasi = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        yedek_yolu = os.path.join(YEDEK_KLASORU, f"Otomatik_Yedek_{zaman_damgasi}.bak")
+        cursor.execute(f"BACKUP DATABASE NisanPlastikERP TO DISK = '{yedek_yolu}'")
+        print(f">>> Otomatik veritabanı yedeği alındı: {yedek_yolu}")
+
+        # Eski yedekleri temizle - hem elle hem otomatik alınan .bak dosyaları kapsanır,
+        # disk süresiz dolmasın diye.
+        simdi = datetime.datetime.now()
+        for dosya_adi in os.listdir(YEDEK_KLASORU):
+            tam_yol = os.path.join(YEDEK_KLASORU, dosya_adi)
+            if dosya_adi.lower().endswith(".bak") and os.path.isfile(tam_yol):
+                degisim_zamani = datetime.datetime.fromtimestamp(os.path.getmtime(tam_yol))
+                if (simdi - degisim_zamani).days > saklama_gunu:
+                    try:
+                        os.remove(tam_yol)
+                        print(f">>> Eski yedek silindi (>{saklama_gunu} gün): {dosya_adi}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f">>> Otomatik yedekleme hatası: {e}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+# Otomatik yedekleme her gece saat 02:00'de çalışır (fonksiyon bu noktada zaten
+# tanımlanmış olduğu için scheduler'a burada, dosyanın en başında değil, kaydediliyor
+# - alarm_kurallarini_kontrol_et ile aynı desen).
+scheduler.add_job(otomatik_veritabani_yedekle, 'cron', hour=2, minute=0)
+
+@app.get("/son-yedek-bilgisi")
+def son_yedek_bilgisi(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    """En son alınan yedeğin adı/tarihi/boyutunu döner - kullanıcı dosya sistemine
+    gitmeden 'otomatik yedekleme gerçekten çalışıyor mu' sorusuna cevap bulabilsin."""
+    try:
+        if not os.path.isdir(YEDEK_KLASORU):
+            return {"YedekVarMi": False}
+        bak_dosyalari = [f for f in os.listdir(YEDEK_KLASORU) if f.lower().endswith(".bak")]
+        if not bak_dosyalari:
+            return {"YedekVarMi": False}
+        en_yeni = max(bak_dosyalari, key=lambda f: os.path.getmtime(os.path.join(YEDEK_KLASORU, f)))
+        tam_yol = os.path.join(YEDEK_KLASORU, en_yeni)
+        boyut_mb = round(os.path.getsize(tam_yol) / (1024 * 1024), 1)
+        tarih = datetime.datetime.fromtimestamp(os.path.getmtime(tam_yol))
+        return {"YedekVarMi": True, "DosyaAdi": en_yeni, "Tarih": tarih.strftime("%Y-%m-%d %H:%M"),
+                "BoyutMB": boyut_mb, "ToplamYedekSayisi": len(bak_dosyalari)}
+    except Exception as e:
+        return {"YedekVarMi": False, "Hata": str(e)}
 
 @app.get("/depolar")
 def depolari_getir(user: dict = Depends(get_current_user)):

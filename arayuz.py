@@ -3107,8 +3107,28 @@ class MainApp(ctk.CTkToplevel):
                           "'Otomatik Gönder' AÇILMADAN önce entegratör ayarlarının doğru girildiğinden emin olun.",
                      font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=10, pady=(0, 10))
 
+        yedek_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=8)
+        yedek_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(yedek_cerceve, text="💾 Otomatik Veritabanı Yedekleme", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        yedek_satiri1 = ctk.CTkFrame(yedek_cerceve, fg_color="transparent")
+        yedek_satiri1.pack(fill="x", padx=10, pady=(0, 5))
+        self.yedek_otomatik_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(yedek_satiri1, text="Her gece 02:00'de otomatik yedek al", variable=self.yedek_otomatik_var,
+                         command=self.yedek_ayarlarini_kaydet).pack(side="left", padx=(0, 15))
+        ctk.CTkLabel(yedek_satiri1, text="Saklama süresi (gün):").pack(side="left", padx=(0, 6))
+        self.yedek_saklama_entry = ctk.CTkEntry(yedek_satiri1, width=60)
+        self.yedek_saklama_entry.pack(side="left", padx=(0, 6))
+        ctk.CTkButton(yedek_satiri1, text="Kaydet", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.yedek_ayarlarini_kaydet).pack(side="left", padx=(0, 15))
+        ctk.CTkButton(yedek_satiri1, text="💾 Şimdi Yedekle", fg_color="#f97316", hover_color="#c2410c",
+                      command=self.veritabani_yedekle_islem).pack(side="left")
+        self.yedek_son_bilgi_label = ctk.CTkLabel(yedek_cerceve, text="Son yedek bilgisi yükleniyor...",
+                                                    font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left")
+        self.yedek_son_bilgi_label.pack(anchor="w", padx=10, pady=(0, 10))
+
         self._eposta_ayarlarini_yukle()
         self._efatura_ayarlarini_yukle()
+        self._yedek_ayarlarini_yukle()
 
     def _efatura_ayarlarini_yukle(self):
         try:
@@ -3143,6 +3163,34 @@ class MainApp(ctk.CTkToplevel):
             self._efatura_ayarlarini_yukle()
             if not sessiz:
                 messagebox.showinfo("Başarılı", "e-Fatura entegratör ayarları kaydedildi.")
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def _yedek_ayarlarini_yukle(self):
+        try:
+            res = requests.get(f"{API}/sistem-ayarlari", headers=self.req_headers(), timeout=5)
+            ayarlar = res.json().get("ayarlar", {})
+            self.yedek_otomatik_var.set(ayarlar.get("OtomatikYedeklemeAktif", "1") == "1")
+            self.yedek_saklama_entry.delete(0, "end")
+            self.yedek_saklama_entry.insert(0, ayarlar.get("YedekSaklamaGunu", "14"))
+        except Exception:
+            pass
+        try:
+            res = requests.get(f"{API}/son-yedek-bilgisi", headers=self.req_headers(), timeout=5)
+            veri = res.json()
+            if veri.get("YedekVarMi"):
+                self.yedek_son_bilgi_label.configure(
+                    text=f"Son yedek: {veri['DosyaAdi']}  |  {veri['Tarih']}  |  {veri['BoyutMB']} MB  |  Toplam {veri['ToplamYedekSayisi']} yedek dosyası")
+            else:
+                self.yedek_son_bilgi_label.configure(text="Henüz alınmış bir yedek bulunamadı.")
+        except Exception:
+            self.yedek_son_bilgi_label.configure(text="Son yedek bilgisi alınamadı.")
+
+    def yedek_ayarlarini_kaydet(self):
+        saklama = self.yedek_saklama_entry.get().strip() or "14"
+        try:
+            requests.put(f"{API}/sistem-ayarlari/OtomatikYedeklemeAktif", params={"deger": "1" if self.yedek_otomatik_var.get() else "0"}, headers=self.req_headers(), timeout=5)
+            requests.put(f"{API}/sistem-ayarlari/YedekSaklamaGunu", params={"deger": saklama}, headers=self.req_headers(), timeout=5)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
@@ -5162,6 +5210,8 @@ class MainApp(ctk.CTkToplevel):
             res = requests.post(f"{API}/veritabani-yedekle", headers=self.req_headers(), timeout=30)
             if res.status_code == 200:
                 messagebox.showinfo("Yedekleme Başarılı", res.json().get("mesaj", "") + f"\nYol: {res.json().get('YedekYolu','')}")
+                if hasattr(self, "yedek_son_bilgi_label"):
+                    self._yedek_ayarlarini_yukle()
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:

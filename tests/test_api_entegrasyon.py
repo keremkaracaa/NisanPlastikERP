@@ -1164,6 +1164,63 @@ class TestElektronikImza:
         assert "i.KullaniciAdi=?" in cagri.args[0]
 
 
+class TestOtomatikYedekleme:
+    """Otomatik veritabanı yedeklemesi önceden hiç yoktu - /veritabani-yedekle
+    sadece elle tıklanınca çalışıyordu. Artık her gece otomatik çalışan ve eski
+    yedekleri temizleyen bir zamanlanmış görev var."""
+
+    def test_ayar_kapaliyken_yedek_alinmaz(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[("OtomatikYedeklemeAktif", "0")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        main.otomatik_veritabani_yedekle()
+        yedek_cagrisi = [c for c in cursor.execute.call_args_list if "BACKUP DATABASE" in c.args[0]]
+        assert len(yedek_cagrisi) == 0
+
+    def test_varsayilan_acik_yedek_alinir(self, monkeypatch, tmp_path):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])  # hiç ayar yok -> varsayılan (açık)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "YEDEK_KLASORU", str(tmp_path))
+
+        main.otomatik_veritabani_yedekle()
+        yedek_cagrisi = [c for c in cursor.execute.call_args_list if "BACKUP DATABASE" in c.args[0]]
+        assert len(yedek_cagrisi) == 1
+
+    def test_eski_yedekler_temizlenir(self, monkeypatch, tmp_path):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[("YedekSaklamaGunu", "1")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "YEDEK_KLASORU", str(tmp_path))
+
+        eski_dosya = tmp_path / "Otomatik_Yedek_eski.bak"
+        eski_dosya.write_text("x")
+        eski_zaman = (main.datetime.datetime.now() - main.datetime.timedelta(days=5)).timestamp()
+        os.utime(eski_dosya, (eski_zaman, eski_zaman))
+
+        main.otomatik_veritabani_yedekle()
+        assert not eski_dosya.exists()
+
+    def test_son_yedek_bilgisi_yedek_yoksa(self, client, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "YEDEK_KLASORU", str(tmp_path / "yok_boyle_bir_klasor"))
+        yanit = client.get("/son-yedek-bilgisi")
+        assert yanit.status_code == 200
+        assert yanit.json()["YedekVarMi"] is False
+
+    def test_son_yedek_bilgisi_yedek_varsa(self, client, monkeypatch, tmp_path):
+        (tmp_path / "Otomatik_Yedek_20260904_020000.bak").write_text("sahte yedek icerigi")
+        monkeypatch.setattr(main, "YEDEK_KLASORU", str(tmp_path))
+
+        yanit = client.get("/son-yedek-bilgisi")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["YedekVarMi"] is True
+        assert veri["ToplamYedekSayisi"] == 1
+
+    def test_son_yedek_bilgisi_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/son-yedek-bilgisi")
+        assert yanit.status_code in (401, 403)
+
+
 class _MrpSahteCursor:
     """MRP hesaplama fonksiyonu tek bir cursor üzerinden birden çok FARKLI SELECT
     çalıştırdığı için (talep, reçete, bileşen, stok, açık üretim, açık talep),
