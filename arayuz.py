@@ -3087,14 +3087,23 @@ class MainApp(ctk.CTkToplevel):
         self.efatura_apikey_entry = ctk.CTkEntry(efatura_satiri1, placeholder_text="API Key", width=180, show="•")
         self.efatura_apikey_entry.pack(side="left", padx=(0, 8))
         efatura_satiri2 = ctk.CTkFrame(efatura_cerceve, fg_color="transparent")
-        efatura_satiri2.pack(fill="x", padx=10, pady=(0, 10))
+        efatura_satiri2.pack(fill="x", padx=10, pady=(0, 5))
         self.efatura_seri_entry = ctk.CTkEntry(efatura_satiri2, placeholder_text="Seri Kodu (örn. NIS)", width=160)
         self.efatura_seri_entry.pack(side="left", padx=(0, 8))
         ctk.CTkButton(efatura_satiri2, text="Kaydet", fg_color="#16a34a", hover_color="#15803d",
-                      command=self.efatura_ayarlarini_kaydet).pack(side="left", padx=(0, 6))
+                      command=lambda: self.efatura_ayarlarini_kaydet(sessiz=False)).pack(side="left", padx=(0, 6))
+        efatura_satiri3 = ctk.CTkFrame(efatura_cerceve, fg_color="transparent")
+        efatura_satiri3.pack(fill="x", padx=10, pady=(0, 5))
+        self.efatura_otomatik_olustur_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(efatura_satiri3, text="Fatura kesilince e-Fatura XML'ini OTOMATİK oluştur",
+                         variable=self.efatura_otomatik_olustur_var, command=self.efatura_ayarlarini_kaydet).pack(side="left", padx=(0, 15))
+        self.efatura_otomatik_gonder_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(efatura_satiri3, text="...ve entegratöre de OTOMATİK gönder",
+                         variable=self.efatura_otomatik_gonder_var, command=self.efatura_ayarlarini_kaydet).pack(side="left")
         ctk.CTkLabel(efatura_cerceve,
                      text="Not: Bu ayarlar sadece XML'in gönderileceği entegratör bağlantısını tanımlar - gerçek GİB\n"
-                          "iletimi/imzalama için özel bir entegratörle (Uyumsoft, Foriba, Logo vb.) sözleşme yapılmalıdır.",
+                          "iletimi/imzalama için özel bir entegratörle (Uyumsoft, Foriba, Logo vb.) sözleşme yapılmalıdır.\n"
+                          "'Otomatik Gönder' AÇILMADAN önce entegratör ayarlarının doğru girildiğinden emin olun.",
                      font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=10, pady=(0, 10))
 
         self._eposta_ayarlarini_yukle()
@@ -3112,10 +3121,12 @@ class MainApp(ctk.CTkToplevel):
             self.efatura_seri_entry.insert(0, ayarlar.get("EFaturaSeriKodu", "NIS"))
             if ayarlar.get("EFaturaApiKey"):
                 self.efatura_apikey_entry.configure(placeholder_text="•••••••••••• (kayıtlı, değiştirmek için yeniden yazın)")
+            self.efatura_otomatik_olustur_var.set(ayarlar.get("EFaturaOtomatikOlustur") == "1")
+            self.efatura_otomatik_gonder_var.set(ayarlar.get("EFaturaOtomatikGonder") == "1")
         except Exception:
             pass
 
-    def efatura_ayarlarini_kaydet(self):
+    def efatura_ayarlarini_kaydet(self, sessiz=True):
         url = self.efatura_url_entry.get().strip()
         kullanici = self.efatura_kullanici_entry.get().strip()
         apikey = self.efatura_apikey_entry.get().strip()
@@ -3124,10 +3135,13 @@ class MainApp(ctk.CTkToplevel):
             requests.put(f"{API}/sistem-ayarlari/EFaturaEntegratorURL", params={"deger": url}, headers=self.req_headers(), timeout=5)
             requests.put(f"{API}/sistem-ayarlari/EFaturaKullaniciAdi", params={"deger": kullanici}, headers=self.req_headers(), timeout=5)
             requests.put(f"{API}/sistem-ayarlari/EFaturaSeriKodu", params={"deger": seri}, headers=self.req_headers(), timeout=5)
+            requests.put(f"{API}/sistem-ayarlari/EFaturaOtomatikOlustur", params={"deger": "1" if self.efatura_otomatik_olustur_var.get() else "0"}, headers=self.req_headers(), timeout=5)
+            requests.put(f"{API}/sistem-ayarlari/EFaturaOtomatikGonder", params={"deger": "1" if self.efatura_otomatik_gonder_var.get() else "0"}, headers=self.req_headers(), timeout=5)
             if apikey:
                 requests.put(f"{API}/sistem-ayarlari/EFaturaApiKey", params={"deger": apikey}, headers=self.req_headers(), timeout=5)
-            messagebox.showinfo("Başarılı", "e-Fatura entegratör ayarları kaydedildi.")
             self._efatura_ayarlarini_yukle()
+            if not sessiz:
+                messagebox.showinfo("Başarılı", "e-Fatura entegratör ayarları kaydedildi.")
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
@@ -4877,6 +4891,13 @@ class MainApp(ctk.CTkToplevel):
             self.init_konsinye()
             self.init_negatif_stok()
 
+        if self.rol in ["Yönetici", "Master", "Depo", "Satınalma", "Muhasebe"] or self.rol in ["Yönetici", "Master", "Satınalma", "Üretim"]:
+            # NOT: Bu blok önceden kendi kategori başlığına sahip değildi - bu yüzden
+            # sidebar'da bir önceki başlığın (Yönetici/Master için "ÜRETİM") altında
+            # görünüyordu, "Alış İrsaliyesi üretimin içinde" gibi yanıltıcı bir görünüme
+            # sebep oluyordu. Artık kendi "SATINALMA" başlığı var.
+            kategori_basligi("SATINALMA")
+
         if self.rol in ["Yönetici", "Master", "Depo", "Satınalma", "Muhasebe"]:
             self.tab_satinalma = yeni_sekme("🛒 Satınalma & Alış")
             self.tab_alis_irsaliye = yeni_sekme("📥 Alış İrsaliyesi")
@@ -6380,28 +6401,39 @@ class MainApp(ctk.CTkToplevel):
         form = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color=RENK_KART, corner_radius=8)
         form.pack(fill="x", padx=20, pady=(0, 10))
         satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(10, 5))
-        self.kk_lot_id = ctk.CTkEntry(satir1, placeholder_text="Lot ID", width=90)
-        self.kk_lot_id.pack(side="left", padx=(0, 8))
+        satir1.pack(fill="x", padx=10, pady=(10, 2))
+        lot_frame = ctk.CTkFrame(satir1, fg_color="transparent")
+        lot_frame.pack(side="left", padx=(0, 8))
+        self.kk_lot_id = ctk.CTkEntry(lot_frame, placeholder_text="Lot ID", width=70)
+        self.kk_lot_id.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(lot_frame, text="🔍", width=32, command=self.lot_secim_penceresi_kalite).pack(side="left")
+        self.kk_lot_etiket = ctk.CTkLabel(satir1, text="(lot seçilmedi)", font=("Arial", 11), text_color=RENK_METIN_SOLUK)
+        self.kk_lot_etiket.pack(side="left", padx=(0, 12))
         self.kk_kontrol_turu = ctk.CTkOptionMenu(satir1, values=["OLCUM", "GOZLEM"], width=110)
         self.kk_kontrol_turu.pack(side="left", padx=(0, 8))
         self.kk_sonuc = ctk.CTkOptionMenu(satir1, values=["KABUL", "RED", "SARTLI_KABUL"], width=130)
         self.kk_sonuc.pack(side="left", padx=(0, 8))
-        self.kk_olculen = ctk.CTkEntry(satir1, placeholder_text="Ölçülen Değer", width=110)
-        self.kk_olculen.pack(side="left", padx=(0, 8))
-        self.kk_birim = ctk.CTkEntry(satir1, placeholder_text="Birim (mm, gr...)", width=110)
-        self.kk_birim.pack(side="left", padx=(0, 8))
         satir2 = ctk.CTkFrame(form, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 10))
-        self.kk_min = ctk.CTkEntry(satir2, placeholder_text="Min Değer", width=100)
+        satir2.pack(fill="x", padx=10, pady=(5, 2))
+        ctk.CTkLabel(satir2, text="Ölçüm (Kontrol Türü='OLCUM' iken doldurun; GÖZLEM'de boş bırakılabilir):",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(0, 3))
+        satir2b = ctk.CTkFrame(form, fg_color="transparent")
+        satir2b.pack(fill="x", padx=10, pady=(0, 5))
+        self.kk_olculen = ctk.CTkEntry(satir2b, placeholder_text="Ölçülen Değer (örn: 1.52)", width=140)
+        self.kk_olculen.pack(side="left", padx=(0, 8))
+        self.kk_min = ctk.CTkEntry(satir2b, placeholder_text="Kabul edilebilir Min (örn: 1.40)", width=170)
         self.kk_min.pack(side="left", padx=(0, 8))
-        self.kk_max = ctk.CTkEntry(satir2, placeholder_text="Max Değer", width=100)
+        self.kk_max = ctk.CTkEntry(satir2b, placeholder_text="Kabul edilebilir Max (örn: 1.60)", width=170)
         self.kk_max.pack(side="left", padx=(0, 8))
-        self.kk_aciklama = ctk.CTkEntry(satir2, placeholder_text="Açıklama", width=260)
+        self.kk_birim = ctk.CTkEntry(satir2b, placeholder_text="Birim (mm, gr...)", width=100)
+        self.kk_birim.pack(side="left", padx=(0, 8))
+        satir3 = ctk.CTkFrame(form, fg_color="transparent")
+        satir3.pack(fill="x", padx=10, pady=(0, 10))
+        self.kk_aciklama = ctk.CTkEntry(satir3, placeholder_text="Açıklama", width=300)
         self.kk_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir2, text="✅ Kontrol Kaydet", fg_color="#16a34a", hover_color="#15803d",
+        ctk.CTkButton(satir3, text="✅ Kontrol Kaydet", fg_color="#16a34a", hover_color="#15803d",
                       command=self.kalite_kontrol_ekle_islem).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(satir2, text="⚠️ Uygunsuzluk Aç", fg_color="#ef4444", hover_color="#b91c1c",
+        ctk.CTkButton(satir3, text="⚠️ Uygunsuzluk Aç", fg_color="#ef4444", hover_color="#b91c1c",
                       command=self.uygunsuzluk_ekle_penceresi).pack(side="left")
 
         kk_cerceve, self.kalite_kontrol_tree = tablo_olustur(
@@ -6422,11 +6454,46 @@ class MainApp(ctk.CTkToplevel):
         self.kalite_kontrol_listesini_yukle()
         self.uygunsuzluk_listesini_yukle()
 
+    def lot_secim_penceresi_kalite(self):
+        """Kalite Kontrol formundaki Lot ID alanını doldurmak için Lot Takibi'ndeki
+        lotları (Lot No + Ürün + mevcut Kalite Durumu) listeleyip seçim yaptıran
+        küçük bir pencere - ham Lot ID'yi ezbere/elle yazmak zorunda kalmamak için."""
+        top = ctk.CTkToplevel(self)
+        top.title("Lot Seç")
+        top.geometry("520x480")
+        top.transient(self)
+        top.lift()
+        top.focus_force()
+        top.grab_set()
+        ctk.CTkLabel(top, text="🏷️ Kalite Kontrolü Yapılacak Lotu Seçin", font=("Arial", 14, "bold"), text_color="#f97316").pack(pady=(15, 10))
+        cerceve, tree = tablo_olustur(top, ["Lot ID", "Lot No", "Ürün", "Kalan", "Kalite Durumu"], [60, 180, 150, 70, 100], height=15)
+        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        try:
+            res = requests.get(f"{API}/lot-listesi", headers=self.req_headers(), timeout=6)
+            for l in res.json().get("lotlar", []):
+                tree.insert("", "end", iid=str(l["LotID"]),
+                            values=(l["LotID"], l["LotNo"], l["StokAdi"], f"{l['KalanMiktar']:g}", l.get("KaliteDurumu", "KONTROLSUZ")))
+        except Exception:
+            pass
+
+        def sec(event=None):
+            secili = tree.selection()
+            if not secili:
+                return
+            degerler = tree.item(secili[0])["values"]
+            self.kk_lot_id.delete(0, "end")
+            self.kk_lot_id.insert(0, degerler[0])
+            self.kk_lot_etiket.configure(text=f"{degerler[1]} — {degerler[2]}")
+            top.destroy()
+
+        tree.bind("<Double-1>", sec)
+        ctk.CTkButton(top, text="Seç", fg_color="#16a34a", hover_color="#15803d", command=sec).pack(pady=(0, 15))
+
     def kalite_kontrol_ekle_islem(self):
         try:
             lot_id = int(self.kk_lot_id.get())
         except ValueError:
-            messagebox.showwarning("Eksik/Hatalı Bilgi", "Geçerli bir Lot ID girin.")
+            messagebox.showwarning("Eksik/Hatalı Bilgi", "Geçerli bir Lot ID girin (🔍 ile Lot Takibi'ndeki listeden seçebilirsiniz).")
             return
         data = {
             "LotID": lot_id, "KontrolTuru": self.kk_kontrol_turu.get(), "Sonuc": self.kk_sonuc.get(),
@@ -6445,6 +6512,7 @@ class MainApp(ctk.CTkToplevel):
             if res.status_code == 200:
                 for e in (self.kk_lot_id, self.kk_olculen, self.kk_min, self.kk_max, self.kk_aciklama):
                     e.delete(0, "end")
+                self.kk_lot_etiket.configure(text="(lot seçilmedi)")
                 self.kalite_kontrol_listesini_yukle()
                 if hasattr(self, "lot_tree"):
                     self.lotlari_yukle()

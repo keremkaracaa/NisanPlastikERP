@@ -6575,6 +6575,10 @@ def fatura_kes(veri: FaturaOlusturRequest, background_tasks: BackgroundTasks, us
 
         log_islem(cursor, f"Fatura kesildi: #{fatura_id}", user["username"])
         conn.commit()
+        # Sistem Ayarları'nda 'e-Fatura Otomatik Oluştur' açıksa, e-Fatura XML'i
+        # (ve ayarlıysa entegratöre gönderimi) arka planda otomatik tetiklenir -
+        # ana fatura kesme yanıtını ASLA beklemez/bloklamaz (bkz. fonksiyon docstring'i).
+        background_tasks.add_task(_efatura_otomatik_tetikle, fatura_id)
         return {"mesaj": f"Fatura #{fatura_id} kesildi!", "PdfYolu": pdf_yolu, "FaturaID": fatura_id}
     except Exception as e:
         conn.rollback()
@@ -6637,52 +6641,63 @@ def fatura_xml_disa_aktar(fatura_id: int, user: dict = Depends(yetki_kontrol(["Y
     finally:
         conn.close()
 
+def _efatura_xml_olustur_ic(cursor, fatura_id: int, senaryo: str, kullanici: str) -> dict:
+    """e-Fatura XML üretiminin asıl mantığı - hem /fatura/{id}/efatura-olustur
+    endpoint'i hem de fatura-kes sonrası otomatik tetikleme (arka plan görevi)
+    TARAFINDAN ORTAK kullanılır, aynı mantığın iki yerde ayrı ayrı yazılıp
+    zamanla birbirinden sapmasını önlemek için buraya çıkarıldı. Çağıran, kendi
+    commit/rollback'ini yönetir - bu fonksiyon commit yapmaz."""
+    cursor.execute("""
+        SELECT f.FaturaID, f.Tarih, f.AraToplam, f.KdvToplam, f.ToplamTutar, f.ParaBirimi,
+               m.FirmaAdi, m.VergiDairesi, m.VergiNo, m.Adres, m.VergiKimlikTipi, m.Il, m.Ilce
+        FROM Faturalar f JOIN Musteriler m ON f.MusteriID = m.MusteriID WHERE f.FaturaID=?
+    """, (fatura_id,))
+    f = cursor.fetchone()
+    if not f:
+        raise HTTPException(status_code=404, detail="Fatura bulunamadı.")
+    musteri_bilgi = {
+        "FirmaAdi": f[6], "VergiDairesi": f[7], "VergiNo": f[8], "Adres": f[9],
+        "VergiKimlikTipi": f[10], "Il": f[11], "Ilce": f[12],
+    }
+    if not musteri_bilgi["VergiNo"] or not musteri_bilgi["Adres"]:
+        raise HTTPException(status_code=400, detail="Müşterinin vergi no ve adres bilgisi eksik - e-Fatura oluşturulamaz. Önce müşteri kaydını tamamlayın.")
+
+    cursor.execute("SELECT StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami, ISNULL(KdvOrani,20) FROM FaturaSatirlari WHERE FaturaID=?", (fatura_id,))
+    satirlar = cursor.fetchall()
+    kalemler = [{"StokKod": s[0], "StokAdi": s[1], "Miktar": s[2], "BirimFiyat": s[3], "SatirToplami": s[4], "KdvOrani": s[5]} for s in satirlar]
+
+    ettn = str(uuid.uuid4())
+    ayarlar = efatura_ayarlarini_getir()
+    seri_kodu = ayarlar["seri_kodu"] if ayarlar else "NIS"
+    efatura_no = efatura_sonraki_no_al(cursor, seri_kodu)
+
+    xml_agaci = ubl_tr_fatura_xml_olustur(
+        fatura_id, ettn, efatura_no, senaryo, f[1], f[5] or "TL",
+        float(f[2] or 0), float(f[3] or 0), float(f[4] or 0), musteri_bilgi, kalemler)
+
+    os.makedirs(os.path.join("Faturalar", "EFatura"), exist_ok=True)
+    xml_yolu = os.path.join("Faturalar", "EFatura", f"{efatura_no}.xml")
+    ET.ElementTree(xml_agaci).write(xml_yolu, encoding="utf-8", xml_declaration=True)
+
+    cursor.execute("""UPDATE Faturalar SET EFaturaUUID=?, EFaturaNo=?, EFaturaSenaryo=?, EFaturaXmlYolu=?, EFaturaDurum='OLUSTURULDU'
+                       WHERE FaturaID=?""", (ettn, efatura_no, senaryo, xml_yolu, fatura_id))
+    log_islem(cursor, f"e-Fatura XML oluşturuldu: Fatura #{fatura_id} -> {efatura_no}", kullanici)
+    return {"mesaj": "e-Fatura XML oluşturuldu.", "EFaturaNo": efatura_no, "EFaturaUUID": ettn, "EFaturaXmlYolu": xml_yolu}
+
 @app.post("/fatura/{fatura_id}/efatura-olustur")
 def efatura_olustur(fatura_id: int, veri: EFaturaOlusturRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
     """GİB-uyumlu ŞEKİLDE (UBL-TR 2.1) e-Fatura/e-Arşiv XML'i üretir ve diske yazar.
     KAPSAM: Bu adım GİB'e/entegratöre GÖNDERMEZ, sadece XML'i hazırlar - gönderim
     ayrı bir adımdır (/fatura/{id}/efatura-gonder), bkz. ubl_tr_fatura_xml_olustur
-    docstring'i için tam kapsam açıklaması."""
+    docstring'i için tam kapsam açıklaması. Sistem Ayarları'nda 'e-Fatura Otomatik
+    Oluştur' açıksa bu adım fatura kesilirken ZATEN otomatik çalışır - bu endpoint
+    o zaman sadece manuel yeniden deneme/kontrol içindir."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("""
-            SELECT f.FaturaID, f.Tarih, f.AraToplam, f.KdvToplam, f.ToplamTutar, f.ParaBirimi,
-                   m.FirmaAdi, m.VergiDairesi, m.VergiNo, m.Adres, m.VergiKimlikTipi, m.Il, m.Ilce
-            FROM Faturalar f JOIN Musteriler m ON f.MusteriID = m.MusteriID WHERE f.FaturaID=?
-        """, (fatura_id,))
-        f = cursor.fetchone()
-        if not f:
-            raise HTTPException(status_code=404, detail="Fatura bulunamadı.")
-        musteri_bilgi = {
-            "FirmaAdi": f[6], "VergiDairesi": f[7], "VergiNo": f[8], "Adres": f[9],
-            "VergiKimlikTipi": f[10], "Il": f[11], "Ilce": f[12],
-        }
-        if not musteri_bilgi["VergiNo"] or not musteri_bilgi["Adres"]:
-            raise HTTPException(status_code=400, detail="Müşterinin vergi no ve adres bilgisi eksik - e-Fatura oluşturulamaz. Önce müşteri kaydını tamamlayın.")
-
-        cursor.execute("SELECT StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami, ISNULL(KdvOrani,20) FROM FaturaSatirlari WHERE FaturaID=?", (fatura_id,))
-        satirlar = cursor.fetchall()
-        kalemler = [{"StokKod": s[0], "StokAdi": s[1], "Miktar": s[2], "BirimFiyat": s[3], "SatirToplami": s[4], "KdvOrani": s[5]} for s in satirlar]
-
-        ettn = str(uuid.uuid4())
-        ayarlar = efatura_ayarlarini_getir()
-        seri_kodu = ayarlar["seri_kodu"] if ayarlar else "NIS"
-        efatura_no = efatura_sonraki_no_al(cursor, seri_kodu)
-
-        xml_agaci = ubl_tr_fatura_xml_olustur(
-            fatura_id, ettn, efatura_no, veri.Senaryo, f[1], f[5] or "TL",
-            float(f[2] or 0), float(f[3] or 0), float(f[4] or 0), musteri_bilgi, kalemler)
-
-        os.makedirs(os.path.join("Faturalar", "EFatura"), exist_ok=True)
-        xml_yolu = os.path.join("Faturalar", "EFatura", f"{efatura_no}.xml")
-        ET.ElementTree(xml_agaci).write(xml_yolu, encoding="utf-8", xml_declaration=True)
-
-        cursor.execute("""UPDATE Faturalar SET EFaturaUUID=?, EFaturaNo=?, EFaturaSenaryo=?, EFaturaXmlYolu=?, EFaturaDurum='OLUSTURULDU'
-                           WHERE FaturaID=?""", (ettn, efatura_no, veri.Senaryo, xml_yolu, fatura_id))
-        log_islem(cursor, f"e-Fatura XML oluşturuldu: Fatura #{fatura_id} -> {efatura_no}", user["username"])
+        sonuc = _efatura_xml_olustur_ic(cursor, fatura_id, veri.Senaryo, user["username"])
         conn.commit()
-        return {"mesaj": "e-Fatura XML oluşturuldu.", "EFaturaNo": efatura_no, "EFaturaUUID": ettn, "EFaturaXmlYolu": xml_yolu}
+        return sonuc
     except HTTPException:
         conn.rollback()
         raise
@@ -6691,6 +6706,49 @@ def efatura_olustur(fatura_id: int, veri: EFaturaOlusturRequest, user: dict = De
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
+
+def _efatura_otomatik_tetikle(fatura_id: int):
+    """fatura-kes'ten SONRA (BackgroundTasks ile, ana fatura akışını bloklamadan)
+    çağrılır. SistemAyarlari'nda 'EFaturaOtomatikOlustur' açık DEĞİLSE hiçbir şey
+    yapmaz (varsayılan: kapalı - kullanıcı açıkça devreye almalı). Açıksa e-Fatura
+    XML'ini otomatik üretir; ayrıca 'EFaturaOtomatikGonder' de açıksa üretilen
+    XML'i entegratöre otomatik gönderir. HER İKİ adımda da oluşan herhangi bir
+    hata SADECE loglanır - bu noktada fatura zaten kesilmiş/commit edilmiş
+    durumda, e-Fatura tarafındaki bir aksaklık asla geriye alınmaz/yayılmaz."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT AyarAnahtari, AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari IN ('EFaturaOtomatikOlustur', 'EFaturaOtomatikGonder')")
+        ayar_satirlari = {r[0]: r[1] for r in cursor.fetchall()}
+        if ayar_satirlari.get("EFaturaOtomatikOlustur") != "1":
+            return
+
+        sonuc = _efatura_xml_olustur_ic(cursor, fatura_id, "EARSIV", "Sistem (Otomatik)")
+        conn.commit()
+        print(f">>> Fatura #{fatura_id} için e-Fatura otomatik oluşturuldu: {sonuc['EFaturaNo']}")
+
+        if ayar_satirlari.get("EFaturaOtomatikGonder") == "1":
+            entegrator_ayarlari = efatura_ayarlarini_getir()
+            if entegrator_ayarlari:
+                gonder_sonuc = efatura_entegrator_gonder(sonuc["EFaturaXmlYolu"], entegrator_ayarlari)
+                if gonder_sonuc["basarili"]:
+                    cursor.execute("UPDATE Faturalar SET EFaturaDurum='GONDERILDI', EFaturaGonderimTarihi=GETDATE() WHERE FaturaID=?", (fatura_id,))
+                    print(f">>> Fatura #{fatura_id} e-Fatura'sı entegratöre otomatik gönderildi.")
+                else:
+                    cursor.execute("UPDATE Faturalar SET EFaturaDurum='HATA', EFaturaHataMesaji=? WHERE FaturaID=?", (gonder_sonuc["hata"][:500], fatura_id))
+                    print(f">>> Fatura #{fatura_id} e-Fatura otomatik gönderim hatası: {gonder_sonuc['hata']}")
+                conn.commit()
+    except Exception as e:
+        print(f">>> Fatura #{fatura_id} için otomatik e-Fatura işlemi başarısız (fatura kesimi ETKİLENMEDİ): {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    finally:
+        if conn:
+            conn.close()
 
 @app.post("/fatura/{fatura_id}/efatura-gonder")
 def efatura_gonder(fatura_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):

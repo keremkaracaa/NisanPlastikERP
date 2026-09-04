@@ -210,6 +210,38 @@ class TestEFaturaGonderEndpoint:
         assert yanit.status_code in (401, 403)
 
 
+class TestEFaturaOtomatikTetikle:
+    """/fatura-kes sonrası arka planda çalışan otomatik e-Fatura tetikleyicisini
+    (main._efatura_otomatik_tetikle) test eder - varsayılan (ayar kapalı) durumda
+    hiçbir şey yapmamalı, açıldığında ise XML üretim mantığını çağırmalı."""
+
+    def test_ayar_kapaliyken_hicbir_sey_yapmaz(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[("EFaturaOtomatikOlustur", "0")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        cagrildi = []
+        monkeypatch.setattr(main, "_efatura_xml_olustur_ic", lambda *a, **k: cagrildi.append(1))
+
+        main._efatura_otomatik_tetikle(1)
+        assert cagrildi == []
+
+    def test_ayar_aciksa_xml_uretimini_cagirir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[("EFaturaOtomatikOlustur", "1")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        cagrildi = []
+        monkeypatch.setattr(main, "_efatura_xml_olustur_ic",
+                             lambda cursor, fatura_id, senaryo, kullanici: (cagrildi.append(fatura_id), {"EFaturaXmlYolu": "x.xml", "EFaturaNo": "NIS1"})[1])
+
+        main._efatura_otomatik_tetikle(1)
+        assert cagrildi == [1]
+
+    def test_hata_olsa_bile_exception_disari_sizmaz(self, monkeypatch):
+        """Otomatik tetikleyici bir arka plan görevidir - içinde herhangi bir
+        hata olsa bile dışarı exception fırlatmamalı (fatura kesme akışı zaten
+        bu noktada tamamlanmış/commit edilmiştir)."""
+        monkeypatch.setattr(main, "get_db_connection", lambda: (_ for _ in ()).throw(Exception("DB çöktü")))
+        main._efatura_otomatik_tetikle(1)  # exception fırlatırsa test kendiliğinden başarısız olur
+
+
 class TestKaliteKontrolEndpoint:
     def test_kalite_kontrol_ekle_basarili(self, client, monkeypatch):
         conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("LOT-PP001-20260101-1", 5))
