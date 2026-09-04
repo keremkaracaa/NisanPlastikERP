@@ -701,6 +701,19 @@ def log_islem(cursor, aciklama: str, kullanici: str = "Sistem"):
     except Exception:
         pass
 
+def oturum_gunlugu_yaz(cursor, kullanici_adi: str, islem_turu: str, ip_adresi: str = None, detay: str = None):
+    """Giriş denemelerini (başarılı/başarısız) ve IP adresini ayrı, güvenlik odaklı
+    bir günlüğe (OturumGunlugu) yazar. Genel IslemLoglari'ndan (log_islem) BİLİNÇLİ
+    olarak ayrı tutulur - o iş akışı logları için var (yüzlerce 'sipariş eklendi'
+    kaydı), güvenlik denetimi (kim ne zaman nereden giriş yapmaya çalıştı, başarısız
+    denemeler) bunun içinde kaybolmamalı. ÖNCEDEN başarısız giriş denemeleri hiç
+    kayıt altına alınmıyordu - bir brute-force denemesi fark edilmeden geçebilirdi."""
+    try:
+        cursor.execute("INSERT INTO OturumGunlugu (KullaniciAdi, IslemTuru, IPAdresi, Detay) VALUES (?, ?, ?, ?)",
+                       (kullanici_adi, islem_turu, ip_adresi, detay))
+    except Exception:
+        pass
+
 def log_degisiklik(cursor, tablo_adi: str, kayit_id, alan_adi: str, eski_deger, yeni_deger, kullanici: str = "Sistem"):
     """Bir alanın eski/yeni değerini ayrı ayrı kaydeder (Logo/SAP tarzı gerçek denetim izi).
     IslemLoglari'ndaki düz metin logdan farklı olarak, hangi kaydın hangi alanının
@@ -2500,6 +2513,24 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _rfq_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> RFQ migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _oturum_gunlugu_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Oturum günlüğü migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -2819,6 +2850,52 @@ def _dokuman_kontrol_migrationlari(cursor):
             YuklemeTarihi DATETIME NOT NULL DEFAULT GETDATE()
         )
     """, "DokumanVersiyonlari tablosu")
+
+def _rfq_migrationlari(cursor):
+    """Satınalma Teklif Karşılaştırma (RFQ) için tablo eklemesi - diğer yeni
+    özellik migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='TeklifTalepleri' and xtype='U')
+        CREATE TABLE TeklifTalepleri (
+            TeklifTalepID INT IDENTITY(1,1) PRIMARY KEY,
+            StokKod NVARCHAR(50) NOT NULL,
+            StokAdi NVARCHAR(150) NULL,
+            Miktar FLOAT NOT NULL,
+            Aciklama NVARCHAR(500) NULL,
+            TalepEden NVARCHAR(50) NOT NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'ACIK',
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "TeklifTalepleri tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='TedarikciTeklifleri' and xtype='U')
+        CREATE TABLE TedarikciTeklifleri (
+            TedarikciTeklifID INT IDENTITY(1,1) PRIMARY KEY,
+            TeklifTalepID INT NOT NULL FOREIGN KEY REFERENCES TeklifTalepleri(TeklifTalepID),
+            TedarikciID INT NOT NULL FOREIGN KEY REFERENCES Tedarikciler(TedarikciID),
+            BirimFiyat FLOAT NOT NULL,
+            ParaBirimi NVARCHAR(10) NOT NULL DEFAULT 'TL',
+            TeslimSuresiGun INT NULL,
+            Aciklama NVARCHAR(500) NULL,
+            KazandiMi BIT NOT NULL DEFAULT 0,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "TedarikciTeklifleri tablosu")
+
+def _oturum_gunlugu_migrationlari(cursor):
+    """Kullanıcı Aktivite/Oturum Denetimi için tablo eklemesi - diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='OturumGunlugu' and xtype='U')
+        CREATE TABLE OturumGunlugu (
+            GunlukID INT IDENTITY(1,1) PRIMARY KEY,
+            KullaniciAdi NVARCHAR(50) NOT NULL,
+            IslemTuru NVARCHAR(20) NOT NULL,
+            IPAdresi NVARCHAR(50) NULL,
+            Tarih DATETIME NOT NULL DEFAULT GETDATE(),
+            Detay NVARCHAR(255) NULL
+        )
+    """, "OturumGunlugu tablosu")
 
 @app.post("/virman-yap")
 def virman_yap(req: VirmanRequest, current_user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
@@ -3451,7 +3528,8 @@ def canliye_gecis_sifirla(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
         conn.close()
 
 @app.post("/giris")
-def giris_yap(veri: GirisRequest):
+def giris_yap(veri: GirisRequest, request: Request):
+    ip_adresi = request.client.host if request.client else None
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -3471,17 +3549,25 @@ def giris_yap(veri: GirisRequest):
             sifre_dogru = False
 
         if not sifre_dogru:
+            # NOT: Önceden başarısız giriş denemeleri HİÇ kayıt altına alınmıyordu -
+            # bir brute-force/şifre deneme saldırısı fark edilmeden geçebilirdi. commit()
+            # burada AÇIKÇA çağrılıyor çünkü 401 fırlatıldıktan sonra fonksiyon devam
+            # etmiyor (rollback yapan bir except bloğu yok, ama açıkça commit etmeden
+            # bırakmak riskli olurdu - garanti altına alınıyor).
+            oturum_gunlugu_yaz(cursor, veri.KullaniciAdi, "GIRIS_BASARISIZ", ip_adresi, "Hatalı kullanıcı adı/şifre")
+            conn.commit()
             raise HTTPException(status_code=401, detail="Kullanıcı adı veya şifre hatalı.")
-            
+
         # Eğer kullanıcının rolü veritabanında boş kalmışsa varsayılan Yönetici yap
         rol = row[1] if row[1] else "Yönetici"
-        
+
         # Token içine Rol verisini de gömüyoruz
         import datetime as dt
         token_data = {"sub": veri.KullaniciAdi, "rol": rol, "exp": dt.datetime.utcnow() + dt.timedelta(hours=12)}
         token = jwt.encode(token_data, SECRET_KEY, algorithm=ALGORITHM)
-        
+
         log_islem(cursor, f"Sisteme giriş yapıldı. (Rol: {rol})", veri.KullaniciAdi)
+        oturum_gunlugu_yaz(cursor, veri.KullaniciAdi, "GIRIS_BASARILI", ip_adresi)
         conn.commit()
         return {"access_token": token, "token_type": "bearer", "KullaniciAdi": veri.KullaniciAdi, "Rol": rol, "mesaj": "Giriş başarılı."}
     finally:
@@ -3620,6 +3706,45 @@ def degisiklik_loglari_getir(tablo: str = None, kayit_id: str = None, user: dict
         cursor.execute(sorgu, parametreler)
         return {"loglar": [{"LogID": r[0], "TabloAdi": r[1], "KayitID": r[2], "AlanAdi": r[3], "EskiDeger": r[4],
                              "YeniDeger": r[5], "KullaniciAdi": r[6] or "-", "Tarih": str(r[7])[:16]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/oturum-gunlugu")
+def oturum_gunlugu_getir(kullanici_adi: Optional[str] = None, sadece_basarisiz: bool = False,
+                          user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = "SELECT TOP 300 GunlukID, KullaniciAdi, IslemTuru, IPAdresi, Tarih, Detay FROM OturumGunlugu WHERE 1=1"
+        parametreler = []
+        if kullanici_adi:
+            sorgu += " AND KullaniciAdi=?"
+            parametreler.append(kullanici_adi)
+        if sadece_basarisiz:
+            sorgu += " AND IslemTuru='GIRIS_BASARISIZ'"
+        sorgu += " ORDER BY Tarih DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"gunluk": [{"GunlukID": r[0], "KullaniciAdi": r[1], "IslemTuru": r[2], "IPAdresi": r[3] or "-",
+                             "Tarih": str(r[4])[:16], "Detay": r[5] or ""} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/oturum-gunlugu/supheli-girisler")
+def oturum_gunlugu_supheli_girisler(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    """Son 1 saat içinde 5 veya daha fazla başarısız giriş denemesi yapılmış kullanıcı
+    adlarını listeler - basit ama gerçek bir brute-force/parola deneme anomali tespiti."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT KullaniciAdi, COUNT(*) AS DenemeSayisi, MAX(Tarih) AS SonDeneme
+            FROM OturumGunlugu
+            WHERE IslemTuru='GIRIS_BASARISIZ' AND Tarih >= DATEADD(HOUR, -1, GETDATE())
+            GROUP BY KullaniciAdi
+            HAVING COUNT(*) >= 5
+            ORDER BY DenemeSayisi DESC
+        """)
+        return {"supheliler": [{"KullaniciAdi": r[0], "DenemeSayisi": r[1], "SonDeneme": str(r[2])[:16]} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -8649,6 +8774,130 @@ def satinalma_talebi_teslim_alindi_isaretle(cursor, stok_kod: str):
                                              WHERE StokKod=? AND Durum='Onaylandı' ORDER BY Tarih ASC)""", (stok_kod,))
     except Exception:
         pass
+
+# --- SATINALMA TEKLİF KARŞILAŞTIRMA (RFQ) ---
+class TeklifTalebiOlusturRequest(BaseModel):
+    StokKod: str
+    StokAdi: Optional[str] = None
+    Miktar: float = Field(gt=0)
+    Aciklama: Optional[str] = None
+
+class TedarikciTeklifiEkleRequest(BaseModel):
+    TeklifTalepID: int
+    TedarikciID: int
+    BirimFiyat: float = Field(gt=0)
+    ParaBirimi: str = "TL"
+    TeslimSuresiGun: Optional[int] = None
+    Aciklama: Optional[str] = None
+
+class KazananSecRequest(BaseModel):
+    TedarikciTeklifID: int
+
+@app.post("/teklif-talebi-olustur")
+def teklif_talebi_olustur(veri: TeklifTalebiOlusturRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""INSERT INTO TeklifTalepleri (StokKod, StokAdi, Miktar, Aciklama, TalepEden)
+                           OUTPUT inserted.TeklifTalepID VALUES (?, ?, ?, ?, ?)""",
+                       (veri.StokKod, veri.StokAdi, veri.Miktar, veri.Aciklama, user["username"]))
+        teklif_talep_id = int(cursor.fetchone()[0])
+        log_islem(cursor, f"Teklif talebi açıldı: {veri.StokKod} ({veri.Miktar:g})", user["username"])
+        conn.commit()
+        return {"mesaj": "Teklif talebi oluşturuldu.", "TeklifTalepID": teklif_talep_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/teklif-talepleri")
+def teklif_talepleri_getir(durum: Optional[str] = None, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = "SELECT TeklifTalepID, StokKod, StokAdi, Miktar, Aciklama, TalepEden, Durum, OlusturmaTarihi FROM TeklifTalepleri WHERE 1=1"
+        parametreler = []
+        if durum:
+            sorgu += " AND Durum=?"
+            parametreler.append(durum)
+        sorgu += " ORDER BY OlusturmaTarihi DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"talepler": [{"TeklifTalepID": r[0], "StokKod": r[1], "StokAdi": r[2] or r[1], "Miktar": float(r[3]),
+                               "Aciklama": r[4] or "", "TalepEden": r[5], "Durum": r[6], "OlusturmaTarihi": str(r[7])[:16]}
+                              for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.post("/tedarikci-teklifi-ekle")
+def tedarikci_teklifi_ekle(veri: TedarikciTeklifiEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Durum FROM TeklifTalepleri WHERE TeklifTalepID=?", (veri.TeklifTalepID,))
+        talep = cursor.fetchone()
+        if not talep:
+            raise HTTPException(status_code=404, detail="Teklif talebi bulunamadı.")
+        if talep[0] == "KAPANDI":
+            raise HTTPException(status_code=400, detail="Bu teklif talebi kapanmış, yeni teklif eklenemez.")
+
+        cursor.execute("""INSERT INTO TedarikciTeklifleri (TeklifTalepID, TedarikciID, BirimFiyat, ParaBirimi, TeslimSuresiGun, Aciklama)
+                           OUTPUT inserted.TedarikciTeklifID VALUES (?, ?, ?, ?, ?, ?)""",
+                       (veri.TeklifTalepID, veri.TedarikciID, veri.BirimFiyat, veri.ParaBirimi, veri.TeslimSuresiGun, veri.Aciklama))
+        tedarikci_teklif_id = int(cursor.fetchone()[0])
+        log_islem(cursor, f"Tedarikçi teklifi eklendi: Talep #{veri.TeklifTalepID}, Tedarikçi #{veri.TedarikciID}, {veri.BirimFiyat} {veri.ParaBirimi}", user["username"])
+        conn.commit()
+        return {"mesaj": "Tedarikçi teklifi eklendi.", "TedarikciTeklifID": tedarikci_teklif_id}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/teklif-talebi/{teklif_talep_id}/teklifler")
+def teklif_talebi_teklifleri_getir(teklif_talep_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT t.TedarikciTeklifID, ISNULL(td.FirmaAdi, 'Bilinmiyor'), t.BirimFiyat, t.ParaBirimi,
+                   t.TeslimSuresiGun, t.Aciklama, t.KazandiMi, t.OlusturmaTarihi
+            FROM TedarikciTeklifleri t LEFT JOIN Tedarikciler td ON t.TedarikciID = td.TedarikciID
+            WHERE t.TeklifTalepID=? ORDER BY t.BirimFiyat ASC
+        """, (teklif_talep_id,))
+        return {"teklifler": [{"TedarikciTeklifID": r[0], "TedarikciAdi": r[1], "BirimFiyat": float(r[2]), "ParaBirimi": r[3],
+                                "TeslimSuresiGun": r[4], "Aciklama": r[5] or "", "KazandiMi": bool(r[6]),
+                                "OlusturmaTarihi": str(r[7])[:16]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.put("/teklif-talebi/{teklif_talep_id}/kazanan-sec")
+def teklif_talebi_kazanan_sec(teklif_talep_id: int, veri: KazananSecRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT TeklifTalepID FROM TedarikciTeklifleri WHERE TedarikciTeklifID=? AND TeklifTalepID=?",
+                       (veri.TedarikciTeklifID, teklif_talep_id))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Bu teklif, belirtilen talebe ait değil ya da bulunamadı.")
+
+        cursor.execute("UPDATE TedarikciTeklifleri SET KazandiMi=0 WHERE TeklifTalepID=?", (teklif_talep_id,))
+        cursor.execute("UPDATE TedarikciTeklifleri SET KazandiMi=1 WHERE TedarikciTeklifID=?", (veri.TedarikciTeklifID,))
+        cursor.execute("UPDATE TeklifTalepleri SET Durum='KAPANDI' WHERE TeklifTalepID=?", (teklif_talep_id,))
+        log_islem(cursor, f"Teklif talebi #{teklif_talep_id} kapandı, kazanan: teklif #{veri.TedarikciTeklifID}", user["username"])
+        conn.commit()
+        return {"mesaj": "Kazanan teklif seçildi, talep kapandı."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
 
 @app.post("/satinalma-talep-ekle")
 def satinalma_talep_ekle(veri: SatinAlmaTalepEkle, user: dict = Depends(get_current_user)):

@@ -4917,6 +4917,10 @@ class MainApp(ctk.CTkToplevel):
             self.tab_mrp = yeni_sekme("📐 MRP Planlama")
             self.init_mrp()
 
+        if self.rol in ["Yönetici", "Master", "Satınalma"]:
+            self.tab_teklif_karsilastirma = yeni_sekme("📋 Teklif Karşılaştırma")
+            self.init_teklif_karsilastirma()
+
         if self.rol in ["Yönetici", "Master", "Satış", "Muhasebe", "Üretim", "Patron"]:
             kategori_basligi("ÜRÜN & MALİYET")
             self.tab_fiyatlandirma = yeni_sekme("💲 Fiyatlandırma")
@@ -5025,6 +5029,8 @@ class MainApp(ctk.CTkToplevel):
             self.init_mobil_erisim()
             self.tab_loglar = yeni_sekme("🧾 Sistem Logları")
             self.init_loglar()
+            self.tab_oturum_gunlugu = yeni_sekme("🔒 Oturum Günlüğü")
+            self.init_oturum_gunlugu()
             self.tab_kullanici = yeni_sekme("👤 Kullanıcı Yönetimi")
             self.init_kullanici_yonetimi()
             self.tab_onay_zincirleri = yeni_sekme("🔗 Onay Zincirleri")
@@ -11617,6 +11623,247 @@ class MainApp(ctk.CTkToplevel):
                       command=onayla).pack(side="left", padx=6)
         ctk.CTkButton(buton_satiri, text="⬇️ Seçileni İndir", fg_color="#2563eb", hover_color="#1d4ed8",
                       command=indir).pack(side="left", padx=6)
+
+    def init_teklif_karsilastirma(self):
+        ust = ctk.CTkFrame(self.tab_teklif_karsilastirma, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="📋 Satınalma Teklif Karşılaştırma", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+        ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=self.teklif_talepleri_yukle).pack(side="right")
+        ctk.CTkLabel(self.tab_teklif_karsilastirma,
+                     text="Bir ürün için birden fazla tedarikçiden fiyat isteyip yan yana karşılaştırabilir, kazananı "
+                          "seçebilirsiniz. Kazanan seçildiğinde talep kapanır - satınalma talebini ayrıca normal "
+                          "'Satınalma & Alış' ekranından açmanız gerekir.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+
+        form = ctk.CTkFrame(self.tab_teklif_karsilastirma, fg_color=RENK_KART, corner_radius=8)
+        form.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(form, text="Yeni Teklif Talebi Aç", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        satir1 = ctk.CTkFrame(form, fg_color="transparent")
+        satir1.pack(fill="x", padx=10, pady=(0, 10))
+        stok_frame = ctk.CTkFrame(satir1, fg_color="transparent")
+        stok_frame.pack(side="left", padx=(0, 8))
+        self.tk_stok = ctk.CTkEntry(stok_frame, placeholder_text="Stok Kodu", width=100)
+        self.tk_stok.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(stok_frame, text="🔑", width=32, fg_color="#3b82f6", hover_color="#2563eb",
+                      command=lambda: self.urun_secim_penceresi(self.tk_stok, hedef_ad_entry=self.tk_stok_adi)).pack(side="left")
+        self.tk_stok_adi = ctk.CTkEntry(satir1, placeholder_text="Stok Adı (opsiyonel)", width=200)
+        self.tk_stok_adi.pack(side="left", padx=(0, 8))
+        self.tk_miktar = ctk.CTkEntry(satir1, placeholder_text="Miktar", width=100)
+        self.tk_miktar.pack(side="left", padx=(0, 8))
+        self.tk_aciklama = ctk.CTkEntry(satir1, placeholder_text="Açıklama (opsiyonel)", width=220)
+        self.tk_aciklama.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(satir1, text="+ Talep Aç", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.teklif_talebi_olustur_islem).pack(side="left")
+
+        ctk.CTkLabel(self.tab_teklif_karsilastirma, text="Bir talebe çift tıklayarak gelen teklifleri karşılaştırabilirsiniz.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
+        liste_cerceve, self.teklif_talep_tree = tablo_olustur(
+            self.tab_teklif_karsilastirma, ["ID", "Stok", "Miktar", "Açıklama", "Talep Eden", "Durum", "Tarih"],
+            [50, 120, 90, 220, 120, 90, 130], height=14)
+        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.teklif_talep_tree.bind("<Double-Button-1>", lambda e: self.teklif_karsilastirma_penceresi())
+
+        self.teklif_talepleri_yukle()
+
+    def teklif_talebi_olustur_islem(self):
+        stok_kod = self.tk_stok.get().strip()
+        if not stok_kod:
+            messagebox.showwarning("Eksik Bilgi", "Stok kodu zorunludur.")
+            return
+        try:
+            miktar = float(self.tk_miktar.get())
+        except ValueError:
+            messagebox.showwarning("Hatalı Değer", "Miktar sayısal olmalıdır.")
+            return
+        data = {"StokKod": stok_kod, "StokAdi": self.tk_stok_adi.get().strip() or None,
+                "Miktar": miktar, "Aciklama": self.tk_aciklama.get().strip() or None}
+        try:
+            res = requests.post(f"{API}/teklif-talebi-olustur", json=data, headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                for e in (self.tk_stok, self.tk_stok_adi, self.tk_miktar, self.tk_aciklama):
+                    e.delete(0, "end")
+                self.teklif_talepleri_yukle()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Talep oluşturuldu."))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def teklif_talepleri_yukle(self):
+        try:
+            res = requests.get(f"{API}/teklif-talepleri", headers=self.req_headers(), timeout=6)
+            for i in self.teklif_talep_tree.get_children():
+                self.teklif_talep_tree.delete(i)
+            for t in res.json().get("talepler", []):
+                tag = "Onaylandı" if t["Durum"] == "KAPANDI" else "Bekliyor"
+                self.teklif_talep_tree.insert("", "end", iid=str(t["TeklifTalepID"]), tags=(tag,),
+                                               values=(t["TeklifTalepID"], t["StokAdi"], f"{t['Miktar']:g}", t["Aciklama"],
+                                                       t["TalepEden"], t["Durum"], t["OlusturmaTarihi"]))
+        except Exception:
+            pass
+
+    def teklif_karsilastirma_penceresi(self):
+        secili = self.teklif_talep_tree.selection()
+        if not secili:
+            return
+        teklif_talep_id = secili[0]
+        degerler = self.teklif_talep_tree.item(secili[0])["values"]
+        stok_adi = degerler[1]
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title(f"{stok_adi} — Teklif Karşılaştırma")
+        pencere.geometry("700x520")
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+        ctk.CTkLabel(pencere, text=f"📋 {stok_adi} — Teklif Karşılaştırma", font=("Arial", 14, "bold"), text_color="#f97316").pack(pady=(15, 10))
+
+        cerceve, tree = tablo_olustur(pencere, ["Teklif ID", "Tedarikçi", "Birim Fiyat", "P.B.", "Teslim (gün)", "Açıklama", "Kazandı mı"],
+                                       [70, 150, 100, 50, 90, 150, 80], height=8)
+        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        def teklifleri_yukle():
+            for i in tree.get_children():
+                tree.delete(i)
+            try:
+                res = requests.get(f"{API}/teklif-talebi/{teklif_talep_id}/teklifler", headers=self.req_headers(), timeout=6)
+                for t in res.json().get("teklifler", []):
+                    tree.insert("", "end", iid=str(t["TedarikciTeklifID"]),
+                                values=(t["TedarikciTeklifID"], t["TedarikciAdi"], f"{t['BirimFiyat']:,.2f}", t["ParaBirimi"],
+                                        t["TeslimSuresiGun"] or "-", t["Aciklama"], "✅" if t["KazandiMi"] else "-"))
+            except Exception:
+                pass
+        teklifleri_yukle()
+
+        ekle_cerceve = ctk.CTkFrame(pencere, fg_color=RENK_KART, corner_radius=8)
+        ekle_cerceve.pack(fill="x", padx=15, pady=(0, 10))
+        ctk.CTkLabel(ekle_cerceve, text="Yeni Teklif Ekle", font=("Arial", 11, "bold")).pack(anchor="w", padx=8, pady=(8, 4))
+        ekle_satiri = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
+        ekle_satiri.pack(fill="x", padx=8, pady=(0, 8))
+        ted_frame = ctk.CTkFrame(ekle_satiri, fg_color="transparent")
+        ted_frame.pack(side="left", padx=(0, 6))
+        ted_id_entry = ctk.CTkEntry(ted_frame, placeholder_text="Tedarikçi ID", width=90)
+        ted_id_entry.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(ted_frame, text="🔍", width=32, command=lambda: self.tedarikci_secim_penceresi(ted_id_entry)).pack(side="left")
+        fiyat_entry = ctk.CTkEntry(ekle_satiri, placeholder_text="Birim Fiyat", width=100)
+        fiyat_entry.pack(side="left", padx=(0, 6))
+        sure_entry = ctk.CTkEntry(ekle_satiri, placeholder_text="Teslim (gün)", width=90)
+        sure_entry.pack(side="left", padx=(0, 6))
+        aciklama_entry = ctk.CTkEntry(ekle_satiri, placeholder_text="Açıklama", width=160)
+        aciklama_entry.pack(side="left", padx=(0, 6))
+
+        def teklif_ekle():
+            try:
+                tedarikci_id = int(ted_id_entry.get())
+                birim_fiyat = float(fiyat_entry.get())
+            except ValueError:
+                messagebox.showwarning("Hatalı Değer", "Tedarikçi ID ve Birim Fiyat sayısal olmalıdır.")
+                return
+            sure = sure_entry.get().strip()
+            data = {"TeklifTalepID": int(teklif_talep_id), "TedarikciID": tedarikci_id, "BirimFiyat": birim_fiyat,
+                     "TeslimSuresiGun": int(sure) if sure else None, "Aciklama": aciklama_entry.get().strip() or None}
+            try:
+                res = requests.post(f"{API}/tedarikci-teklifi-ekle", json=data, headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    for e in (ted_id_entry, fiyat_entry, sure_entry, aciklama_entry):
+                        e.delete(0, "end")
+                    teklifleri_yukle()
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(ekle_satiri, text="+ Ekle", fg_color="#16a34a", hover_color="#15803d", command=teklif_ekle).pack(side="left")
+
+        def kazanan_sec():
+            sec = tree.selection()
+            if not sec:
+                messagebox.showinfo("Seçim Yok", "Lütfen kazanan olarak seçilecek teklifi seçin.")
+                return
+            if not messagebox.askyesno("Onay", "Bu teklif kazanan olarak seçilecek ve talep kapanacak. Emin misiniz?"):
+                return
+            try:
+                res = requests.put(f"{API}/teklif-talebi/{teklif_talep_id}/kazanan-sec",
+                                    json={"TedarikciTeklifID": int(sec[0])}, headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    teklifleri_yukle()
+                    self.teklif_talepleri_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kazanan seçildi."))
+                    pencere.destroy()
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="🏆 Seçileni Kazanan Yap", fg_color="#f97316", hover_color="#c2410c",
+                      command=kazanan_sec).pack(pady=(0, 15))
+
+    def init_oturum_gunlugu(self):
+        ust = ctk.CTkFrame(self.tab_oturum_gunlugu, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="🔒 Oturum Günlüğü", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+        ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=lambda: (self.oturum_gunlugunu_yukle(), self.supheli_girisleri_yukle())).pack(side="right")
+        ctk.CTkLabel(self.tab_oturum_gunlugu,
+                     text="Başarılı ve başarısız giriş denemelerini IP adresiyle birlikte gösterir. Başarısız denemeler "
+                          "kırmızı renkte vurgulanır. Aşağıdaki 'Şüpheli Girişler' bölümü, son 1 saatte aynı kullanıcı "
+                          "adı için 5+ başarısız deneme olduğunda otomatik uyarır (olası brute-force/parola deneme).",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+
+        filtre_cerceve = ctk.CTkFrame(self.tab_oturum_gunlugu, fg_color=RENK_KART, corner_radius=8)
+        filtre_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        filtre_satiri = ctk.CTkFrame(filtre_cerceve, fg_color="transparent")
+        filtre_satiri.pack(fill="x", padx=10, pady=10)
+        self.og_kullanici_filtre = ctk.CTkEntry(filtre_satiri, placeholder_text="Kullanıcı adına göre filtrele (opsiyonel)", width=280)
+        self.og_kullanici_filtre.pack(side="left", padx=(0, 8))
+        self.og_sadece_basarisiz_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(filtre_satiri, text="Sadece başarısız denemeler", variable=self.og_sadece_basarisiz_var).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(filtre_satiri, text="Filtrele", fg_color="#7c3aed", hover_color="#6d28d9",
+                      command=self.oturum_gunlugunu_yukle).pack(side="left")
+
+        liste_cerceve, self.oturum_gunlugu_tree = tablo_olustur(
+            self.tab_oturum_gunlugu, ["ID", "Kullanıcı", "İşlem", "IP Adresi", "Tarih", "Detay"], [50, 130, 130, 120, 130, 220], height=12)
+        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+
+        ctk.CTkLabel(self.tab_oturum_gunlugu, text="⚠️ Şüpheli Girişler (son 1 saat, 5+ başarısız deneme)",
+                     font=("Arial", 13, "bold"), text_color="#ef4444").pack(anchor="w", padx=22, pady=(5, 2))
+        supheli_cerceve, self.supheli_giris_tree = tablo_olustur(
+            self.tab_oturum_gunlugu, ["Kullanıcı", "Deneme Sayısı", "Son Deneme"], [200, 130, 160], height=4)
+        supheli_cerceve.pack(fill="x", padx=20, pady=(0, 20))
+
+        self.oturum_gunlugunu_yukle()
+        self.supheli_girisleri_yukle()
+
+    def oturum_gunlugunu_yukle(self):
+        try:
+            params = {}
+            kullanici = self.og_kullanici_filtre.get().strip()
+            if kullanici:
+                params["kullanici_adi"] = kullanici
+            if self.og_sadece_basarisiz_var.get():
+                params["sadece_basarisiz"] = True
+            res = requests.get(f"{API}/oturum-gunlugu", params=params, headers=self.req_headers(), timeout=6)
+            for i in self.oturum_gunlugu_tree.get_children():
+                self.oturum_gunlugu_tree.delete(i)
+            for g in res.json().get("gunluk", []):
+                tag = "İptal" if g["IslemTuru"] == "GIRIS_BASARISIZ" else "Onaylandı"
+                self.oturum_gunlugu_tree.insert("", "end", iid=str(g["GunlukID"]), tags=(tag,),
+                                                 values=(g["GunlukID"], g["KullaniciAdi"], g["IslemTuru"], g["IPAdresi"],
+                                                         g["Tarih"], g["Detay"]))
+        except Exception:
+            pass
+
+    def supheli_girisleri_yukle(self):
+        try:
+            res = requests.get(f"{API}/oturum-gunlugu/supheli-girisler", headers=self.req_headers(), timeout=6)
+            for i in self.supheli_giris_tree.get_children():
+                self.supheli_giris_tree.delete(i)
+            for s in res.json().get("supheliler", []):
+                self.supheli_giris_tree.insert("", "end", values=(s["KullaniciAdi"], s["DenemeSayisi"], s["SonDeneme"]))
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     app = LoginWindow()

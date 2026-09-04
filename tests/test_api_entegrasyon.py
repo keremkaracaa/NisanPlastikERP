@@ -970,6 +970,130 @@ class TestSatinalmaTalebiTeslimAlindiIsaretleme:
         assert len(teslim_cagrisi) == 1
 
 
+class TestTeklifKarsilastirma:
+    def test_teklif_talebi_olustur_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/teklif-talebi-olustur", json={"StokKod": "PP-001", "Miktar": 500, "Aciklama": "Q3 ihtiyacı"})
+        assert yanit.status_code == 200
+        assert yanit.json()["TeklifTalepID"] == 1
+
+    def test_teklif_talebi_olustur_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/teklif-talebi-olustur", json={"StokKod": "PP-001", "Miktar": 500})
+        assert yanit.status_code in (401, 403)
+
+    def test_tedarikci_teklifi_ekle_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("ACIK",), (5,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/tedarikci-teklifi-ekle", json={
+            "TeklifTalepID": 1, "TedarikciID": 3, "BirimFiyat": 12.5, "TeslimSuresiGun": 7
+        })
+        assert yanit.status_code == 200
+        assert yanit.json()["TedarikciTeklifID"] == 5
+
+    def test_tedarikci_teklifi_ekle_kapali_talebe_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("KAPANDI",))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/tedarikci-teklifi-ekle", json={"TeklifTalepID": 1, "TedarikciID": 3, "BirimFiyat": 12.5})
+        assert yanit.status_code == 400
+
+    def test_tedarikci_teklifi_ekle_talep_bulunamadi_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/tedarikci-teklifi-ekle", json={"TeklifTalepID": 999, "TedarikciID": 3, "BirimFiyat": 12.5})
+        assert yanit.status_code == 404
+
+    def test_teklifler_fiyata_gore_siralanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchall.return_value = [
+            (1, "Ucuz Tedarikçi", 10.0, "TL", 5, None, False, "2026-01-01"),
+            (2, "Pahalı Tedarikçi", 15.0, "TL", 3, None, False, "2026-01-01"),
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/teklif-talebi/1/teklifler")
+        assert yanit.status_code == 200
+        teklifler = yanit.json()["teklifler"]
+        assert teklifler[0]["BirimFiyat"] < teklifler[1]["BirimFiyat"]
+
+    def test_kazanan_sec_diger_teklifleri_sifirlar(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/teklif-talebi/1/kazanan-sec", json={"TedarikciTeklifID": 5})
+        assert yanit.status_code == 200
+        sifirlama_cagrisi = next(c for c in cursor.execute.call_args_list if "SET KazandiMi=0" in c.args[0])
+        secim_cagrisi = next(c for c in cursor.execute.call_args_list if "SET KazandiMi=1" in c.args[0])
+        kapanis_cagrisi = next(c for c in cursor.execute.call_args_list if "SET Durum='KAPANDI'" in c.args[0])
+        assert sifirlama_cagrisi and secim_cagrisi and kapanis_cagrisi
+
+    def test_kazanan_sec_gecersiz_teklif_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/teklif-talebi/1/kazanan-sec", json={"TedarikciTeklifID": 999})
+        assert yanit.status_code == 404
+
+
+class TestOturumDenetimi:
+    """/giris artık başarısız denemeleri de IP adresiyle birlikte OturumGunlugu'na
+    yazıyor - önceden sadece başarılı girişler genel IslemLoglari'na yazılıyordu,
+    başarısız denemeler (olası brute-force) hiç görünmüyordu."""
+
+    def test_giris_basarisiz_denemede_oturum_gunlugune_yazilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)  # kullanıcı bulunamadı
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = TestClient(main.app).post("/giris", json={"KullaniciAdi": "yok_boyle_biri", "Sifre": "yanlis"})
+        assert yanit.status_code == 401
+        basarisiz_kayit = [c for c in cursor.execute.call_args_list
+                            if "INTO OturumGunlugu" in c.args[0] and "GIRIS_BASARISIZ" in c.args[1]]
+        assert len(basarisiz_kayit) == 1
+        conn.commit.assert_called()  # log kaybolmasın diye 401'den önce commit edilmeli
+
+    def test_giris_basarili_oturum_gunlugune_yazilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("sahte_hash", "Satış"))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main.pwd_context, "verify", lambda sifre, hash_: True)
+
+        yanit = TestClient(main.app).post("/giris", json={"KullaniciAdi": "satisci", "Sifre": "dogru_sifre"})
+        assert yanit.status_code == 200
+        basarili_kayit = [c for c in cursor.execute.call_args_list
+                           if "INTO OturumGunlugu" in c.args[0] and "GIRIS_BASARILI" in c.args[1]]
+        assert len(basarili_kayit) == 1
+
+    def test_oturum_gunlugu_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/oturum-gunlugu")
+        assert yanit.status_code in (401, 403)
+
+    def test_oturum_gunlugu_listesi(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (1, "satisci", "GIRIS_BASARILI", "127.0.0.1", "2026-09-04 10:00", None),
+        ])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/oturum-gunlugu")
+        assert yanit.status_code == 200
+        assert yanit.json()["gunluk"][0]["KullaniciAdi"] == "satisci"
+
+    def test_supheli_girisler(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[("saldirgan", 7, "2026-09-04 10:05")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/oturum-gunlugu/supheli-girisler")
+        assert yanit.status_code == 200
+        supheli = yanit.json()["supheliler"][0]
+        assert supheli["KullaniciAdi"] == "saldirgan"
+        assert supheli["DenemeSayisi"] == 7
+
+
 class _MrpSahteCursor:
     """MRP hesaplama fonksiyonu tek bir cursor üzerinden birden çok FARKLI SELECT
     çalıştırdığı için (talep, reçete, bileşen, stok, açık üretim, açık talep),
