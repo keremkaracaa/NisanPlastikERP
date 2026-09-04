@@ -328,6 +328,181 @@ class TestUygunsuzlukEndpoint:
         assert yanit.status_code in (401, 403)
 
 
+class TestOnayZinciriHesaplama:
+    """onay_zinciri_bul/onay_gerekli_mi'yi doğrudan (HTTP katmanı olmadan) test eder."""
+
+    def test_yonetici_hicbir_zaman_onaya_takilmaz(self):
+        conn, cursor = sahte_cursor_olustur()
+        esik, zincir_id = main.onay_gerekli_mi(cursor, 999999, {"rol": "Yönetici", "username": "x"})
+        assert esik is None and zincir_id is None
+
+    def test_eslesen_zincir_varsa_esik_ve_zincir_id_doner(self):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(5, 50000.0))  # ZincirID=5, MinTutar=50000
+        esik, zincir_id = main.onay_gerekli_mi(cursor, 75000, {"rol": "Satış", "username": "x"})
+        assert esik == 50000.0 and zincir_id == 5
+
+    def test_eslesen_zincir_yoksa_onay_gerekmez(self):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        esik, zincir_id = main.onay_gerekli_mi(cursor, 100, {"rol": "Satış", "username": "x"})
+        assert esik is None and zincir_id is None
+
+
+class TestOnayVerAdimFarkinda:
+    def test_son_adim_degilse_sadece_ilerletir_ve_uygulamaz(self, client, monkeypatch):
+        """2 adımlı bir zincirde ilk adım onaylanınca işlem HENÜZ uygulanmamalı,
+        sadece MevcutAdim ilerlemeli ve Durum 'Bekliyor' kalmalı."""
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("SiparisEkle", "{}", "Bekliyor", 5, 1),  # ana kayıt: ZincirID=5, MevcutAdim=1
+            ("Depo",),                                  # mevcut adımın gerekli rolü
+            (2,),                                       # toplam adım sayısı
+            ("Yönetici",),                               # sonraki adımın gerekli rolü
+            (2,),                                       # toplam adım sayısı (tekrar)
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/onay-ver/1")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["TamamlandiMi"] is False
+        assert veri["MevcutAdim"] == 2
+
+    def test_son_adimda_orijinal_islem_replay_edilir(self, client, monkeypatch):
+        """Tek adımlı (ya da son adıma gelmiş) bir zincirde onay verilince orijinal
+        işlem (burada SiparisEkle) gerçekten uygulanmalı - replay mekanizması."""
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("SiparisEkle", '{"MusteriID": 1, "StokKod": "PP-001", "StokAdi": "Test", "Miktar": 10, "BirimFiyat": 5}', "Bekliyor", 5, 1),
+            ("Depo",),   # mevcut adımın gerekli rolü
+            (1,),        # toplam adım sayısı -> mevcut_adim(1) == toplam_adim(1), son adım
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "siparis_ekle", lambda siparis, user: {"mesaj": "sipariş eklendi (replay)"})
+
+        yanit = client.post("/onay-ver/1")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["TamamlandiMi"] is True
+        assert veri["detay"]["mesaj"] == "sipariş eklendi (replay)"
+
+    def test_yanlis_rol_403_doner(self, monkeypatch):
+        """Mevcut adım 'Depo' rolü gerektiriyorsa, 'Satış' rolündeki biri onaylayamamalı."""
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("SiparisEkle", "{}", "Bekliyor", 5, 1),
+            ("Depo",),
+            (2,),
+        ]
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "satisci", "rol": "Satış"}
+        try:
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+            gecici_client = TestClient(main.app)
+            yanit = gecici_client.post("/onay-ver/1")
+            assert yanit.status_code == 403
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_zaten_islenmis_kayit_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("SiparisEkle", "{}", "Onaylandı", 5, 1))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/onay-ver/1")
+        assert yanit.status_code == 400
+
+    def test_onay_ver_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/onay-ver/1")
+        assert yanit.status_code in (401, 403)
+
+
+class TestOnayReddet:
+    def test_yetkili_rol_reddedebilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("Bekliyor", 5, 1), ("Depo",), (2,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/onay-reddet/1")
+        assert yanit.status_code == 200
+
+    def test_yanlis_rol_reddedemez_403_doner(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("Bekliyor", 5, 1), ("Depo",), (2,)]
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "satisci", "rol": "Satış"}
+        try:
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+            gecici_client = TestClient(main.app)
+            yanit = gecici_client.put("/onay-reddet/1")
+            assert yanit.status_code == 403
+        finally:
+            main.app.dependency_overrides.clear()
+
+
+class TestOnayZinciriEkle:
+    def test_zincir_ekle_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(9,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/onay-zinciri-ekle", json={
+            "Ad": "Orta Tutar", "MinTutar": 10000, "MaxTutar": 50000,
+            "Adimlar": [{"AdimSira": 1, "GerekliRol": "Depo"}, {"AdimSira": 2, "GerekliRol": "Yönetici"}]
+        })
+        assert yanit.status_code == 200
+        assert yanit.json()["ZincirID"] == 9
+
+    def test_zincir_ekle_adimsiz_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/onay-zinciri-ekle", json={"Ad": "Boş", "MinTutar": 1000, "Adimlar": []})
+        assert yanit.status_code == 400
+
+    def test_zincir_ekle_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/onay-zinciri-ekle", json={"Ad": "x", "MinTutar": 1, "Adimlar": [{"AdimSira": 1, "GerekliRol": "Depo"}]})
+        assert yanit.status_code in (401, 403)
+
+
+class TestStokHizliHareket:
+    def test_giris_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("PP-001", "Test Ürünü", 50.0))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/stok-hizli-hareket", json={"Kod": "PP-001", "Miktar": 10, "Yon": "GIRIS"})
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["YeniMevcutMiktar"] == 60.0
+        assert "Uyari" not in veri
+
+    def test_cikis_stok_eksiye_duserse_uyari_doner_ama_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("PP-001", "Test Ürünü", 5.0))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/stok-hizli-hareket", json={"Kod": "PP-001", "Miktar": 10, "Yon": "CIKIS"})
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["YeniMevcutMiktar"] == -5.0
+        assert "Uyari" in veri
+
+    def test_urun_bulunamadi_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/stok-hizli-hareket", json={"Kod": "YOK", "Miktar": 1, "Yon": "GIRIS"})
+        assert yanit.status_code == 404
+
+    def test_gecersiz_yon_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("PP-001", "Test Ürünü", 50.0))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/stok-hizli-hareket", json={"Kod": "PP-001", "Miktar": 1, "Yon": "YANLIS"})
+        assert yanit.status_code == 400
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/stok-hizli-hareket", json={"Kod": "PP-001", "Miktar": 1, "Yon": "GIRIS"})
+        assert yanit.status_code in (401, 403)
+
+
 class _MrpSahteCursor:
     """MRP hesaplama fonksiyonu tek bir cursor üzerinden birden çok FARKLI SELECT
     çalıştırdığı için (talep, reçete, bileşen, stok, açık üretim, açık talep),

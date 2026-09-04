@@ -3011,14 +3011,15 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkLabel(self.tab_onay_bekleyenler, text="Bir işleme çift tıklayarak Onayla/Reddet seçebilirsiniz. Ctrl/Shift ile birden fazla satır seçip toplu onaylayabilirsiniz.",
                      font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
         ctk.CTkLabel(self.tab_onay_bekleyenler,
-                     text="⚠️ ÖNEMLİ: Yönetici rolündeki bir kullanıcının kendi girdiği sipariş/fatura HİÇBİR ZAMAN bu listeye düşmez "
-                          "(bir onaylayıcının kendi işlemini kendine onaylatması anlamsız olur). Bu akışı test etmek için "
-                          "Yönetici DIŞINDA bir rolle (örn. Satış) giriş yapıp sipariş/fatura oluşturun.",
+                     text="Bu liste, o anki adımda SİZİN rolünüzün onayını bekleyen işlemleri gösterir (Yönetici/Master tümünü görür). "
+                          "Tutar aralığına göre birden fazla onay adımı olabilir - 'Adım' kolonu (örn. 2/3) o an kaçıncı aşamada olduğunu, "
+                          "'Bekleyen Rol' hangi rolün onayını beklediğini gösterir. Onay zincirlerini Sistem → Onay Zincirleri'nden tanımlayabilirsiniz.\n"
+                          "⚠️ Yönetici rolündeki bir kullanıcının kendi girdiği sipariş/fatura HİÇBİR ZAMAN bu listeye düşmez.",
                      font=("Arial", 10), text_color="#f59e0b", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 8))
 
         onay_cerceve, self.onay_tree = tablo_olustur(
-            self.tab_onay_bekleyenler, ["ID", "Tür", "Özet", "Tutar", "Talep Eden", "Durum", "Onaylayan", "Tarih"],
-            [50, 100, 240, 110, 100, 90, 100, 130], height=16)
+            self.tab_onay_bekleyenler, ["ID", "Tür", "Özet", "Tutar", "Talep Eden", "Adım", "Bekleyen Rol", "Durum", "Onaylayan", "Tarih"],
+            [50, 100, 220, 100, 90, 60, 100, 90, 100, 130], height=16)
         onay_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
         self.onay_tree.bind("<Double-Button-1>", self.onay_islem_penceresi)
 
@@ -3218,9 +3219,11 @@ class MainApp(ctk.CTkToplevel):
             DURUM_ETIKET = {"Bekliyor": "Bekliyor", "Onaylandı": "Onaylandı", "Reddedildi": "İptal"}
             for o in res.json().get("onaylar", []):
                 tag = DURUM_ETIKET.get(o["Durum"], "Bekliyor")
+                adim_metni = f"{o['MevcutAdim']}/{o['ToplamAdim']}" if o.get("MevcutAdim") else "-"
                 self.onay_tree.insert("", "end", iid=str(o["OnayID"]), tags=(tag,),
                                        values=(o["OnayID"], o["IslemTipi"], o["Ozet"], f"{o['Tutar']:,.2f} TL",
-                                               o["TalepEden"], o["Durum"], o["OnaylayanKullanici"], o["Tarih"]))
+                                               o["TalepEden"], adim_metni, o.get("GerekliRol") or "-", o["Durum"],
+                                               o["OnaylayanKullanici"], o["Tarih"]))
         except Exception:
             pass
 
@@ -3229,8 +3232,8 @@ class MainApp(ctk.CTkToplevel):
         if not secili:
             return
         satir = self.onay_tree.item(secili[0])["values"]
-        if satir[5] != "Bekliyor":
-            messagebox.showinfo("Bilgi", f"Bu işlem zaten '{satir[5]}' durumunda.")
+        if satir[7] != "Bekliyor":
+            messagebox.showinfo("Bilgi", f"Bu işlem zaten '{satir[7]}' durumunda.")
             return
 
         try:
@@ -3247,7 +3250,9 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkLabel(pencere, text=f"Onay #{secili[0]} — {detay.get('EvrakTuru', satir[1])}", font=("Arial", 15, "bold"), text_color="#f97316").pack(pady=(20, 5))
         ctk.CTkLabel(pencere, text=str(satir[2]), font=("Arial", 12), wraplength=480).pack(pady=(0, 5))
         ctk.CTkLabel(pencere, text=f"Cari: {detay.get('CariAd', '-')}   ·   Belge No: {detay.get('BelgeNo', '-')}   ·   Tarih: {detay.get('Tarih', '-')}",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(pady=(0, 10))
+                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(pady=(0, 5))
+        ctk.CTkLabel(pencere, text=f"Adım: {satir[5]}   ·   Bekleyen Rol: {satir[6]}",
+                     font=("Arial", 11, "bold"), text_color="#2563eb").pack(pady=(0, 10))
 
         kalemler = detay.get("Kalemler", [])
         if kalemler:
@@ -4891,6 +4896,10 @@ class MainApp(ctk.CTkToplevel):
             self.init_konsinye()
             self.init_negatif_stok()
 
+        if self.rol in ["Yönetici", "Master", "Depo", "Üretim"]:
+            self.tab_hizli_barkod = yeni_sekme("📷 Hızlı Barkod İşlem")
+            self.init_hizli_barkod()
+
         if self.rol in ["Yönetici", "Master", "Depo", "Satınalma", "Muhasebe"] or self.rol in ["Yönetici", "Master", "Satınalma", "Üretim"]:
             # NOT: Bu blok önceden kendi kategori başlığına sahip değildi - bu yüzden
             # sidebar'da bir önceki başlığın (Yönetici/Master için "ÜRETİM") altında
@@ -4937,10 +4946,6 @@ class MainApp(ctk.CTkToplevel):
             self.init_firsatlar()
             self.init_musteri_segment()
             self.init_siparis_fatura_tutarlilik()
-
-            if self.rol in ("Yönetici", "Master"):
-                self.tab_onay_bekleyenler = yeni_sekme("✅ Onay Bekleyenler")
-                self.init_onay_bekleyenler()
 
         if self.rol in ["Yönetici", "Master", "Muhasebe", "Finans"]:
             kategori_basligi("FİNANS")
@@ -4991,6 +4996,9 @@ class MainApp(ctk.CTkToplevel):
 
         # Herkesin görebileceği ortak / diğer sekmeler
         kategori_basligi("ORTAK")
+        self.tab_onay_bekleyenler = yeni_sekme("✅ Onay Bekleyenler")
+        self.init_onay_bekleyenler()
+
         self.tab_ted_ekle = yeni_sekme("🏭 Tedarikçi")
         self.init_tedarikci()
 
@@ -5019,6 +5027,8 @@ class MainApp(ctk.CTkToplevel):
             self.init_loglar()
             self.tab_kullanici = yeni_sekme("👤 Kullanıcı Yönetimi")
             self.init_kullanici_yonetimi()
+            self.tab_onay_zincirleri = yeni_sekme("🔗 Onay Zincirleri")
+            self.init_onay_zincirleri()
 
         sidebar_yeniden_diz()  # Sidebar'ı ilk kez kaydedilen sırayla ve doğru aç/kapa durumlarıyla çiz
         self.sekmeye_git("📊 Finans Özet")  # açılışta varsayılan olarak Dashboard görünsün
@@ -11093,6 +11103,238 @@ class MainApp(ctk.CTkToplevel):
             for oneri_id in secili:
                 requests.put(f"{API}/mrp-oneri-reddet/{oneri_id}", headers=self.req_headers(), timeout=8)
             self.mrp_onerilerini_yukle()
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def init_onay_zincirleri(self):
+        ROL_SECENEKLERI = ["Yönetici", "Master", "Patron", "Satış", "Muhasebe", "Depo", "Üretim", "Satınalma", "Finans", "İnsan Kaynakları"]
+
+        ust = ctk.CTkFrame(self.tab_onay_zincirleri, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="🔗 Onay Zincirleri", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+        ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=self.onay_zincirlerini_yukle).pack(side="right")
+        ctk.CTkLabel(self.tab_onay_zincirleri,
+                     text="Tutar aralığına göre kaç aşamalı onay gerektiğini burada tanımlarsınız - örn. 10.000-50.000 TL arası "
+                          "önce Depo, sonra Yönetici onaylasın. Bir tutar birden fazla zincire denk gelirse en yüksek alt sınıra "
+                          "sahip (en spesifik) zincir uygulanır. Zincirler silinmez, sadece Aktif/Pasif yapılabilir (geçmiş "
+                          "onay kayıtları bozulmasın diye).",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+
+        zincir_cerceve, self.onay_zincir_tree = tablo_olustur(
+            self.tab_onay_zincirleri, ["ID", "Ad", "Min Tutar", "Max Tutar", "Adımlar", "Durum"], [50, 180, 110, 110, 260, 80], height=8)
+        zincir_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkButton(self.tab_onay_zincirleri, text="🔁 Seçilinin Aktif/Pasif Durumunu Değiştir", fg_color="#f59e0b", hover_color="#d97706",
+                      command=self.onay_zinciri_durum_degistir_islem).pack(anchor="w", padx=20, pady=(0, 15))
+
+        form = ctk.CTkFrame(self.tab_onay_zincirleri, fg_color=RENK_KART, corner_radius=8)
+        form.pack(fill="x", padx=20, pady=(0, 20))
+        ctk.CTkLabel(form, text="Yeni Onay Zinciri Ekle", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        temel_satir = ctk.CTkFrame(form, fg_color="transparent")
+        temel_satir.pack(fill="x", padx=10, pady=(0, 8))
+        self.oz_ad = ctk.CTkEntry(temel_satir, placeholder_text="Zincir Adı (örn: Orta Tutar Siparişleri)", width=280)
+        self.oz_ad.pack(side="left", padx=(0, 8))
+        self.oz_min = ctk.CTkEntry(temel_satir, placeholder_text="Min Tutar", width=110)
+        self.oz_min.pack(side="left", padx=(0, 8))
+        self.oz_max = ctk.CTkEntry(temel_satir, placeholder_text="Max Tutar (boş=sınırsız)", width=150)
+        self.oz_max.pack(side="left", padx=(0, 8))
+
+        self.oz_adim_cercevesi = ctk.CTkFrame(form, fg_color="transparent")
+        self.oz_adim_cercevesi.pack(fill="x", padx=10, pady=(0, 5))
+        self._oz_adim_secimleri = []
+
+        def adim_ekle(varsayilan="Depo"):
+            satir = ctk.CTkFrame(self.oz_adim_cercevesi, fg_color="transparent")
+            satir.pack(fill="x", pady=2)
+            ctk.CTkLabel(satir, text=f"Adım {len(self._oz_adim_secimleri) + 1}:", width=70).pack(side="left")
+            secim = ctk.CTkOptionMenu(satir, values=ROL_SECENEKLERI, width=180)
+            secim.set(varsayilan)
+            secim.pack(side="left", padx=(0, 8))
+            self._oz_adim_secimleri.append(secim)
+
+        buton_satiri = ctk.CTkFrame(form, fg_color="transparent")
+        buton_satiri.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(buton_satiri, text="+ Adım Ekle", fg_color=RENK_KENARLIK, hover_color=RENK_IKINCIL,
+                      command=lambda: adim_ekle()).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(buton_satiri, text="✅ Zinciri Kaydet", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.onay_zinciri_ekle_islem).pack(side="left")
+
+        adim_ekle("Depo")
+        adim_ekle("Yönetici")
+        self.onay_zincirlerini_yukle()
+
+    def onay_zincirlerini_yukle(self):
+        try:
+            res = requests.get(f"{API}/onay-zincirleri", headers=self.req_headers(), timeout=6)
+            for i in self.onay_zincir_tree.get_children():
+                self.onay_zincir_tree.delete(i)
+            for z in res.json().get("zincirler", []):
+                adim_ozeti = " → ".join(a["GerekliRol"] for a in sorted(z["Adimlar"], key=lambda a: a["AdimSira"]))
+                self.onay_zincir_tree.insert("", "end", iid=str(z["ZincirID"]),
+                                              values=(z["ZincirID"], z["Ad"], f"{z['MinTutar']:,.2f}",
+                                                      f"{z['MaxTutar']:,.2f}" if z["MaxTutar"] is not None else "Sınırsız",
+                                                      adim_ozeti, "Aktif" if z["AktifMi"] else "Pasif"))
+        except Exception:
+            pass
+
+    def onay_zinciri_ekle_islem(self):
+        ad = self.oz_ad.get().strip()
+        if not ad:
+            messagebox.showwarning("Eksik Bilgi", "Zincir adı zorunludur.")
+            return
+        try:
+            min_tutar = float(self.oz_min.get())
+        except ValueError:
+            messagebox.showwarning("Hatalı Değer", "Min Tutar sayısal olmalıdır.")
+            return
+        max_deger = self.oz_max.get().strip()
+        max_tutar = None
+        if max_deger:
+            try:
+                max_tutar = float(max_deger)
+            except ValueError:
+                messagebox.showwarning("Hatalı Değer", "Max Tutar sayısal olmalıdır.")
+                return
+        adimlar = [{"AdimSira": i + 1, "GerekliRol": secim.get()} for i, secim in enumerate(self._oz_adim_secimleri)]
+        try:
+            res = requests.post(f"{API}/onay-zinciri-ekle", json={"Ad": ad, "MinTutar": min_tutar, "MaxTutar": max_tutar, "Adimlar": adimlar},
+                                 headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                self.oz_ad.delete(0, "end")
+                self.oz_min.delete(0, "end")
+                self.oz_max.delete(0, "end")
+                self.onay_zincirlerini_yukle()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Zincir oluşturuldu."))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def onay_zinciri_durum_degistir_islem(self):
+        secili = self.onay_zincir_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen listeden bir zincir seçin.")
+            return
+        mevcut_durum = self.onay_zincir_tree.item(secili[0])["values"][5]
+        yeni_aktif = mevcut_durum != "Aktif"
+        try:
+            res = requests.put(f"{API}/onay-zinciri-durum/{secili[0]}", params={"aktif": yeni_aktif}, headers=self.req_headers(), timeout=6)
+            if res.status_code == 200:
+                self.onay_zincirlerini_yukle()
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def init_hizli_barkod(self):
+        self._hb_secili_urun = None
+        self._hb_depolar_cache = []
+
+        ust = ctk.CTkFrame(self.tab_hizli_barkod, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="📷 Hızlı Barkod İşlem", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+        ctk.CTkLabel(self.tab_hizli_barkod,
+                     text="El terminaliyle (ya da telefon/masaüstü kamerası + barkod okuyucu yazılımıyla) barkodu okutun, "
+                          "ya da stok kodunu yazıp Enter'a basın. Ürün bulununca miktar girip Giriş/Çıkış'a basmanız yeterli - "
+                          "her işlemden sonra alan otomatik temizlenip yeniden odaklanır, art arda hızlı okutabilirsiniz.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+
+        barkod_cerceve = ctk.CTkFrame(self.tab_hizli_barkod, fg_color=RENK_KART, corner_radius=8)
+        barkod_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(barkod_cerceve, text="📷 Barkod Okut / Stok Kodu Yaz:", font=("Arial", 13, "bold")).pack(side="left", padx=(12, 8), pady=12)
+        self.hb_barkod_entry = ctk.CTkEntry(barkod_cerceve, placeholder_text="Barkod okuyucuyla okutun veya yazıp Enter'a basın",
+                                             width=400, height=36, font=("Arial", 13))
+        self.hb_barkod_entry.pack(side="left", padx=(0, 10), pady=12)
+        self.hb_barkod_entry.bind("<Return>", lambda e: self.hb_urun_ara())
+
+        kart = ctk.CTkFrame(self.tab_hizli_barkod, fg_color=RENK_KART, corner_radius=8)
+        kart.pack(fill="x", padx=20, pady=(0, 10))
+        self.hb_urun_label = ctk.CTkLabel(kart, text="Henüz ürün okutulmadı.", font=("Arial", 15, "bold"), text_color=RENK_METIN_SOLUK)
+        self.hb_urun_label.pack(anchor="w", padx=12, pady=(12, 4))
+        self.hb_stok_label = ctk.CTkLabel(kart, text="", font=("Arial", 12), text_color=RENK_METIN_SOLUK)
+        self.hb_stok_label.pack(anchor="w", padx=12, pady=(0, 10))
+
+        islem_satiri = ctk.CTkFrame(kart, fg_color="transparent")
+        islem_satiri.pack(fill="x", padx=12, pady=(0, 12))
+        self.hb_miktar_entry = ctk.CTkEntry(islem_satiri, placeholder_text="Miktar", width=110, height=36, font=("Arial", 13))
+        self.hb_miktar_entry.pack(side="left", padx=(0, 8))
+        self.hb_depo_secim = ctk.CTkOptionMenu(islem_satiri, values=["Depo Seçilmedi (opsiyonel)"], width=200)
+        self.hb_depo_secim.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(islem_satiri, text="➕ Giriş", fg_color="#16a34a", hover_color="#15803d", height=36,
+                      font=("Arial", 13, "bold"), command=lambda: self.hb_hareket_kaydet("GIRIS")).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(islem_satiri, text="➖ Çıkış", fg_color="#ef4444", hover_color="#b91c1c", height=36,
+                      font=("Arial", 13, "bold"), command=lambda: self.hb_hareket_kaydet("CIKIS")).pack(side="left")
+
+        ctk.CTkLabel(self.tab_hizli_barkod, text="Bugünün İşlemleri", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 2))
+        gecmis_cerceve, self.hb_gecmis_tree = tablo_olustur(
+            self.tab_hizli_barkod, ["Saat", "Stok Kod", "Ürün", "Yön", "Miktar", "Yeni Mevcut"], [90, 100, 260, 80, 90, 100], height=12)
+        gecmis_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        self._hb_depolari_yukle()
+        self.hb_barkod_entry.focus_set()
+
+    def _hb_depolari_yukle(self):
+        try:
+            res = requests.get(f"{API}/depolar", headers=self.req_headers(), timeout=5)
+            depolar = res.json().get("depolar", []) if res.status_code == 200 else []
+            self._hb_depolar_cache = depolar
+            self.hb_depo_secim.configure(values=["Depo Seçilmedi (opsiyonel)"] + [d["DepoAdi"] for d in depolar])
+        except Exception:
+            pass
+
+    def hb_urun_ara(self):
+        kod = self.hb_barkod_entry.get().strip()
+        self.hb_barkod_entry.delete(0, "end")
+        if not kod:
+            return
+        try:
+            res = requests.get(f"{API}/stok-barkod-ara/{kod}", headers=self.req_headers(), timeout=5)
+            if res.status_code != 200:
+                messagebox.showwarning("Bulunamadı", f"'{kod}' ile eşleşen bir ürün bulunamadı.")
+                self.hb_barkod_entry.focus_set()
+                return
+            self._hb_secili_urun = res.json()
+            self.hb_urun_label.configure(text=f"{self._hb_secili_urun['StokAdi']}  ({self._hb_secili_urun['StokKod']})", text_color="#10b981")
+            self.hb_stok_label.configure(text=f"Mevcut stok: {self._hb_secili_urun['MevcutMiktar']:g} {self._hb_secili_urun['Birim']}")
+            self.hb_miktar_entry.delete(0, "end")
+            self.hb_miktar_entry.focus_set()
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+        finally:
+            self.hb_barkod_entry.focus_set()
+
+    def hb_hareket_kaydet(self, yon: str):
+        if not self._hb_secili_urun:
+            messagebox.showinfo("Önce Ürün Okutun", "Giriş/Çıkış kaydetmeden önce bir barkod/stok kodu okutun.")
+            return
+        try:
+            miktar = float(self.hb_miktar_entry.get())
+            if miktar <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Hatalı Değer", "Miktar sıfırdan büyük bir sayı olmalıdır.")
+            return
+
+        depo_secim_adi = self.hb_depo_secim.get()
+        depo_id = next((d["DepoID"] for d in self._hb_depolar_cache if d["DepoAdi"] == depo_secim_adi), None)
+
+        data = {"Kod": self._hb_secili_urun["StokKod"], "Miktar": miktar, "Yon": yon, "DepoID": depo_id}
+        try:
+            res = requests.post(f"{API}/stok-hizli-hareket", json=data, headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                sonuc = res.json()
+                from datetime import datetime as _dt
+                self.hb_gecmis_tree.insert("", 0, values=(
+                    _dt.now().strftime("%H:%M:%S"), sonuc["StokKod"], sonuc["StokAdi"],
+                    "Giriş" if yon == "GIRIS" else "Çıkış", f"{miktar:g}", f"{sonuc['YeniMevcutMiktar']:g}"))
+                self.hb_stok_label.configure(text=f"Mevcut stok: {sonuc['YeniMevcutMiktar']:g}")
+                self._hb_secili_urun["MevcutMiktar"] = sonuc["YeniMevcutMiktar"]
+                self.hb_miktar_entry.delete(0, "end")
+                if sonuc.get("Uyari"):
+                    messagebox.showwarning("Stok Uyarısı", sonuc["Uyari"])
+                self.hb_barkod_entry.focus_set()
+            else:
+                self.api_hata_goster(res)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 

@@ -1007,23 +1007,31 @@ class EvrakPayload(BaseModel):
 
 
 # --- 2. EVRAK İŞLEME VE DAĞITIM MOTORU ---
-def onay_esigi_asildi_mi(cursor, tutar: float, user: dict):
-    """Ortak onay eşiği kontrolü - Fatura, Sipariş gibi birden fazla akışta tekrar
-    kullanılır. Yönetici hiçbir zaman kendi işlemini onaya göndermez. Eşik aşılmışsa
-    eşik değerini, aşılmamışsa/Yöneticiyse None döner."""
-    if user["rol"] == "Yönetici":
-        return None
-    cursor.execute("SELECT AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari='FaturaOnayEsigi'")
-    esik_row = cursor.fetchone()
-    esik = float(esik_row[0]) if esik_row else None
-    if esik and tutar > esik:
-        return esik
-    return None
+def onay_zinciri_bul(cursor, tutar: float):
+    """Bir tutar için eşleşen AKTİF onay zincirini bulur - en yüksek MinTutar'a
+    sahip eşleşen zincir kazanır (yani en spesifik/en yüksek dilim). Eşleşme
+    yoksa None döner (onaysız otomatik uygulanır)."""
+    cursor.execute("""SELECT TOP 1 ZincirID, MinTutar FROM OnayZincirleri
+                       WHERE AktifMi=1 AND MinTutar<=? AND (MaxTutar IS NULL OR ?<=MaxTutar)
+                       ORDER BY MinTutar DESC""", (tutar, tutar))
+    return cursor.fetchone()
 
-def onaya_gonder(cursor, islem_tipi: str, islem_verisi: dict, tutar: float, ozet: str, user: dict):
-    cursor.execute("""INSERT INTO OnayBekleyenIslemler (IslemTipi, IslemVerisiJSON, Tutar, Ozet, TalepEden)
-                       OUTPUT inserted.OnayID VALUES (?, ?, ?, ?, ?)""",
-                   (islem_tipi, json.dumps(islem_verisi), tutar, ozet, user["username"]))
+def onay_gerekli_mi(cursor, tutar: float, user: dict):
+    """Ortak onay kontrolü - Fatura, Sipariş gibi birden fazla akışta tekrar
+    kullanılır. Yönetici hiçbir zaman kendi işlemini onaya göndermez. Eşleşen bir
+    onay zinciri varsa (esik, zincir_id) döner, yoksa/Yöneticiyse (None, None)."""
+    if user["rol"] == "Yönetici":
+        return None, None
+    zincir = onay_zinciri_bul(cursor, tutar)
+    if not zincir:
+        return None, None
+    zincir_id, esik = zincir
+    return float(esik), int(zincir_id)
+
+def onaya_gonder(cursor, islem_tipi: str, islem_verisi: dict, tutar: float, ozet: str, user: dict, zincir_id: int = None):
+    cursor.execute("""INSERT INTO OnayBekleyenIslemler (IslemTipi, IslemVerisiJSON, Tutar, Ozet, TalepEden, ZincirID, MevcutAdim)
+                       OUTPUT inserted.OnayID VALUES (?, ?, ?, ?, ?, ?, 1)""",
+                   (islem_tipi, json.dumps(islem_verisi), tutar, ozet, user["username"], zincir_id))
     onay_id = int(cursor.fetchone()[0])
     log_islem(cursor, f"Yüksek tutarlı işlem onaya gönderildi: #{onay_id} ({tutar:,.2f} TL)", user["username"])
     return onay_id
@@ -1039,12 +1047,12 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
         genel_toplam = ara_toplam + kdv_toplam
 
         if data.evrak_tipi == "Satış Faturası":
-            esik = onay_esigi_asildi_mi(cursor, genel_toplam, user)
+            esik, zincir_id = onay_gerekli_mi(cursor, genel_toplam, user)
             if esik:
                 onay_id = onaya_gonder(cursor, "EvrakIsleme", data.dict(), genel_toplam,
-                                        f"{data.evrak_tipi}: {data.cari_ad} - {genel_toplam:,.2f} TL", user)
+                                        f"{data.evrak_tipi}: {data.cari_ad} - {genel_toplam:,.2f} TL", user, zincir_id)
                 conn.commit()
-                return {"mesaj": f"Tutar ({genel_toplam:,.2f} TL), onay eşiğini ({esik:,.2f} TL) aştığı için Yönetici onayına gönderildi.",
+                return {"mesaj": f"Tutar ({genel_toplam:,.2f} TL), onay eşiğini ({esik:,.2f} TL) aştığı için onaya gönderildi.",
                         "OnayBekliyor": True, "OnayID": onay_id}
 
         try:
@@ -2415,6 +2423,15 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _onay_zinciri_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Onay zinciri migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -2623,6 +2640,67 @@ def _mrp_migrationlari(cursor):
             OlusturanKullanici NVARCHAR(50) NOT NULL
         )
     """, "MrpOnerileri tablosu")
+
+def _onay_zinciri_migrationlari(cursor):
+    """Çok Kademeli Onay Motoru için tablo/sütun eklemeleri - diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='OnayZincirleri' and xtype='U')
+        CREATE TABLE OnayZincirleri (
+            ZincirID INT IDENTITY(1,1) PRIMARY KEY,
+            Ad NVARCHAR(100) NOT NULL,
+            MinTutar FLOAT NOT NULL,
+            MaxTutar FLOAT NULL,
+            AktifMi BIT NOT NULL DEFAULT 1,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "OnayZincirleri tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='OnayZinciriAdimlari' and xtype='U')
+        CREATE TABLE OnayZinciriAdimlari (
+            AdimID INT IDENTITY(1,1) PRIMARY KEY,
+            ZincirID INT NOT NULL FOREIGN KEY REFERENCES OnayZincirleri(ZincirID),
+            AdimSira INT NOT NULL,
+            GerekliRol NVARCHAR(30) NOT NULL
+        )
+    """, "OnayZinciriAdimlari tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='OnayAdimGecmisi' and xtype='U')
+        CREATE TABLE OnayAdimGecmisi (
+            GecmisID INT IDENTITY(1,1) PRIMARY KEY,
+            OnayID INT NOT NULL FOREIGN KEY REFERENCES OnayBekleyenIslemler(OnayID),
+            AdimSira INT NOT NULL,
+            OnaylayanKullanici NVARCHAR(50) NOT NULL,
+            Durum NVARCHAR(20) NOT NULL,
+            Tarih DATETIME NOT NULL DEFAULT GETDATE(),
+            Not_ NVARCHAR(255) NULL
+        )
+    """, "OnayAdimGecmisi tablosu")
+    guvenli_sutun_ekle(cursor, "OnayBekleyenIslemler", "ZincirID", "INT NULL")
+    guvenli_sutun_ekle(cursor, "OnayBekleyenIslemler", "MevcutAdim", "INT NOT NULL DEFAULT 1")
+
+    # Geriye uyumluluk: hiç zincir tanımlanmamışsa, eski tek-seviyeli FaturaOnayEsigi
+    # ayarını bire bir davranışını koruyan bir "Varsayılan" zincire (tek adım, Yönetici
+    # rolü) otomatik dönüştür - kullanıcı yeni zincir tanımlamadan mevcut davranış
+    # (Yönetici onayı gerektiren tek eşik) hiç bozulmaz.
+    try:
+        cursor.execute("SELECT COUNT(*) FROM OnayZincirleri")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("SELECT AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari='FaturaOnayEsigi'")
+            esik_row = cursor.fetchone()
+            esik = float(esik_row[0]) if esik_row and esik_row[0] else 50000.0
+            cursor.execute("INSERT INTO OnayZincirleri (Ad, MinTutar, MaxTutar) OUTPUT inserted.ZincirID VALUES (?, ?, NULL)",
+                           ("Varsayılan (Yönetici)", esik))
+            zincir_id = int(cursor.fetchone()[0])
+            cursor.execute("INSERT INTO OnayZinciriAdimlari (ZincirID, AdimSira, GerekliRol) VALUES (?, 1, 'Yönetici')", (zincir_id,))
+            cursor.connection.commit()
+            print(f">>> Onay zinciri geriye uyumluluk seed'i eklendi: 'Varsayılan (Yönetici)', MinTutar={esik}")
+    except Exception as e:
+        print(f">>> Onay zinciri geriye uyumluluk seed'i atlandı: {e}")
+        try:
+            cursor.connection.rollback()
+        except Exception:
+            pass
 
 @app.post("/virman-yap")
 def virman_yap(req: VirmanRequest, current_user: dict = Depends(get_current_user)):
@@ -4446,6 +4524,61 @@ def stok_barkod_ara(kod: str, user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
+class StokHizliHareketRequest(BaseModel):
+    Kod: str                    # Barkod ya da StokKod - /stok-barkod-ara ile aynı fallback mantığı
+    Miktar: float = Field(gt=0)
+    Yon: str                     # 'GIRIS' | 'CIKIS'
+    DepoID: Optional[int] = None
+    Aciklama: Optional[str] = None
+
+@app.post("/stok-hizli-hareket")
+def stok_hizli_hareket(veri: StokHizliHareketRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Üretim"]))):
+    """El terminali/barkod okuyucu ile hızlı stok giriş-çıkış kaydı - barkod okutulup
+    (ya da yazılıp Enter'a basılıp) doğrudan miktar girilerek stoğun anında güncellenmesini
+    sağlar. /stok-barkod-ara ile AYNI Barkod->StokKod fallback aramasını kullanır ki
+    operatör hangi kodu okuttuysa (gerçek barkod ya da stok kodu) sorunsuz çalışsın."""
+    if veri.Yon not in ("GIRIS", "CIKIS"):
+        raise HTTPException(status_code=400, detail="Yön 'GIRIS' veya 'CIKIS' olmalıdır.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT StokKod, StokAdi, MevcutMiktar FROM StokKartlari WHERE Barkod=?", (veri.Kod,))
+        row = cursor.fetchone()
+        if not row:
+            cursor.execute("SELECT StokKod, StokAdi, MevcutMiktar FROM StokKartlari WHERE StokKod=?", (veri.Kod,))
+            row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"'{veri.Kod}' ile eşleşen bir ürün bulunamadı.")
+        stok_kod, stok_adi, mevcut = row[0], row[1], float(row[2])
+
+        miktar_degisim = veri.Miktar if veri.Yon == "GIRIS" else -veri.Miktar
+        yeni_mevcut = mevcut + miktar_degisim
+
+        cursor.execute("UPDATE StokKartlari SET MevcutMiktar = MevcutMiktar + ? WHERE StokKod = ?", (miktar_degisim, stok_kod))
+        islem_turu = "GİRİŞ" if veri.Yon == "GIRIS" else "ÇIKIŞ"
+        aciklama = veri.Aciklama or f"Hızlı barkod işlemi ({user['username']})"
+        cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, ?, ?, ?)",
+                       (stok_kod, islem_turu, veri.Miktar, aciklama))
+        if veri.DepoID:
+            depo_stok_guncelle(cursor, stok_kod, veri.DepoID, miktar_degisim)
+
+        log_islem(cursor, f"Hızlı barkod {islem_turu.lower()}: {stok_kod} - {veri.Miktar:g}", user["username"])
+        conn.commit()
+
+        sonuc = {"mesaj": f"'{stok_adi}' için {veri.Miktar:g} birim {islem_turu.lower()} kaydedildi.",
+                 "StokKod": stok_kod, "StokAdi": stok_adi, "YeniMevcutMiktar": yeni_mevcut}
+        if yeni_mevcut < 0:
+            sonuc["Uyari"] = f"⚠️ '{stok_adi}' stoğu eksiye düştü ({yeni_mevcut:g}) - kontrol edin."
+        return sonuc
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
 @app.get("/stok-barkod-etiketi/{stok_kod}")
 def stok_barkod_etiketi(stok_kod: str, miktar: Optional[float] = None, birim_override: Optional[str] = None,
                          tarih: Optional[str] = None, etiket_genislik_mm: float = 80, etiket_yukseklik_mm: float = 50,
@@ -5926,7 +6059,7 @@ class TopluOnayRequest(BaseModel):
     OnayIDListesi: list[int]
 
 @app.post("/onay-toplu-onayla")
-def onay_toplu_onayla(veri: TopluOnayRequest, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+def onay_toplu_onayla(veri: TopluOnayRequest, user: dict = Depends(get_current_user)):
     """Birden fazla onay bekleyen işlemi TEK seferde onaylar - mevcut, tek tekli
     onay_ver() fonksiyonunu her ID için sırayla çağırır (kendi bağlantısını kendi
     yönetiyor), hangi ID'lerin başarılı/başarısız olduğunu raporlar."""
@@ -6001,12 +6134,12 @@ def siparis_ekle(siparis: SiparisEkleRequest, user: dict = Depends(yetki_kontrol
     try:
         toplam = siparis.Miktar * siparis.BirimFiyat
 
-        esik = onay_esigi_asildi_mi(cursor, toplam, user)
+        esik, zincir_id = onay_gerekli_mi(cursor, toplam, user)
         if esik:
             onay_id = onaya_gonder(cursor, "SiparisEkle", siparis.dict(), toplam,
-                                    f"Sipariş: {siparis.StokAdi} - {toplam:,.2f} TL", user)
+                                    f"Sipariş: {siparis.StokAdi} - {toplam:,.2f} TL", user, zincir_id)
             conn.commit()
-            return {"mesaj": f"Sipariş tutarı ({toplam:,.2f} TL) onay eşiğini ({esik:,.2f} TL) aştığı için Yönetici onayına gönderildi.",
+            return {"mesaj": f"Sipariş tutarı ({toplam:,.2f} TL) onay eşiğini ({esik:,.2f} TL) aştığı için onaya gönderildi.",
                     "OnayBekliyor": True, "OnayID": onay_id}
 
         cursor.execute("INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar) VALUES (?, ?, ?, ?, ?, ?)",
@@ -6047,12 +6180,12 @@ def siparis_grup_ekle(veri: SiparisGrupEkleRequest, user: dict = Depends(yetki_k
         # eşiği kontrolü ve grup toplamı için TÜMÜ güncel TCMB kuruyla TL'ye çevrilir.
         kurlar = guncel_kur_getir()
         grup_toplam = sum((k.Miktar * k.BirimFiyat) * kurlar.get(k.ParaBirimi, 1.0) for k in veri.Kalemler)
-        esik = onay_esigi_asildi_mi(cursor, grup_toplam, user)
+        esik, zincir_id = onay_gerekli_mi(cursor, grup_toplam, user)
         if esik:
             onay_id = onaya_gonder(cursor, "SiparisGrupEkle", veri.dict(), grup_toplam,
-                                    f"Sipariş Grubu ({len(veri.Kalemler)} kalem) - {grup_toplam:,.2f} TL", user)
+                                    f"Sipariş Grubu ({len(veri.Kalemler)} kalem) - {grup_toplam:,.2f} TL", user, zincir_id)
             conn.commit()
-            return {"mesaj": f"Sipariş tutarı ({grup_toplam:,.2f} TL) onay eşiğini ({esik:,.2f} TL) aştığı için Yönetici onayına gönderildi.",
+            return {"mesaj": f"Sipariş tutarı ({grup_toplam:,.2f} TL) onay eşiğini ({esik:,.2f} TL) aştığı için onaya gönderildi.",
                     "OnayBekliyor": True, "OnayID": onay_id}
 
         cursor.execute("""INSERT INTO SiparisGruplari (MusteriID, Aciklama, KullaniciAdi)
@@ -8240,23 +8373,60 @@ def mrp_oneri_reddet(oneri_id: int, user: dict = Depends(yetki_kontrol(["Yöneti
     finally:
         conn.close()
 
+def _onay_adim_bilgisi(cursor, zincir_id, mevcut_adim: int):
+    """Bir OnayBekleyenIslemler kaydının mevcut adımı için (GerekliRol, ToplamAdim)
+    döner. ZincirID NULL ise (eski/geçiş verisi ya da hiç zincir eşleşmemiş edge-case)
+    'Yönetici' + tek adım varsayılır - eski tek-seviyeli davranışla uyumlu kalır."""
+    if zincir_id is None:
+        return "Yönetici", 1
+    cursor.execute("SELECT GerekliRol FROM OnayZinciriAdimlari WHERE ZincirID=? AND AdimSira=?", (zincir_id, mevcut_adim))
+    row = cursor.fetchone()
+    gerekli_rol = row[0] if row else "Yönetici"
+    cursor.execute("SELECT ISNULL(MAX(AdimSira),1) FROM OnayZinciriAdimlari WHERE ZincirID=?", (zincir_id,))
+    toplam_adim = int(cursor.fetchone()[0])
+    return gerekli_rol, toplam_adim
+
 @app.get("/onay-bekleyenler")
-def onay_bekleyenler_getir(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+def onay_bekleyenler_getir(user: dict = Depends(get_current_user)):
+    """Yönetici/Master TÜM bekleyen onayları görür; diğer roller SADECE mevcut
+    adımın gerektirdiği rol kendi rolleriyle eşleşen kayıtları görür - bir Depo
+    Şefi, henüz sırası gelmemiş (örn. hâlâ Muhasebe adımında bekleyen) ya da
+    zaten kendi adımını geçmiş bir onayı listede görmemeli."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT OnayID, IslemTipi, Tutar, Ozet, TalepEden, Durum, OnaylayanKullanici, Tarih, OnayTarihi
+            SELECT OnayID, IslemTipi, Tutar, Ozet, TalepEden, Durum, OnaylayanKullanici, Tarih, OnayTarihi, ZincirID, MevcutAdim
             FROM OnayBekleyenIslemler ORDER BY Tarih DESC
         """)
-        return {"onaylar": [{"OnayID": r[0], "IslemTipi": r[1], "Tutar": float(r[2]) if r[2] is not None else 0, "Ozet": r[3] or "", "TalepEden": r[4],
-                              "Durum": r[5], "OnaylayanKullanici": r[6] or "-", "Tarih": str(r[7])[:16],
-                              "OnayTarihi": str(r[8])[:16] if r[8] else "-"} for r in cursor.fetchall()]}
+        onaylar = []
+        for r in cursor.fetchall():
+            durum, zincir_id, mevcut_adim = r[5], r[9], r[10]
+            gerekli_rol, toplam_adim = _onay_adim_bilgisi(cursor, zincir_id, mevcut_adim) if durum == "Bekliyor" else (None, None)
+            if durum == "Bekliyor" and user["rol"] not in ("Yönetici", "Master") and user["rol"] != gerekli_rol:
+                continue
+            onaylar.append({"OnayID": r[0], "IslemTipi": r[1], "Tutar": float(r[2]) if r[2] is not None else 0, "Ozet": r[3] or "", "TalepEden": r[4],
+                             "Durum": durum, "OnaylayanKullanici": r[6] or "-", "Tarih": str(r[7])[:16],
+                             "OnayTarihi": str(r[8])[:16] if r[8] else "-", "MevcutAdim": mevcut_adim, "ToplamAdim": toplam_adim,
+                             "GerekliRol": gerekli_rol})
+        return {"onaylar": onaylar}
+    finally:
+        conn.close()
+
+@app.get("/onay-adim-gecmisi/{onay_id}")
+def onay_adim_gecmisi_getir(onay_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT AdimSira, OnaylayanKullanici, Durum, Tarih, Not_ FROM OnayAdimGecmisi
+                           WHERE OnayID=? ORDER BY AdimSira""", (onay_id,))
+        return {"gecmis": [{"AdimSira": r[0], "OnaylayanKullanici": r[1], "Durum": r[2], "Tarih": str(r[3])[:16], "Not": r[4] or ""}
+                            for r in cursor.fetchall()]}
     finally:
         conn.close()
 
 @app.get("/onay-detay/{onay_id}")
-def onay_detay_getir(onay_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+def onay_detay_getir(onay_id: int, user: dict = Depends(get_current_user)):
     """Onay bekleyen işlemin tam kalem dökümünü (ürün/miktar/fiyat) döndürür, Yönetici
     'Onayla' demeden önce neyi onayladığını satır satır görebilsin diye."""
     conn = get_db_connection()
@@ -8293,17 +8463,41 @@ def onay_detay_getir(onay_id: int, user: dict = Depends(yetki_kontrol(["Yönetic
         conn.close()
 
 @app.post("/onay-ver/{onay_id}")
-def onay_ver(onay_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+def onay_ver(onay_id: int, user: dict = Depends(get_current_user)):
+    """Adım-farkında onay: mevcut adımı onaylayan kullanıcının rolü, o adımın
+    GerekliRol'üyle eşleşmeli (ya da Yönetici/Master her zaman geçer). Son adım
+    DEĞİLSE sadece MevcutAdim ilerletilir ve bekleme sürer; SON adımsa orijinal
+    işlem (IslemVerisiJSON) tıpkı eskisi gibi 'replay' edilerek gerçek uygulama
+    yapılır (bkz. bu fonksiyonun eski tek-seviyeli hâli, davranış aynı kalır)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT IslemTipi, IslemVerisiJSON, Durum FROM OnayBekleyenIslemler WHERE OnayID=?", (onay_id,))
+        cursor.execute("SELECT IslemTipi, IslemVerisiJSON, Durum, ZincirID, MevcutAdim FROM OnayBekleyenIslemler WHERE OnayID=?", (onay_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Onay kaydı bulunamadı.")
         if row[2] != "Bekliyor":
             raise HTTPException(status_code=400, detail=f"Bu işlem zaten '{row[2]}' durumunda, tekrar onaylanamaz.")
-        islem_tipi, veri_json = row[0], row[1]
+        islem_tipi, veri_json, zincir_id, mevcut_adim = row[0], row[1], row[3], row[4]
+
+        gerekli_rol, toplam_adim = _onay_adim_bilgisi(cursor, zincir_id, mevcut_adim)
+        if user["rol"] not in ("Yönetici", "Master") and user["rol"] != gerekli_rol:
+            raise HTTPException(status_code=403, detail=f"Bu adımı onaylama yetkiniz yok. Gerekli rol: {gerekli_rol}")
+
+        cursor.execute("INSERT INTO OnayAdimGecmisi (OnayID, AdimSira, OnaylayanKullanici, Durum) VALUES (?, ?, ?, 'Onaylandı')",
+                       (onay_id, mevcut_adim, user["username"]))
+
+        if mevcut_adim < toplam_adim:
+            # Son adım değil - sırayı bir sonraki onaylayıcıya devret, henüz işlemi UYGULAMA.
+            cursor.execute("UPDATE OnayBekleyenIslemler SET MevcutAdim=? WHERE OnayID=?", (mevcut_adim + 1, onay_id))
+            log_islem(cursor, f"Onay adımı {mevcut_adim}/{toplam_adim} tamamlandı: #{onay_id} -> sıradaki onaylayıcıya iletildi.", user["username"])
+            conn.commit()
+            sonraki_rol, _ = _onay_adim_bilgisi(cursor, zincir_id, mevcut_adim + 1)
+            return {"mesaj": f"Adım {mevcut_adim}/{toplam_adim} onaylandı. Sıradaki onaylayıcıya ({sonraki_rol}) iletildi.",
+                    "TamamlandiMi": False, "MevcutAdim": mevcut_adim + 1, "ToplamAdim": toplam_adim}
+
+        # Son adım - orijinal işlemi şimdi gerçekten uygula.
+        conn.commit()
         conn.close()
 
         if islem_tipi == "EvrakIsleme":
@@ -8323,12 +8517,16 @@ def onay_ver(onay_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
         try:
             cursor2.execute("""UPDATE OnayBekleyenIslemler SET Durum='Onaylandı', OnaylayanKullanici=?, OnayTarihi=GETDATE()
                                 WHERE OnayID=?""", (user["username"], onay_id))
-            log_islem(cursor2, f"Onay bekleyen işlem onaylandı: #{onay_id}", user["username"])
+            log_islem(cursor2, f"Onay bekleyen işlem tüm adımlardan geçti, onaylandı: #{onay_id}", user["username"])
             conn2.commit()
         finally:
             conn2.close()
-        return {"mesaj": "İşlem onaylandı ve uygulandı.", "detay": sonuc}
+        return {"mesaj": "İşlem tüm onay adımlarından geçti ve uygulandı.", "detay": sonuc, "TamamlandiMi": True}
     except HTTPException:
+        # NOT: conn son adımda zaten kapatılmış olabilir (replay çağrısından önce) -
+        # rollback burada DENENMEZ, kapalı bir bağlantıda rollback yeni bir hata
+        # fırlatıp asıl HTTPException'ı maskeleyebilir. finally bloğu zaten güvenli
+        # şekilde (try/except ile) kapatmayı dener.
         raise
     finally:
         try:
@@ -8337,19 +8535,96 @@ def onay_ver(onay_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
             pass
 
 @app.put("/onay-reddet/{onay_id}")
-def onay_reddet(onay_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+def onay_reddet(onay_id: int, user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT Durum FROM OnayBekleyenIslemler WHERE OnayID=?", (onay_id,))
+        cursor.execute("SELECT Durum, ZincirID, MevcutAdim FROM OnayBekleyenIslemler WHERE OnayID=?", (onay_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Onay kaydı bulunamadı.")
+        durum, zincir_id, mevcut_adim = row[0], row[1], row[2]
+        if durum != "Bekliyor":
+            raise HTTPException(status_code=400, detail=f"Bu işlem zaten '{durum}' durumunda, tekrar reddedilemez.")
+        gerekli_rol, _ = _onay_adim_bilgisi(cursor, zincir_id, mevcut_adim)
+        if user["rol"] not in ("Yönetici", "Master") and user["rol"] != gerekli_rol:
+            raise HTTPException(status_code=403, detail=f"Bu adımı reddetme yetkiniz yok. Gerekli rol: {gerekli_rol}")
+        cursor.execute("INSERT INTO OnayAdimGecmisi (OnayID, AdimSira, OnaylayanKullanici, Durum) VALUES (?, ?, ?, 'Reddedildi')",
+                       (onay_id, mevcut_adim, user["username"]))
         cursor.execute("""UPDATE OnayBekleyenIslemler SET Durum='Reddedildi', OnaylayanKullanici=?, OnayTarihi=GETDATE()
                            WHERE OnayID=?""", (user["username"], onay_id))
-        log_islem(cursor, f"Onay bekleyen işlem reddedildi: #{onay_id}", user["username"])
+        log_islem(cursor, f"Onay bekleyen işlem reddedildi: #{onay_id} (adım {mevcut_adim})", user["username"])
         conn.commit()
         return {"mesaj": f"İşlem #{onay_id} reddedildi."}
+    finally:
+        conn.close()
+
+class OnayZinciriAdimiEkle(BaseModel):
+    AdimSira: int
+    GerekliRol: str
+
+class OnayZinciriEkleRequest(BaseModel):
+    Ad: str
+    MinTutar: float = Field(ge=0)
+    MaxTutar: Optional[float] = None
+    Adimlar: list[OnayZinciriAdimiEkle]
+
+@app.post("/onay-zinciri-ekle")
+def onay_zinciri_ekle(veri: OnayZinciriEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    if not veri.Adimlar:
+        raise HTTPException(status_code=400, detail="En az bir onay adımı eklemelisiniz.")
+    if veri.MaxTutar is not None and veri.MaxTutar <= veri.MinTutar:
+        raise HTTPException(status_code=400, detail="Üst tutar, alt tutardan büyük olmalıdır.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO OnayZincirleri (Ad, MinTutar, MaxTutar) OUTPUT inserted.ZincirID VALUES (?, ?, ?)",
+                       (veri.Ad, veri.MinTutar, veri.MaxTutar))
+        zincir_id = int(cursor.fetchone()[0])
+        for adim in sorted(veri.Adimlar, key=lambda a: a.AdimSira):
+            cursor.execute("INSERT INTO OnayZinciriAdimlari (ZincirID, AdimSira, GerekliRol) VALUES (?, ?, ?)",
+                           (zincir_id, adim.AdimSira, adim.GerekliRol))
+        log_islem(cursor, f"Yeni onay zinciri tanımlandı: {veri.Ad} ({len(veri.Adimlar)} adım)", user["username"])
+        conn.commit()
+        return {"mesaj": "Onay zinciri oluşturuldu.", "ZincirID": zincir_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/onay-zincirleri")
+def onay_zincirleri_getir(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT ZincirID, Ad, MinTutar, MaxTutar, AktifMi FROM OnayZincirleri ORDER BY MinTutar")
+        zincirler = []
+        for r in cursor.fetchall():
+            zincir_id = r[0]
+            cursor.execute("SELECT AdimSira, GerekliRol FROM OnayZinciriAdimlari WHERE ZincirID=? ORDER BY AdimSira", (zincir_id,))
+            adimlar = [{"AdimSira": a[0], "GerekliRol": a[1]} for a in cursor.fetchall()]
+            zincirler.append({"ZincirID": zincir_id, "Ad": r[1], "MinTutar": float(r[2]), "MaxTutar": float(r[3]) if r[3] is not None else None,
+                               "AktifMi": bool(r[4]), "Adimlar": adimlar})
+        return {"zincirler": zincirler}
+    finally:
+        conn.close()
+
+@app.put("/onay-zinciri-durum/{zincir_id}")
+def onay_zinciri_durum_degistir(zincir_id: int, aktif: bool, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT ZincirID FROM OnayZincirleri WHERE ZincirID=?", (zincir_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Onay zinciri bulunamadı.")
+        cursor.execute("UPDATE OnayZincirleri SET AktifMi=? WHERE ZincirID=?", (1 if aktif else 0, zincir_id))
+        log_islem(cursor, f"Onay zinciri {'aktif' if aktif else 'pasif'} edildi: #{zincir_id}", user["username"])
+        conn.commit()
+        return {"mesaj": f"Zincir #{zincir_id} {'aktif' if aktif else 'pasif'} edildi."}
+    except HTTPException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
