@@ -1397,6 +1397,54 @@ class _MrpSahteCursor:
         return [] if self._son_sonuc is None else [self._son_sonuc]
 
 
+class TestTeslimTarihiYaklasiyorAlarmi:
+    """Siparişte söz verilen teslim tarihi girilmişse (opsiyonel) ve teslimat henüz
+    tamamlanmamışsa, o tarihe az kaldığında/geçtiğinde AlarmGecmisi'ne kritik stok
+    uyarısıyla aynı mekanizmayla (AlarmKurallari/AlarmGecmisi) bir kayıt düşülür."""
+
+    def test_yaklasan_teslim_tarihi_icin_alarm_yazilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(
+            fetchall_sonucu=[(1, "Test Kuralı", "TeslimTarihiYaklasiyor", 3)],
+            fetchone_sonucu=None,
+        )
+        # İlk fetchall() -> aktif kurallar, ikinci fetchall() -> yaklaşan siparişler.
+        cursor.fetchall.side_effect = [
+            [(1, "Test Kuralı", "TeslimTarihiYaklasiyor", 3)],
+            [(42, "Test Ürünü", "2026-09-07", 2)],
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        main.alarm_kurallarini_kontrol_et()
+        insert_cagrilari = [c for c in cursor.execute.call_args_list if "INSERT INTO AlarmGecmisi" in c.args[0]]
+        assert len(insert_cagrilari) == 1
+        assert "Sipariş #42" in insert_cagrilari[0].args[1][2]
+        assert "2 gün kaldı" in insert_cagrilari[0].args[1][2]
+
+    def test_gecmis_teslim_tarihi_icin_gecikme_mesaji_yazilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        cursor.fetchall.side_effect = [
+            [(1, "Test Kuralı", "TeslimTarihiYaklasiyor", 3)],
+            [(42, "Test Ürünü", "2026-09-01", -4)],
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        main.alarm_kurallarini_kontrol_et()
+        insert_cagrilari = [c for c in cursor.execute.call_args_list if "INSERT INTO AlarmGecmisi" in c.args[0]]
+        assert "4 gün gecikti" in insert_cagrilari[0].args[1][2]
+
+    def test_ayni_gun_icinde_tekrar_yazilmaz(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))  # zaten_var_mi -> True
+        cursor.fetchall.side_effect = [
+            [(1, "Test Kuralı", "TeslimTarihiYaklasiyor", 3)],
+            [(42, "Test Ürünü", "2026-09-07", 2)],
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        main.alarm_kurallarini_kontrol_et()
+        insert_cagrilari = [c for c in cursor.execute.call_args_list if "INSERT INTO AlarmGecmisi" in c.args[0]]
+        assert len(insert_cagrilari) == 0
+
+
 class TestButceYonetimi:
     """Bütçe Yönetimi önceden hiç yoktu - Hesap Planı bazlı aylık hedef/gerçekleşen
     karşılaştırma için sıfırdan eklendi. Gerçekleşen, HesapHareketleri'nden hesaplanır;

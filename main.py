@@ -2129,6 +2129,11 @@ def _konsinye_ve_sonraki_ozellik_migrationlari(cursor):
         ('Olağandışı İşlem Uyarısı (Kasa/Stok, 3 kat üstü)', 'AnormalIslem', 3)
     """, "Anomali tespiti alarm kuralı")
     guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT 1 FROM AlarmKurallari WHERE KuralTipi='TeslimTarihiYaklasiyor')
+        INSERT INTO AlarmKurallari (KuralAdi, KuralTipi, Esik) VALUES
+        ('Sipariş Teslim Tarihi Yaklaşıyor (3 gün kala)', 'TeslimTarihiYaklasiyor', 3)
+    """, "Sipariş teslim tarihi alarm kuralı")
+    guvenli_migrasyon(cursor, """
         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='AlarmGecmisi' and xtype='U')
         CREATE TABLE AlarmGecmisi (
             GecmisID INT IDENTITY(1,1) PRIMARY KEY,
@@ -5812,6 +5817,23 @@ def alarm_kurallarini_kontrol_et():
                 """, (gun,))
                 for belge_id, dosya_adi, bitis in cursor.fetchall():
                     mesaj = f"Sözleşme/belge süresi doluyor: {dosya_adi} (Bitiş: {bitis})"
+                    if not zaten_var_mi(kural_id, mesaj):
+                        cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+
+            elif kural_tipi == "TeslimTarihiYaklasiyor":
+                gun = int(esik) if esik else 3
+                cursor.execute("""
+                    SELECT SiparisID, StokAdi, SozVerilenTeslimTarihi, DATEDIFF(day, GETDATE(), SozVerilenTeslimTarihi)
+                    FROM Siparisler
+                    WHERE SozVerilenTeslimTarihi IS NOT NULL AND GercekTeslimTarihi IS NULL
+                      AND Durum NOT IN ('Tamamlandı', 'İptal')
+                      AND DATEDIFF(day, GETDATE(), SozVerilenTeslimTarihi) <= ?
+                """, (gun,))
+                for siparis_id, stok_adi, teslim_tarihi, kalan_gun in cursor.fetchall():
+                    if kalan_gun < 0:
+                        mesaj = f"Teslim tarihi geçti: Sipariş #{siparis_id} ({stok_adi}) - {abs(kalan_gun)} gün gecikti (Söz verilen: {str(teslim_tarihi)[:10]})"
+                    else:
+                        mesaj = f"Teslim tarihi yaklaşıyor: Sipariş #{siparis_id} ({stok_adi}) - {kalan_gun} gün kaldı (Söz verilen: {str(teslim_tarihi)[:10]})"
                     if not zaten_var_mi(kural_id, mesaj):
                         cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
 

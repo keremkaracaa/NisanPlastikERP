@@ -2054,7 +2054,8 @@ class MainApp(ctk.CTkToplevel):
         ekle_satiri.pack(fill="x", padx=10, pady=(0, 5))
         self.al_kural_adi = ctk.CTkEntry(ekle_satiri, placeholder_text="Kural Adı", width=220)
         self.al_kural_adi.pack(side="left", padx=(0, 8))
-        self.al_kural_tipi = ctk.CTkOptionMenu(ekle_satiri, values=["KritikStok", "RiskLimitiAsimi", "VadeYaklasan"], width=160)
+        self.al_kural_tipi = ctk.CTkOptionMenu(ekle_satiri, values=["KritikStok", "RiskLimitiAsimi", "VadeYaklasan",
+                                                                     "SozlesmeSuresiDoluyor", "AnormalIslem", "TeslimTarihiYaklasiyor"], width=160)
         self.al_kural_tipi.pack(side="left", padx=(0, 8))
         self.al_esik = ctk.CTkEntry(ekle_satiri, placeholder_text="Eşik (VadeYaklasan için gün sayısı)", width=200)
         self.al_esik.pack(side="left", padx=(0, 8))
