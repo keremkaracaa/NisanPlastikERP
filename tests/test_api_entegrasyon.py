@@ -50,9 +50,9 @@ def sahte_cursor_olustur(fetchall_sonucu=None, fetchone_sonucu=None):
 class TestStokListesiEndpoint:
     def test_stok_listesi_kar_marjini_dogru_hesaplayarak_doner(self, client, monkeypatch):
         """DB'den gelen ham satırların (StokKod, StokAdi, Birim, Miktar, Fiyat,
-        MinSeviye, OrtMaliyet, Barkod) API üzerinden doğru JSON alanlarına ve
-        doğru KarMarji hesabına dönüştüğünü doğrular."""
-        sahte_satirlar = [("PP-001", "Test Ürünü", "KG", 100.0, 50.0, 10.0, 30.0, "1234567890")]
+        MinSeviye, OrtMaliyet, Barkod, RezerveMiktar) API üzerinden doğru JSON
+        alanlarına ve doğru KarMarji hesabına dönüştüğünü doğrular."""
+        sahte_satirlar = [("PP-001", "Test Ürünü", "KG", 100.0, 50.0, 10.0, 30.0, "1234567890", 20.0)]
         conn, cursor = sahte_cursor_olustur(fetchall_sonucu=sahte_satirlar, fetchone_sonucu=(1,))
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
@@ -62,6 +62,8 @@ class TestStokListesiEndpoint:
         veri = yanit.json()["stoklar"][0]
         assert veri["StokKod"] == "PP-001"
         assert veri["KarMarji"] == 40.0  # (50-30)/50*100
+        assert veri["RezerveMiktar"] == 20.0
+        assert veri["KullanilabilirMiktar"] == 80.0  # 100 - 20
 
     def test_stok_listesi_yetkisiz_istekte_401_doner(self):
         """dependency_override YAPILMADAN çağrılan bir client, gerçek JWT

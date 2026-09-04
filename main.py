@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, File, UploadFile, Form, Request
+from fastapi.responses import Response
 from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -21,6 +23,7 @@ from jose import JWTError, jwt
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -152,12 +155,73 @@ def eposta_gonder(kime: str, konu: str, icerik: str):
     except Exception as e:
         print(f"E-posta gönderim hatası: {e}")
 
+def eposta_gonder_pdf_ekli(kime: str, konu: str, icerik: str, pdf_yolu: str, pdf_dosya_adi: str):
+    """eposta_gonder ile aynı SMTP ayarlarını kullanır ama ayrıca bir PDF dosyasını
+    ek olarak iliştirir - fatura/teklif otomatik e-posta gönderimi için kullanılır.
+    Müşterinin e-postası yoksa ya da SMTP ayarlanmamışsa SESSİZCE atlanır - bu, ana
+    fatura/teklif kesme işlemini ASLA bloke etmemeli (o yüzden BackgroundTasks
+    üzerinden çağrılır, çağıran işlemin başarısını etkilemez)."""
+    if not kime:
+        return
+    ayar = eposta_ayarlarini_getir()
+    if not ayar:
+        print(f">>> PDF e-postası gönderilemedi (SMTP ayarı yok): {konu}")
+        return
+    if not os.path.exists(pdf_yolu):
+        print(f">>> PDF e-postası gönderilemedi (dosya bulunamadı): {pdf_yolu}")
+        return
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = ayar["gonderen"]
+        msg['To'] = kime
+        msg['Subject'] = konu
+        msg.attach(MIMEText(icerik, 'plain', 'utf-8'))
+
+        with open(pdf_yolu, "rb") as f:
+            ek = MIMEApplication(f.read(), _subtype="pdf")
+            ek.add_header("Content-Disposition", "attachment", filename=pdf_dosya_adi)
+            msg.attach(ek)
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(ayar["gonderen"], ayar["sifre"])
+        server.send_message(msg)
+        server.quit()
+        print(f"PDF ekli e-posta gönderildi: {konu} -> {kime}")
+    except Exception as e:
+        print(f"PDF ekli e-posta gönderim hatası: {e}")
+
 # ... (Buradan itibaren def kaynak_yolu(goreli_yol): şeklinde orijinal kodların devam etmeli) ...
 
 def kaynak_yolu(goreli_yol):
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, goreli_yol)
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), goreli_yol)
+
+def pdf_unicode_font_yukle(pdf) -> str:
+    """PDF'lerde Türkçe karakterlerin (ı, ş, ğ, İ, Ş, Ğ) DÜZGÜN çalışması için gerçek bir
+    TrueType font yükler. ÖNEMLİ: fpdf2'nin yerleşik 'Arial' fontu aslında dahili
+    Helvetica'ya denk düşer ve sadece Latin-1 (ı/ş/ğ/İ/Ş/Ğ HARİÇ) karakterleri destekler -
+    bu yüzden 'Yıldız Plastik' veya 'Şeffaf Poşet' gibi gerçek Türkçe isimler PDF'i
+    ÇÖKERTİYORDU. Bu fonksiyon Windows'ta her zaman bulunan gerçek Arial.ttf dosyasını
+    Unicode destekli olarak yükler; bulunamazsa (Windows dışı bir ortamda test ediliyorsa)
+    sistemdeki DejaVu Sans'a, o da yoksa son çare olarak dahili Arial'e düşer (bu durumda
+    Türkçe karakterler yine risk taşır).
+    Dönen değer: pdf.set_font() içinde kullanılacak font ailesi adı."""
+    aday_yollar = [
+        (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\ariali.ttf"),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf"),
+    ]
+    for normal, kalin, italik in aday_yollar:
+        try:
+            if os.path.exists(normal):
+                pdf.add_font("ERPFont", "", normal)
+                pdf.add_font("ERPFont", "B", kalin if os.path.exists(kalin) else normal)
+                pdf.add_font("ERPFont", "I", italik if os.path.exists(italik) else normal)
+                return "ERPFont"
+        except Exception:
+            continue
+    return "Arial"  # son çare - Türkçe ı/ş/ğ/İ/Ş/Ğ karakterlerinde risklidir
 
 def pdf_filigran_ekle(pdf):
     try:
@@ -170,6 +234,74 @@ def pdf_filigran_ekle(pdf):
     except Exception:
         pass
 
+# --- Profesyonel PDF Şablon Yardımcıları (Teklif + Fatura ortak kullanır) ---
+PDF_MARKA_RENGI = (249, 115, 22)   # Nisan Plastik turuncusu (#f97316)
+PDF_KOYU_GRI = (55, 65, 81)
+PDF_ACIK_GRI = (243, 244, 246)
+
+def pdf_profesyonel_baslik(pdf, belge_turu: str, belge_no: str, tarih: str, cari_bilgi_satirlari: list, font_ailesi: str = "Arial"):
+    """Üstte renkli bir başlık şeridi + şirket adı + belge türü/no/tarih + cari bilgi
+    kutusu çizer. Önceki sade metin başlığı yerine gerçek bir kurumsal doküman görünümü verir."""
+    pdf.set_fill_color(*PDF_MARKA_RENGI)
+    pdf.rect(0, 0, 210, 28, style="F")
+    pdf.set_xy(10, 8)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font(font_ailesi, "B", 18)
+    pdf.cell(120, 8, txt="NISAN PLASTIK A.S.", ln=0)
+    pdf.set_font(font_ailesi, "", 9)
+    pdf.set_xy(10, 17)
+    pdf.cell(120, 6, txt="Kurumsal Kaynak Planlama Sistemi", ln=0)
+
+    pdf.set_xy(130, 8)
+    pdf.set_font(font_ailesi, "B", 13)
+    pdf.cell(70, 8, txt=belge_turu, ln=0, align="R")
+    pdf.set_xy(130, 17)
+    pdf.set_font(font_ailesi, "", 9)
+    pdf.cell(70, 6, txt=f"No: {belge_no}   Tarih: {tarih}", ln=0, align="R")
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_xy(10, 34)
+    pdf.set_fill_color(*PDF_ACIK_GRI)
+    pdf.set_font(font_ailesi, "B", 10)
+    pdf.cell(190, 7, txt="  MUSTERI BILGILERI", ln=True, fill=True)
+    pdf.set_font(font_ailesi, "", 10)
+    for satir in cari_bilgi_satirlari:
+        pdf.cell(190, 6, txt=f"  {satir}", ln=True)
+    pdf.ln(4)
+
+def pdf_tablo_basligi(pdf, basliklar_ve_genislikler: list, font_ailesi: str = "Arial"):
+    """basliklar_ve_genislikler: [(baslik, genislik, hizalama), ...]"""
+    pdf.set_fill_color(*PDF_KOYU_GRI)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font(font_ailesi, "B", 10)
+    for i, (baslik, genislik, hiza) in enumerate(basliklar_ve_genislikler):
+        pdf.cell(genislik, 8, baslik, 1, 0 if i < len(basliklar_ve_genislikler) - 1 else 1, hiza, fill=True)
+    pdf.set_text_color(0, 0, 0)
+
+def pdf_tablo_satiri(pdf, degerler_ve_genislikler: list, satir_no: int, font_ailesi: str = "Arial"):
+    """Çift/tek satırlarda hafif gri/beyaz alternatif renk (zebra) uygular - okunurluğu artırır."""
+    if satir_no % 2 == 0:
+        pdf.set_fill_color(*PDF_ACIK_GRI)
+        doldur = True
+    else:
+        doldur = False
+    pdf.set_font(font_ailesi, "", 10)
+    for i, (deger, genislik, hiza) in enumerate(degerler_ve_genislikler):
+        pdf.cell(genislik, 7, str(deger), 1, 0 if i < len(degerler_ve_genislikler) - 1 else 1, hiza, fill=doldur)
+
+def pdf_footer_ekle(pdf, ek_not: str = "", font_ailesi: str = "Arial"):
+    pdf.set_y(-22)
+    pdf.set_draw_color(*PDF_MARKA_RENGI)
+    pdf.set_line_width(0.5)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(2)
+    pdf.set_font(font_ailesi, "I", 8)
+    pdf.set_text_color(120, 120, 120)
+    if ek_not:
+        pdf.cell(190, 5, txt=ek_not, ln=True, align="C")
+    pdf.cell(190, 5, txt="Nisan Plastik A.S. - Bu belge Nisan Plastik ERP sistemi tarafindan otomatik olusturulmustur.", ln=True, align="C")
+    pdf.set_text_color(0, 0, 0)
+
 app = FastAPI(title="Nisan Plastik ERP - Ultimate Enterprise Sürüm")
 
 app.add_middleware(
@@ -180,11 +312,180 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- MASTER ROLÜ İÇİN FİYAT YÖNETİMİ KISITLAMASI ---
+# Master rolü uygulamadaki HER ŞEYİ görüntüleyebilir VE her şeye işlem yapabilir
+# (Yönetici gibi) - TEK istisna: aşağıdaki "fiyat yönetimi" ekranlarında (Fiyatlandırma,
+# Fiyat Listeleri) ekleme/güncelleme yapamaz, sadece görüntüler. Bu kontrol
+# get_current_user() içinde (aşağıda) uygulanıyor.
+_FIYAT_YONETIM_YOLLARI = (
+    "/fiyat-listesi-ekle", "/fiyat-listesi-kalem-ekle", "/musteri-fiyat-listesi-ata",
+    "/iskonto-kademe-ekle", "/fiyat-onerisi-hesapla", "/urun-maliyeti-kaydet",
+)
+
 security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 SECRET_KEY = "3d739dffb43c3da76dc5b0598ee571fc5a2e034154c5f21883a40f5d14d62f13"
 ALGORITHM = "HS256"
+
+@app.get("/mobil", response_class=HTMLResponse)
+def mobil_dashboard():
+    """Telefon/tablet tarayıcısından (ya da evden bir bilgisayardan) erişilebilen,
+    salt-okunur bir özet panel. Aynı backend'i kullanır, ayrı bir sunucu/kurulum
+    gerektirmez - sadece bu bilgisayarın IP adresine ağ üzerinden ulaşılabilmesi
+    yeterlidir (örn. http://192.168.1.X:8000/mobil). İnternetten (ofis dışından)
+    erişim için ayrıca port yönlendirme/VPN gibi bir ağ ayarı gerekir - bu, ERP
+    kodunun değil, ağ/router yapılandırmasının işidir."""
+    return """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nisan Plastik ERP - Mobil Özet</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#0f0f10; color:#e5e5e5; font-family: -apple-system, Segoe UI, Arial, sans-serif; padding-bottom: 40px; }
+  header { background:#18181a; padding:16px; text-align:center; border-bottom:2px solid #f97316; position:sticky; top:0; z-index:10; }
+  header h1 { margin:0; font-size:18px; color:#f97316; }
+  #girisEkrani { max-width:340px; margin:60px auto; padding:20px; }
+  #girisEkrani input { width:100%; padding:12px; margin-bottom:10px; border-radius:8px; border:1px solid #333; background:#1c1c1e; color:#fff; font-size:15px; }
+  #girisEkrani button, .yenile-btn { width:100%; padding:13px; border-radius:8px; border:none; background:#16a34a; color:#fff; font-weight:bold; font-size:15px; }
+  #hataMsg { color:#ef4444; text-align:center; margin-top:8px; font-size:13px; }
+  #panel { display:none; padding:14px; max-width:600px; margin:0 auto; }
+  .kart { background:#1c1c1e; border-radius:10px; padding:14px; margin-bottom:12px; border-left:4px solid #f97316; }
+  .kart h3 { margin:0 0 10px 0; font-size:14px; color:#f97316; }
+  .kpi-grid { display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:12px; }
+  .kpi { background:#1c1c1e; border-radius:10px; padding:14px; text-align:center; }
+  .kpi .deger { font-size:20px; font-weight:bold; color:#10b981; }
+  .kpi .etiket { font-size:11px; color:#999; margin-top:4px; }
+  .satir { padding:8px 0; border-bottom:1px solid #2a2a2c; font-size:13px; }
+  .satir:last-child { border-bottom:none; }
+  .satir .ad { font-weight:bold; }
+  .satir .detay { color:#999; font-size:12px; }
+  .bos { color:#666; font-size:13px; text-align:center; padding:10px; }
+  .rozet-kirmizi { color:#ef4444; }
+  .rozet-turuncu { color:#f59e0b; }
+</style>
+</head>
+<body>
+<header><h1>📦 Nisan Plastik ERP — Mobil Özet</h1></header>
+
+<div id="girisEkrani">
+  <input id="kadi" placeholder="Kullanıcı Adı" autocomplete="username">
+  <input id="sifre" type="password" placeholder="Şifre" autocomplete="current-password">
+  <button onclick="girisYap()">Giriş Yap</button>
+  <div id="hataMsg"></div>
+</div>
+
+<div id="panel">
+  <div class="kpi-grid" id="kpiAlani"></div>
+  <div class="kart"><h3>🛒 Aktif Siparişler</h3><div id="siparisAlani"></div></div>
+  <div class="kart"><h3>⚠️ Kritik Stok</h3><div id="kritikStokAlani"></div></div>
+  <div class="kart"><h3>🔔 Okunmamış Alarmlar</h3><div id="alarmAlani"></div></div>
+  <div class="kart"><h3>✅ Onay Bekleyen İşlemler</h3><div id="onayAlani"></div></div>
+  <button class="yenile-btn" onclick="verileriYukle()">🔄 Yenile</button>
+</div>
+
+<script>
+let TOKEN = null;
+
+async function girisYap() {
+  const kadi = document.getElementById('kadi').value.trim();
+  const sifre = document.getElementById('sifre').value.trim();
+  document.getElementById('hataMsg').innerText = '';
+  try {
+    const res = await fetch('/giris', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({KullaniciAdi: kadi, Sifre: sifre})
+    });
+    if (!res.ok) { document.getElementById('hataMsg').innerText = 'Hatalı kullanıcı adı veya şifre.'; return; }
+    const data = await res.json();
+    TOKEN = data.access_token;
+    document.getElementById('girisEkrani').style.display = 'none';
+    document.getElementById('panel').style.display = 'block';
+    verileriYukle();
+  } catch (e) {
+    document.getElementById('hataMsg').innerText = 'Sunucuya ulaşılamadı.';
+  }
+}
+
+async function apiGet(yol) {
+  try {
+    const res = await fetch(yol, { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) { return null; }
+}
+
+async function verileriYukle() {
+  const ozet = await apiGet('/dashboard-ozet');
+  const kpiAlani = document.getElementById('kpiAlani');
+  if (ozet) {
+    kpiAlani.innerHTML = `
+      <div class="kpi"><div class="deger">${(ozet.ToplamCiro||0).toLocaleString('tr-TR',{maximumFractionDigits:0})} TL</div><div class="etiket">Toplam Ciro</div></div>
+      <div class="kpi"><div class="deger">${ozet.BekleyenSiparis||0}</div><div class="etiket">Bekleyen Sipariş</div></div>
+    `;
+  } else {
+    kpiAlani.innerHTML = '<div class="bos">Bu kullanıcı rolü genel özet verisini görüntüleyemiyor.</div>';
+  }
+
+  const siparisler = await apiGet('/siparis-listesi');
+  const siparisAlani = document.getElementById('siparisAlani');
+  if (siparisler && siparisler.siparisler) {
+    const AKTIF_DURUMLAR = ['Bekliyor', 'Onaylandı', 'Kargoda', 'Kısmi Teslim'];
+    const aktifler = siparisler.siparisler.filter(s => AKTIF_DURUMLAR.includes(s.Durum));
+    siparisAlani.innerHTML = aktifler.length ? aktifler.slice(0, 20).map(s =>
+      `<div class="satir"><span class="ad">#${s.SiparisID} — ${s.FirmaAdi}</span><br>
+       <span class="detay">${s.StokAdi} (${s.Miktar}) — ${(s.ToplamTutar||0).toLocaleString('tr-TR')} ${s.ParaBirimi||'TL'} — <b>${s.Durum}</b></span></div>`
+    ).join('') : '<div class="bos">Aktif sipariş yok.</div>';
+    if (aktifler.length > 20) {
+      siparisAlani.innerHTML += `<div class="detay" style="text-align:center;padding-top:6px;">+ ${aktifler.length - 20} sipariş daha (tamamı için masaüstü uygulamayı kullanın)</div>`;
+    }
+  } else {
+    siparisAlani.innerHTML = '<div class="bos">Sipariş verisi görüntülenemiyor.</div>';
+  }
+
+  const kritik = await apiGet('/stok-kritik');
+  const kritikAlani = document.getElementById('kritikStokAlani');
+  if (kritik && kritik.kritik && kritik.kritik.length) {
+    kritikAlani.innerHTML = kritik.kritik.map(k =>
+      `<div class="satir"><span class="ad rozet-kirmizi">${k.StokAdi}</span><br>
+       <span class="detay">Mevcut: ${k.MevcutMiktar} ${k.Birim||''} — Min: ${k.MinStokSeviyesi}</span></div>`
+    ).join('');
+  } else {
+    kritikAlani.innerHTML = '<div class="bos">Kritik stok yok.</div>';
+  }
+
+  const alarm = await apiGet('/alarm-gecmisi?sadece_okunmamis=true');
+  const alarmAlani = document.getElementById('alarmAlani');
+  if (alarm && alarm.gecmis && alarm.gecmis.length) {
+    alarmAlani.innerHTML = alarm.gecmis.map(a =>
+      `<div class="satir"><span class="ad rozet-turuncu">${a.KuralAdi}</span><br>
+       <span class="detay">${a.Mesaj} — ${a.Tarih}</span></div>`
+    ).join('');
+  } else {
+    alarmAlani.innerHTML = '<div class="bos">Okunmamış alarm yok.</div>';
+  }
+
+  const onay = await apiGet('/onay-bekleyenler');
+  const onayAlani = document.getElementById('onayAlani');
+  if (onay && onay.onaylar) {
+    const bekleyenler = onay.onaylar.filter(o => o.Durum === 'Bekliyor');
+    onayAlani.innerHTML = bekleyenler.length ? bekleyenler.map(o =>
+      `<div class="satir"><span class="ad">${o.IslemTipi} — ${(o.Tutar||0).toLocaleString('tr-TR')} TL</span><br>
+       <span class="detay">${o.Ozet} — Talep eden: ${o.TalepEden}</span></div>`
+    ).join('') : '<div class="bos">Onay bekleyen işlem yok.</div>';
+  } else {
+    onayAlani.innerHTML = '<div class="bos">Bu kullanıcı rolü onay listesini görüntüleyemiyor.</div>';
+  }
+}
+
+document.getElementById('sifre').addEventListener('keydown', e => { if (e.key === 'Enter') girisYap(); });
+</script>
+</body>
+</html>
+"""
 
 import os
 
@@ -201,24 +502,35 @@ if os.path.exists("ayarlar.txt"):
 # 3. Dinamik adresimizle DB_CONFIG'i oluşturuyoruz
 DB_CONFIG = f"Driver={{ODBC Driver 17 for SQL Server}};Server={SQL_SERVER_ADRESI};Database=NisanPlastikERP;Trusted_Connection=yes;"
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise HTTPException(status_code=401, detail="Yetkisiz erişim. Token geçersiz.")
+        rol = payload.get("rol", "Yönetici")
+        # MASTER ROLÜ: Uygulamadaki HER ŞEYİ görüntüleyebilir VE her şeye işlem yapabilir
+        # (Yönetici gibi) - TEK istisna: Fiyatlandırma/Fiyat Listeleri gibi FİYAT YÖNETİMİ
+        # ekranlarında işlem (ekleme/güncelleme) yapamaz, sadece görüntüler. Bu kontrolü
+        # burada (get_current_user'ın kendisinde) yapmak, yetki_kontrol() ile SARILMAMIŞ
+        # (bare Depends(get_current_user)) endpoint'leri de otomatik korur.
+        if rol == "Master" and request.method not in ("GET", "HEAD", "OPTIONS"):
+            if any(request.url.path.startswith(yol) for yol in _FIYAT_YONETIM_YOLLARI):
+                raise HTTPException(status_code=403, detail="Master rolü fiyat yönetimi işlemlerini yapamaz - sadece görüntüleyebilir.")
         # Token decode edilince sözlük döndürüyoruz ki endpointlerde role de erişebilelim
-        return {"username": username, "rol": payload.get("rol", "Yönetici")}
+        return {"username": username, "rol": rol}
     except JWTError:
         raise HTTPException(status_code=401, detail="Geçersiz veya süresi dolmuş token. Tekrar giriş yapın.")
 
 def yetki_kontrol(izin_verilen_roller: list):
     """Dependency olarak kullanıp endpoint seviyesinde yetki kontrolü yapar"""
     def yetki_kalkani(user: dict = Depends(get_current_user)):
-        if "Yönetici" in izin_verilen_roller: # Yönetici her şeye erişebilir
-            pass
-        if user["rol"] not in izin_verilen_roller and user["rol"] != "Yönetici":
+        if user["rol"] in ("Yönetici", "Master"):
+            # Yönetici ve Master her role-kısıtlı endpoint'e erişebilir - fiyat yönetimi
+            # kısıtlaması zaten get_current_user seviyesinde (yukarıda) uygulanıyor.
+            return user
+        if user["rol"] not in izin_verilen_roller:
             raise HTTPException(status_code=403, detail=f"Bu işlemi yapmaya yetkiniz yok. Gerekli rol: {izin_verilen_roller}")
         return user
     return yetki_kalkani
@@ -327,6 +639,62 @@ def depo_stok_guncelle(cursor, stok_kod: str, depo_id, miktar_degisim: float):
         else:
             cursor.execute("INSERT INTO StokDepoMiktarlari (StokKod, DepoID, Miktar) VALUES (?, ?, ?)",
                            (stok_kod, depo_id, max(miktar_degisim, 0)))
+    except Exception:
+        pass
+
+def stok_rezerve_et(cursor, stok_kod: str, miktar: float):
+    """Bir sipariş verildiğinde o miktarı stoktan FİZİKSEL OLARAK düşmeden 'rezerve
+    edilmiş' olarak işaretler - böylece başka bir sipariş bu miktarı bir kez daha
+    satamaz (çift satış riski). Kullanılabilir Miktar = MevcutMiktar - RezerveMiktar."""
+    if not stok_kod or miktar <= 0:
+        return
+    try:
+        cursor.execute("UPDATE StokKartlari SET RezerveMiktar = RezerveMiktar + ? WHERE StokKod=?", (miktar, stok_kod))
+    except Exception:
+        pass
+
+def stok_rezerve_coz(cursor, stok_kod: str, miktar: float):
+    """Bir sipariş iptal edildiğinde, silindiğinde ya da faturaya/teslim edildiğinde
+    (fiziksel stok zaten normal yoldan düştüğü için) rezervasyonu geri serbest bırakır.
+    Negatife düşmesin diye 0'da sınırlanır (örn. iki kez çözme denemesi olursa)."""
+    if not stok_kod or miktar <= 0:
+        return
+    try:
+        cursor.execute("UPDATE StokKartlari SET RezerveMiktar = CASE WHEN RezerveMiktar - ? < 0 THEN 0 ELSE RezerveMiktar - ? END WHERE StokKod=?",
+                       (miktar, miktar, stok_kod))
+    except Exception:
+        pass
+
+def stok_kullanilabilir_miktar(cursor, stok_kod: str) -> float:
+    """MevcutMiktar - RezerveMiktar = şu an gerçekten satılabilecek (başka bir siparişe
+    henüz bağlanmamış) miktar."""
+    cursor.execute("SELECT MevcutMiktar, ISNULL(RezerveMiktar, 0) FROM StokKartlari WHERE StokKod=?", (stok_kod,))
+    row = cursor.fetchone()
+    if not row:
+        return 0.0
+    return float(row[0]) - float(row[1])
+
+def siparis_fatura_tutarlilik_kontrol_et(cursor, siparis_id: int, fatura_id: int, stok_kod: str, stok_adi: str,
+                                          fatura_fiyati: float, tolerans_yuzde: float = 1.0):
+    """Bir sipariş faturaya/irsaliyeye dönüştüğünde, faturadaki birim fiyatın sipariş
+    anında anlaşılan fiyattan (%1'den fazla) FARKLI olup olmadığını kontrol eder.
+    Fark varsa kaydeder - bu genelde ya meşru bir sebepten (son dakika iskontosu,
+    kur güncellemesi) ya da GERÇEK bir hatadan (yanlış fiyat girişi) kaynaklanır;
+    ayrım yapmaz, sadece görünür kılar. Ana fatura/sipariş işlemini ASLA bloke etmez
+    (try/except ile sarılı, sessizce başarısız olabilir)."""
+    try:
+        cursor.execute("SELECT BirimFiyat FROM Siparisler WHERE SiparisID=?", (siparis_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+        siparis_fiyati = float(row[0])
+        if siparis_fiyati <= 0:
+            return
+        fark_yuzde = abs(fatura_fiyati - siparis_fiyati) / siparis_fiyati * 100
+        if fark_yuzde > tolerans_yuzde:
+            cursor.execute("""INSERT INTO SiparisFaturaTutarsizliklari (SiparisID, FaturaID, StokKod, StokAdi, SiparisFiyati, FaturaFiyati, FarkYuzdesi)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                           (siparis_id, fatura_id, stok_kod, stok_adi, siparis_fiyati, fatura_fiyati, round(fark_yuzde, 1)))
     except Exception:
         pass
 
@@ -502,7 +870,7 @@ def onaya_gonder(cursor, islem_tipi: str, islem_verisi: dict, tutar: float, ozet
     return onay_id
 
 @app.post("/evrak-isleme")
-def evrak_isleme(data: EvrakPayload, user: dict = Depends(get_current_user)):
+def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -609,6 +977,72 @@ def evrak_isleme(data: EvrakPayload, user: dict = Depends(get_current_user)):
                     yeni_durum = "Tamamlandı" if yeni_teslim >= sip_miktar - 0.0001 else "Kısmi Teslim"
                     cursor.execute("UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=? WHERE SiparisID=?",
                                    (yeni_teslim, yeni_durum, data.siparis_id))
+                    # Fatura kesilince mal fiziksel olarak gerçekten çıktığı için, bu
+                    # kadarlık miktarın rezervasyonu da serbest bırakılır (artık "rezerve
+                    # bekleyen" değil, "satılmış" durumda).
+                    if sip_stok_kod and teslim_bu_faturada > 0:
+                        stok_rezerve_coz(cursor, sip_stok_kod, teslim_bu_faturada)
+
+                    # Sipariş-Fatura Tutarlılık Kontrolü: bu kalemin fatura fiyatı,
+                    # sipariş anında anlaşılan fiyattan belirgin şekilde farklıysa kaydedilir.
+                    ilgili_kalem = next((k for k in data.kalemler
+                                          if (k.stok_kod and k.stok_kod == sip_stok_kod) or (not k.stok_kod and k.urun_ad == sip_urun_adi)), None)
+                    if ilgili_kalem:
+                        siparis_fatura_tutarlilik_kontrol_et(cursor, data.siparis_id, fatura_id, sip_stok_kod, sip_urun_adi, ilgili_kalem.fiyat)
+
+            # --- PDF ÜRETİMİ ---
+            # NOT: Bu evrak_isleme fonksiyonu (asıl "Fatura Kes" ekranının kullandığı akış)
+            # önceden hiç PDF üretmiyordu - sadece veritabanı kaydı oluşturuyordu. Bu yüzden
+            # kesilen faturanın "PDF Aç" butonu 'dosya yolu bulunamadı' hatası veriyordu.
+            firma_adi_pdf = data.cari_ad
+            if musteri_id:
+                cursor.execute("SELECT FirmaAdi FROM Musteriler WHERE MusteriID=?", (musteri_id,))
+                fr = cursor.fetchone()
+                if fr:
+                    firma_adi_pdf = fr[0]
+
+            pdf = FPDF()
+            pdf.add_page()
+            font = pdf_unicode_font_yukle(pdf)
+            pdf_filigran_ekle(pdf)
+            pdf_profesyonel_baslik(pdf, "SATIS FATURASI", f"FT-{fatura_id}", datetime.datetime.now().strftime("%d.%m.%Y"),
+                                   [f"Firma: {firma_adi_pdf}"], font)
+
+            pdf_tablo_basligi(pdf, [("Stok Adi", 60, "L"), ("Miktar", 25, "C"), ("Birim Fiyat", 35, "R"), ("KDV%", 20, "C"), ("Satir Toplam", 50, "R")], font)
+            for idx, k in enumerate(data.kalemler):
+                pdf_tablo_satiri(pdf, [(k.urun_ad, 60, "L"), (f"{k.miktar}", 25, "C"),
+                                        (f"{k.fiyat:.2f} TL", 35, "R"), (f"%{k.kdv_orani:g}", 20, "C"),
+                                        (f"{k.miktar * k.fiyat:.2f} TL", 50, "R")], idx, font)
+            pdf.ln(2)
+            pdf.set_font(font, "B", 11)
+            pdf.cell(140, 8, "ARA TOPLAM:", 1, 0, "R")
+            pdf.cell(50, 8, f"{ara_toplam:.2f} TL", 1, 1, "R")
+            pdf.cell(140, 8, "KDV TOPLAMI:", 1, 0, "R")
+            pdf.cell(50, 8, f"{kdv_toplam:.2f} TL", 1, 1, "R")
+            pdf.set_fill_color(*PDF_MARKA_RENGI)
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font(font, "B", 12)
+            pdf.cell(140, 10, "GENEL TOPLAM:", 1, 0, "R", fill=True)
+            pdf.cell(50, 10, f"{genel_toplam:.2f} TL", 1, 1, "R", fill=True)
+            pdf.set_text_color(0, 0, 0)
+            pdf_footer_ekle(pdf, font_ailesi=font)
+
+            os.makedirs("Faturalar", exist_ok=True)
+            pdf_yolu = os.path.join("Faturalar", f"Fatura_{fatura_id}.pdf")
+            pdf.output(pdf_yolu)
+            cursor.execute("UPDATE Faturalar SET PdfYolu = ? WHERE FaturaID = ?", (pdf_yolu, fatura_id))
+
+            # Müşterinin kayıtlı bir e-postası varsa, fatura PDF'i otomatik olarak
+            # arka planda (ana işlemi YAVAŞLATMADAN/BLOKE ETMEDEN) gönderilir.
+            if musteri_id:
+                cursor.execute("SELECT EPosta FROM Musteriler WHERE MusteriID=?", (musteri_id,))
+                mus_eposta_row = cursor.fetchone()
+                if mus_eposta_row and mus_eposta_row[0]:
+                    background_tasks.add_task(
+                        eposta_gonder_pdf_ekli, mus_eposta_row[0], f"Faturanız #{fatura_id} - {firma_adi_pdf}",
+                        f"Sayın {firma_adi_pdf},\n\n{genel_toplam:,.2f} TL tutarındaki faturanız ektedir.\n\nİyi çalışmalar dileriz.",
+                        pdf_yolu, f"Fatura_{fatura_id}.pdf"
+                    )
 
         elif data.evrak_tipi == "Alım Faturası":
             cursor.execute("""
@@ -708,6 +1142,8 @@ def evrak_isleme(data: EvrakPayload, user: dict = Depends(get_current_user)):
                         yeni_durum = sip_durum
                     cursor.execute("UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=? WHERE SiparisID=?",
                                    (yeni_teslim, yeni_durum, data.siparis_id))
+                    if sip_stok_kod and teslim_bu_irsaliyede > 0:
+                        stok_rezerve_coz(cursor, sip_stok_kod, teslim_bu_irsaliyede)
             
             for k in data.kalemler:
                 if k.stok_kod:
@@ -793,6 +1229,7 @@ class MusteriEkle(BaseModel):
     VergiNo: str
     Adres: str
     RiskLimiti: float = 0  # 0 = limitsiz (kontrol uygulanmaz)
+    EPosta: Optional[str] = None  # Fatura/Teklif otomatik e-posta gönderimi için
 
 class MusteriGuncelle(MusteriEkle):
     MusteriID: int
@@ -826,6 +1263,7 @@ class TahsilatEkle(BaseModel):
     OdemeTuru: str
     Aciklama: str
     ParaBirimi: str = "TL"
+    SiparisID: Optional[int] = None  # Opsiyonel: bu tahsilat belirli bir siparişe karşılıksa
 
 class KasaHareketEkle(BaseModel):
     KasaID: int
@@ -868,10 +1306,10 @@ class SiparisGrupKalem(BaseModel):
     StokAdi: str
     Miktar: float = Field(gt=0)
     BirimFiyat: float = Field(ge=0)
+    ParaBirimi: str = "TL"  # Aynı sipariş içinde kalemler farklı para biriminde olabilir (TL/USD/EUR)
 
 class SiparisGrupEkleRequest(BaseModel):
     MusteriID: int
-    ParaBirimi: str = "TL"
     Aciklama: Optional[str] = None
     Kalemler: list[SiparisGrupKalem]
 
@@ -960,6 +1398,7 @@ class TeklifKalem(BaseModel):
     StokAdi: str
     Miktar: float = Field(gt=0)
     BirimFiyat: float = Field(ge=0)
+    ParaBirimi: str = "TL"  # Aynı teklif içinde kalemler farklı para biriminde olabilir (TL/USD/EUR)
 
 class TeklifOlusturRequest(BaseModel):
     MusteriID: int
@@ -1366,6 +1805,18 @@ def _eski_migrationlar_calistir(cursor):
         )
     """, "MakineBakimlari tablosu")
 
+def _konsinye_ve_sonraki_ozellik_migrationlari(cursor):
+    """Konsinye Stok'tan itibaren eklenen TÜM daha yeni özelliklerin (Belgeler, Alarm
+    Yönetimi, Fiyat Listeleri, Satış Fırsatları, Lot Takibi, vb.) migration'ları.
+    Bu ayrı fonksiyona alınmasının sebebi: bunlar önceden _eski_migrationlar_calistir'in
+    İÇİNDEYDİ - o dev, eski fonksiyonun BAŞINDA bir yerde (örn. Kasalar/Irsaliyeler gibi
+    çok eski bir adımda) hata olursa, Python fonksiyonun geri kalanını hiç çalıştırmıyor,
+    yani bu satırlara HİÇ ULAŞILAMIYORDU - kullanıcıda "Anomali Tespiti kuralı hiç
+    görünmüyor" gibi sessiz, açıklanamayan eksiklikler buna sebep oluyordu. Artık bu
+    kod, eski migration'lardan bağımsız kendi başına çağrılıyor (startup_db_check'te
+    kendi try/except+rollback koruması var) - eski kodda bir sorun olsa bile bu YENİ
+    özellikler her zaman doğru şekilde kurulur.
+    """
     # --- Konsinye Stok Takibi ---
     guvenli_migrasyon(cursor, """
         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='KonsinyeStoklar' and xtype='U')
@@ -1427,6 +1878,11 @@ def _eski_migrationlar_calistir(cursor):
         INSERT INTO AlarmKurallari (KuralAdi, KuralTipi, Esik) VALUES
         ('Sözleşme/Belge Süresi Doluyor (30 gün kala)', 'SozlesmeSuresiDoluyor', 30)
     """, "Sözleşme vade alarm kuralı")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT 1 FROM AlarmKurallari WHERE KuralTipi='AnormalIslem')
+        INSERT INTO AlarmKurallari (KuralAdi, KuralTipi, Esik) VALUES
+        ('Olağandışı İşlem Uyarısı (Kasa/Stok, 3 kat üstü)', 'AnormalIslem', 3)
+    """, "Anomali tespiti alarm kuralı")
     guvenli_migrasyon(cursor, """
         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='AlarmGecmisi' and xtype='U')
         CREATE TABLE AlarmGecmisi (
@@ -1533,6 +1989,82 @@ def _eski_migrationlar_calistir(cursor):
     # --- Sözleşme Vade Hatırlatıcısı (Belgeler tablosuna bitiş tarihi) ---
     guvenli_sutun_ekle(cursor, "Belgeler", "BitisTarihi", "DATE NULL")
 
+    # --- Müşteri Segmentasyonu: Elle Atama Desteği ---
+    guvenli_sutun_ekle(cursor, "Musteriler", "ManuelSegment", "NVARCHAR(30) NULL")
+
+    # --- Sık Kullanılan Sipariş Şablonları ---
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SiparisSablonlari' and xtype='U')
+        CREATE TABLE SiparisSablonlari (
+            SablonID INT IDENTITY(1,1) PRIMARY KEY,
+            SablonAdi NVARCHAR(150) NOT NULL,
+            MusteriID INT NULL FOREIGN KEY REFERENCES Musteriler(MusteriID),
+            KullaniciAdi NVARCHAR(50) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "SiparisSablonlari tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SiparisSablonKalemleri' and xtype='U')
+        CREATE TABLE SiparisSablonKalemleri (
+            KalemID INT IDENTITY(1,1) PRIMARY KEY,
+            SablonID INT NOT NULL FOREIGN KEY REFERENCES SiparisSablonlari(SablonID),
+            StokKod NVARCHAR(50) NOT NULL,
+            StokAdi NVARCHAR(150) NOT NULL,
+            Miktar FLOAT NOT NULL,
+            BirimFiyat FLOAT NOT NULL
+        )
+    """, "SiparisSablonKalemleri tablosu")
+
+    # --- Siparişte Stok Rezervasyonu ---
+    guvenli_sutun_ekle(cursor, "StokKartlari", "RezerveMiktar", "FLOAT NOT NULL DEFAULT 0")
+
+    # --- Fatura/Teklif Otomatik E-posta için Müşteri E-posta Alanı ---
+    guvenli_sutun_ekle(cursor, "Musteriler", "EPosta", "NVARCHAR(150) NULL")
+
+    # --- Teklif Kalemlerinde Karma Para Birimi Desteği ---
+    guvenli_sutun_ekle(cursor, "TeklifSatirlari", "ParaBirimi", "NVARCHAR(10) NOT NULL DEFAULT 'TL'")
+
+    # --- Tahsilatı Belirli Bir Siparişe Bağlama (opsiyonel) ---
+    guvenli_sutun_ekle(cursor, "Tahsilatlar", "SiparisID", "INT NULL")
+
+    # --- Sipariş Şablonu Kalemlerinde Karma Para Birimi Desteği ---
+    guvenli_sutun_ekle(cursor, "SiparisSablonKalemleri", "ParaBirimi", "NVARCHAR(10) NOT NULL DEFAULT 'TL'")
+
+    # --- Sipariş-Fatura Tutarlılık Kontrolü ---
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SiparisFaturaTutarsizliklari' and xtype='U')
+        CREATE TABLE SiparisFaturaTutarsizliklari (
+            TutarsizlikID INT IDENTITY(1,1) PRIMARY KEY,
+            SiparisID INT NOT NULL,
+            FaturaID INT NOT NULL,
+            StokKod NVARCHAR(50) NULL,
+            StokAdi NVARCHAR(150) NULL,
+            SiparisFiyati FLOAT NOT NULL,
+            FaturaFiyati FLOAT NOT NULL,
+            FarkYuzdesi FLOAT NOT NULL,
+            Tarih DATETIME NOT NULL DEFAULT GETDATE(),
+            IncelendiMi BIT NOT NULL DEFAULT 0
+        )
+    """, "SiparisFaturaTutarsizliklari tablosu")
+
+    # --- Master Kullanıcısını Otomatik Oluşturma ---
+    # "master" / "1234" ile giriş yapılabilecek, Master rolündeki kullanıcıyı sunucu
+    # her başladığında (henüz yoksa) otomatik oluşturur - elle Kullanıcı Yönetimi'nden
+    # eklemeye gerek kalmaz.
+    try:
+        cursor.execute("SELECT 1 FROM Kullanicilar WHERE KullaniciAdi = 'master'")
+        if not cursor.fetchone():
+            master_sifre_hash = pwd_context.hash("1234")
+            cursor.execute("INSERT INTO Kullanicilar (KullaniciAdi, SifreHash, Rol) VALUES ('master', ?, 'Master')", (master_sifre_hash,))
+            cursor.connection.commit()
+            print(">>> 'master' kullanıcısı otomatik oluşturuldu (şifre: 1234).")
+    except Exception as e:
+        print(f">>> 'master' kullanıcısı oluşturulamadı: {e}")
+        try:
+            cursor.connection.rollback()
+        except Exception:
+            pass
+
 
 @app.on_event("startup")
 def startup_db_check():
@@ -1550,6 +2082,15 @@ def startup_db_check():
             # komut çalışmaz. Bu satır olmadan, burada bir hata olduğunda SONRAKİ TÜM yeni
             # migration'lar (Banka Kredileri, Teminat, İhracat, Vade/Kur Farkı vb.) da
             # sessizce başarısız oluyordu - gerçek arıza buradaydı.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _konsinye_ve_sonraki_ozellik_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Konsinye/Belgeler/Alarm/Fiyat Listesi/Lot migration bloğu hata verdi: {e}")
             try:
                 conn.rollback()
             except Exception:
@@ -2670,10 +3211,11 @@ def mizan_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Fi
 
 @app.get("/bilanco")
 def bilanco_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
-    """Tekdüzen Hesap Planı'nın ilk hane kuralına göre basit bir bilanço üretir:
-    1-2 ile başlayan hesaplar VARLIK, 3-4-5 ile başlayan hesaplar KAYNAK (Borç+Özkaynak).
-    NOT: Bu, gerçek bir mali müşavir onaylı resmi bilanço değildir - hızlı bir öz bakış
-    sağlar, resmi beyan için mali müşavirinizin kendi sisteminde hazırladığı bilanço geçerlidir."""
+    """Resmi Tekdüzen Hesap Planı bölümlemesine (Dönen/Duran Varlıklar - Kısa/Uzun Vadeli
+    Yabancı Kaynaklar - Özkaynaklar) uygun bir bilanço üretir. Dönem Net Kâr/Zararı otomatik
+    hesaplanıp Özkaynaklar'a eklenir ki bilanço gerçekten denklessin.
+    NOT: Bu resmi beyanname formatında DEĞİLDİR - hızlı bir öz bakış sağlar, resmi beyan
+    için mali müşavirinizin kendi sisteminde hazırladığı bilanço geçerlidir."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -2683,21 +3225,59 @@ def bilanco_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "
             GROUP BY h.HesapKodu, h.HesapAdi HAVING ISNULL(SUM(s.Borc), 0) - ISNULL(SUM(s.Alacak), 0) <> 0
             ORDER BY h.HesapKodu
         """)
-        varliklar, kaynaklar = [], []
-        toplam_varlik = toplam_kaynak = 0.0
+        donen_varliklar, duran_varliklar = [], []
+        kvyk, uvyk, ozkaynaklar = [], [], []
+        toplam_donen = toplam_duran = toplam_kvyk = toplam_uvyk = toplam_ozkaynak = 0.0
         for kod, ad, bakiye in cursor.fetchall():
             bakiye = float(bakiye)
             ilk_hane = kod[0]
-            if ilk_hane in ('1', '2'):
-                varliklar.append({"HesapKodu": kod, "HesapAdi": ad, "Tutar": bakiye})
-                toplam_varlik += bakiye
-            elif ilk_hane in ('3', '4', '5'):
-                # Kaynak hesapları normalde alacak bakiyeli (Alacak>Borç) olur, o yüzden işareti çeviriyoruz
+            if ilk_hane == '1':
+                donen_varliklar.append({"HesapKodu": kod, "HesapAdi": ad, "Tutar": bakiye})
+                toplam_donen += bakiye
+            elif ilk_hane == '2':
+                duran_varliklar.append({"HesapKodu": kod, "HesapAdi": ad, "Tutar": bakiye})
+                toplam_duran += bakiye
+            elif ilk_hane == '3':
+                tutar = -bakiye  # kaynak hesapları normalde alacak bakiyeli
+                kvyk.append({"HesapKodu": kod, "HesapAdi": ad, "Tutar": tutar})
+                toplam_kvyk += tutar
+            elif ilk_hane == '4':
                 tutar = -bakiye
-                kaynaklar.append({"HesapKodu": kod, "HesapAdi": ad, "Tutar": tutar})
-                toplam_kaynak += tutar
-        return {"Varliklar": varliklar, "Kaynaklar": kaynaklar, "ToplamVarlik": round(toplam_varlik, 2),
-                "ToplamKaynak": round(toplam_kaynak, 2), "Fark": round(toplam_varlik - toplam_kaynak, 2)}
+                uvyk.append({"HesapKodu": kod, "HesapAdi": ad, "Tutar": tutar})
+                toplam_uvyk += tutar
+            elif ilk_hane == '5':
+                tutar = -bakiye
+                ozkaynaklar.append({"HesapKodu": kod, "HesapAdi": ad, "Tutar": tutar})
+                toplam_ozkaynak += tutar
+
+        # Dönem Net Kâr/Zararını (6-7 hesapları üzerinden) hesaplayıp Özkaynaklara ekliyoruz -
+        # aksi halde bilanço hiçbir zaman denk gelmez (kâr, sermayeye henüz aktarılmamış olsa
+        # bile bilançoda Özkaynaklar altında ayrı bir kalem olarak gösterilir).
+        cursor.execute("""
+            SELECT LEFT(s.HesapKodu,1), ISNULL(SUM(s.Borc),0), ISNULL(SUM(s.Alacak),0)
+            FROM YevmiyeSatirlari s WHERE LEFT(s.HesapKodu,1) IN ('6','7') GROUP BY LEFT(s.HesapKodu,1)
+        """)
+        gelir_gider = {r[0]: (float(r[1]), float(r[2])) for r in cursor.fetchall()}
+        gelir_toplam = gelir_gider.get('6', (0, 0))[1] - gelir_gider.get('6', (0, 0))[0]
+        gider_toplam = gelir_gider.get('7', (0, 0))[0] - gelir_gider.get('7', (0, 0))[1]
+        donem_net_kar = gelir_toplam - gider_toplam
+        if abs(donem_net_kar) > 0.01:
+            ozkaynaklar.append({"HesapKodu": "-", "HesapAdi": "Dönem Net Kârı/Zararı", "Tutar": donem_net_kar})
+            toplam_ozkaynak += donem_net_kar
+
+        toplam_varlik = toplam_donen + toplam_duran
+        toplam_kaynak = toplam_kvyk + toplam_uvyk + toplam_ozkaynak
+        return {
+            "DonenVarliklar": donen_varliklar, "ToplamDonenVarlik": round(toplam_donen, 2),
+            "DuranVarliklar": duran_varliklar, "ToplamDuranVarlik": round(toplam_duran, 2),
+            "ToplamVarlik": round(toplam_varlik, 2),
+            "KisaVadeliYabanciKaynaklar": kvyk, "ToplamKVYK": round(toplam_kvyk, 2),
+            "UzunVadeliYabanciKaynaklar": uvyk, "ToplamUVYK": round(toplam_uvyk, 2),
+            "Ozkaynaklar": ozkaynaklar, "ToplamOzkaynak": round(toplam_ozkaynak, 2),
+            "ToplamKaynak": round(toplam_kaynak, 2), "Fark": round(toplam_varlik - toplam_kaynak, 2),
+            # Eski (düz) alanlar geriye dönük uyumluluk için korunuyor:
+            "Varliklar": donen_varliklar + duran_varliklar, "Kaynaklar": kvyk + uvyk + ozkaynaklar,
+        }
     finally:
         conn.close()
 
@@ -2737,6 +3317,47 @@ def gelir_tablosu_getir(baslangic: Optional[str] = None, bitis: Optional[str] = 
                 toplam_gider += tutar
         return {"Gelirler": gelirler, "Giderler": giderler, "ToplamGelir": round(toplam_gelir, 2),
                 "ToplamGider": round(toplam_gider, 2), "NetKarZarar": round(toplam_gelir - toplam_gider, 2)}
+    finally:
+        conn.close()
+
+class EnflasyonDuzeltmeRequest(BaseModel):
+    DuzeltmeKatsayisi: float = Field(gt=0)
+
+@app.post("/enflasyon-duzeltmesi")
+def enflasyon_duzeltmesi_hesapla(veri: EnflasyonDuzeltmeRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    """VUK Mükerrer 298 kapsamındaki enflasyon muhasebesinin ÇOK BASİTLEŞTİRİLMİŞ bir
+    yaklaşık hesabı: parasal olmayan kalemlere (stoklar, duran varlıklar, özkaynaklar)
+    verilen düzeltme katsayısını uygular, parasal kalemleri (kasa, banka, alıcı/satıcı
+    gibi nakit/alacak/borç hesapları) OLDUĞU GİBİ bırakır.
+    ÖNEMLİ UYARI: Bu GERÇEK, resmi bir enflasyon düzeltmesi DEĞİLDİR. Resmi düzeltme;
+    TÜİK Yİ-ÜFE endekslerinin her hesabın edinim tarihine göre ayrı ayrı uygulanmasını,
+    parasal kar/zarar hesabını ve mali müşavir onayını gerektirir. Bu araç sadece
+    kabaca 'enflasyon etkisi ne kadar olurdu' sorusuna hızlı bir fikir verir."""
+    PARASAL_OLMAYAN_ILK_HANELER = ('2',)  # Duran varlıklar
+    PARASAL_OLMAYAN_KODLAR = ('153', '500')  # Stoklar ve Sermaye (özkaynak) - parasal değildir
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT h.HesapKodu, h.HesapAdi, ISNULL(SUM(s.Borc), 0) - ISNULL(SUM(s.Alacak), 0) AS Bakiye
+            FROM HesapPlani h LEFT JOIN YevmiyeSatirlari s ON h.HesapKodu = s.HesapKodu
+            GROUP BY h.HesapKodu, h.HesapAdi HAVING ISNULL(SUM(s.Borc), 0) - ISNULL(SUM(s.Alacak), 0) <> 0
+            ORDER BY h.HesapKodu
+        """)
+        satirlar = []
+        toplam_fark = 0.0
+        for kod, ad, bakiye in cursor.fetchall():
+            bakiye = float(bakiye)
+            nominal = abs(bakiye)
+            parasal_degil = kod[0] in PARASAL_OLMAYAN_ILK_HANELER or kod in PARASAL_OLMAYAN_KODLAR
+            duzeltilmis = nominal * veri.DuzeltmeKatsayisi if parasal_degil else nominal
+            fark = duzeltilmis - nominal
+            toplam_fark += fark if kod[0] in ('1', '2') else -fark  # varlık artışı + / kaynak artışı -
+            satirlar.append({"HesapKodu": kod, "HesapAdi": ad, "Nominal": round(nominal, 2),
+                              "Duzeltilmis": round(duzeltilmis, 2), "Fark": round(fark, 2), "ParasalMi": not parasal_degil})
+        return {"Satirlar": satirlar, "DuzeltmeKatsayisi": veri.DuzeltmeKatsayisi, "TahminiNetEtki": round(toplam_fark, 2),
+                "Not": "Bu TAHMİNİ bir araçtır, resmi VUK Mük.298 enflasyon düzeltmesi değildir. Kesin hesap için mali müşavirinize danışın."}
     finally:
         conn.close()
 
@@ -3267,12 +3888,14 @@ def stok_listesi_getir(user: dict = Depends(get_current_user)):
         cursor.execute("SELECT COL_LENGTH('StokKartlari', 'OrtalamaMaliyet')")
         maliyet_sutunu_var = cursor.fetchone()[0] is not None
         if maliyet_sutunu_var:
-            cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), ISNULL(OrtalamaMaliyet,0), Barkod FROM StokKartlari")
+            cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), ISNULL(OrtalamaMaliyet,0), Barkod, ISNULL(RezerveMiktar,0) FROM StokKartlari")
         else:
-            cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), 0, Barkod FROM StokKartlari")
+            cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), 0, Barkod, ISNULL(RezerveMiktar,0) FROM StokKartlari")
         return {"stoklar": [{"StokKod": s[0], "StokAdi": s[1], "Birim": s[2], "MevcutMiktar": float(s[3]) if s[3] is not None else 0,
                               "BirimFiyat": float(s[4]) if s[4] is not None else 0, "MinStokSeviyesi": float(s[5]) if s[5] is not None else 0,
                               "OrtalamaMaliyet": float(s[6]) if s[6] is not None else 0, "Barkod": s[7] or "",
+                              "RezerveMiktar": float(s[8]) if s[8] is not None else 0,
+                              "KullanilabilirMiktar": (float(s[3]) if s[3] is not None else 0) - (float(s[8]) if s[8] is not None else 0),
                               "KarMarji": kar_marji_hesapla(float(s[4]), float(s[6]))} for s in cursor.fetchall()]}
     finally:
         conn.close()
@@ -3287,6 +3910,173 @@ def stok_kritik_listesi(user: dict = Depends(get_current_user)):
             FROM StokKartlari WHERE MevcutMiktar <= ISNULL(MinStokSeviyesi,0)
         """)
         return {"kritik": [{"StokKod": s[0], "StokAdi": s[1], "Birim": s[2], "MevcutMiktar": s[3], "MinStokSeviyesi": s[4]} for s in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/negatif-stoklar")
+def negatif_stoklar_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Üretim", "Satınalma"]))):
+    """Fiziksel olarak imkansız olan (eksi) stok miktarlarını tespit eder - genelde
+    stok kontrolü olmadan yapılan toplu faturalama, hatalı elle düzeltme ya da veri
+    girişi hatalarından kaynaklanır. Bu bir 'iyi' durum değildir, düzeltilmelidir."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT StokKod, StokAdi, Birim, MevcutMiktar, ISNULL(RezerveMiktar,0)
+            FROM StokKartlari WHERE MevcutMiktar < 0 ORDER BY MevcutMiktar ASC
+        """)
+        return {"negatifler": [{"StokKod": s[0], "StokAdi": s[1], "Birim": s[2], "MevcutMiktar": float(s[3]),
+                                 "RezerveMiktar": float(s[4])} for s in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+class NegatifStokDuzeltRequest(BaseModel):
+    StokKod: str
+    YeniMiktar: float = Field(ge=0)
+    Aciklama: Optional[str] = None
+
+@app.put("/negatif-stok-duzelt")
+def negatif_stok_duzelt(veri: NegatifStokDuzeltRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo"]))):
+    """Negatif bir stok kaydını, kullanıcının girdiği doğru (gerçek fiziksel sayım)
+    miktara düzeltir. Fark, StokHareketleri'ne ve Yevmiye'ye (Stok Sayımı düzeltmesiyle
+    aynı mantıkla, 397 Sayım Farkları hesabı üzerinden) işlenir - sessizce
+    değiştirilmez, iz bırakılır."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT MevcutMiktar, ISNULL(OrtalamaMaliyet, BirimFiyat) FROM StokKartlari WHERE StokKod=?", (veri.StokKod,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Stok kartı bulunamadı.")
+        eski_miktar, birim_maliyet = float(row[0]), float(row[1] or 0)
+        if eski_miktar >= 0:
+            raise HTTPException(status_code=400, detail="Bu stok zaten negatif değil, düzeltmeye gerek yok.")
+
+        fark = veri.YeniMiktar - eski_miktar  # her zaman pozitif olacak (negatiften düzeltiliyor)
+        cursor.execute("UPDATE StokKartlari SET MevcutMiktar=? WHERE StokKod=?", (veri.YeniMiktar, veri.StokKod))
+        cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'GİRİŞ', ?, ?)",
+                       (veri.StokKod, fark, f"Negatif stok düzeltmesi: {veri.Aciklama or 'açıklama girilmedi'}"))
+
+        fark_tutari = fark * birim_maliyet
+        if abs(fark_tutari) > 0.01:
+            yevmiye_fisi_olustur(cursor, f"Negatif Stok Düzeltmesi: {veri.StokKod}", "NegatifStokDuzelt", veri.StokKod, [
+                ("153", fark_tutari, 0, "Negatif stok düzeltmesi (fazla)"),
+                ("397", 0, fark_tutari, "Sayım Farkları karşılığı"),
+            ], user["username"])
+
+        log_islem(cursor, f"Negatif stok düzeltildi: {veri.StokKod} ({eski_miktar:g} -> {veri.YeniMiktar:g})", user["username"])
+        conn.commit()
+        return {"mesaj": f"'{veri.StokKod}' stoğu {eski_miktar:g} -> {veri.YeniMiktar:g} olarak düzeltildi."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+@app.get("/ana-takvim")
+def ana_takvim_getir(gun_sayisi: int = 60, user: dict = Depends(get_current_user)):
+    """Uygulama genelinde dağınık duran TÜM vadeleri (kredi taksiti, teminat mektubu
+    bitişi, sözleşme/belge vadesi, makine bakım tarihi, tahmini fatura vadesi) TEK bir
+    listede birleştirir. Varsayılan olarak bugünden itibaren 60 gün ileriye bakar."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    olaylar = []
+    try:
+        # 1) Kredi Taksitleri (ödenmemiş, yaklaşan)
+        try:
+            cursor.execute("""
+                SELECT t.VadeTarihi, k.KrediAdi, t.TaksitNo, t.TaksitTutari
+                FROM KrediTaksitleri t JOIN BankaKredileri k ON t.KrediID = k.KrediID
+                WHERE t.OdendiMi = 0 AND t.VadeTarihi <= DATEADD(day, ?, GETDATE())
+            """, (gun_sayisi,))
+            for tarih, kredi_adi, taksit_no, tutar in cursor.fetchall():
+                olaylar.append({"Tarih": str(tarih), "Tur": "Kredi Taksiti", "Baslik": f"{kredi_adi} - Taksit #{taksit_no}",
+                                 "Detay": f"{float(tutar):,.2f} TL", "Onem": "Yüksek"})
+        except Exception:
+            pass
+
+        # 2) Teminat Mektubu Bitişleri
+        try:
+            cursor.execute("""
+                SELECT BitisTarihi, Tur, CariAdi, Tutar, ParaBirimi FROM TeminatMektuplari
+                WHERE Durum = 'Yürürlükte' AND BitisTarihi <= DATEADD(day, ?, GETDATE())
+            """, (gun_sayisi,))
+            for tarih, tur, cari_adi, tutar, pb in cursor.fetchall():
+                olaylar.append({"Tarih": str(tarih), "Tur": "Teminat Mektubu", "Baslik": f"{tur} Teminat - {cari_adi}",
+                                 "Detay": f"{float(tutar):,.2f} {pb}", "Onem": "Orta"})
+        except Exception:
+            pass
+
+        # 3) Sözleşme/Belge Vadeleri
+        try:
+            cursor.execute("""
+                SELECT BitisTarihi, DosyaAdi FROM Belgeler
+                WHERE BitisTarihi IS NOT NULL AND BitisTarihi <= DATEADD(day, ?, GETDATE())
+            """, (gun_sayisi,))
+            for tarih, dosya_adi in cursor.fetchall():
+                olaylar.append({"Tarih": str(tarih), "Tur": "Sözleşme/Belge", "Baslik": f"Süresi doluyor: {dosya_adi}",
+                                 "Detay": "-", "Onem": "Orta"})
+        except Exception:
+            pass
+
+        # 4) Planlı Makine Bakımları
+        try:
+            cursor.execute("""
+                SELECT SonrakiBakimTarihi, HatAdi FROM UretimHatlari
+                WHERE SonrakiBakimTarihi IS NOT NULL AND SonrakiBakimTarihi <= DATEADD(day, ?, GETDATE())
+            """, (gun_sayisi,))
+            for tarih, hat_adi in cursor.fetchall():
+                olaylar.append({"Tarih": str(tarih), "Tur": "Makine Bakımı", "Baslik": f"Planlı bakım: {hat_adi}",
+                                 "Detay": "-", "Onem": "Düşük"})
+        except Exception:
+            pass
+
+        # 5) Tahmini Fatura Vadeleri (30 gün standart vade varsayımıyla, ödenmemiş faturalar)
+        try:
+            cursor.execute("""
+                SELECT DATEADD(day, 30, f.Tarih) AS TahminiVade, m.FirmaAdi, f.ToplamTutar
+                FROM Faturalar f JOIN Musteriler m ON f.MusteriID = m.MusteriID
+                WHERE DATEADD(day, 30, f.Tarih) <= DATEADD(day, ?, GETDATE()) AND DATEADD(day, 30, f.Tarih) >= DATEADD(day, -3650, GETDATE())
+            """, (gun_sayisi,))
+            for tarih, firma_adi, tutar in cursor.fetchall():
+                olaylar.append({"Tarih": str(tarih)[:10], "Tur": "Fatura Vadesi (Tahmini)", "Baslik": f"Tahsilat bekleniyor: {firma_adi}",
+                                 "Detay": f"{float(tutar):,.2f} TL", "Onem": "Yüksek"})
+        except Exception:
+            pass
+
+        olaylar.sort(key=lambda o: o["Tarih"])
+        return {"olaylar": olaylar}
+    finally:
+        conn.close()
+
+@app.get("/siparis-fatura-tutarsizliklari")
+def siparis_fatura_tutarsizliklari_getir(sadece_incelenmemis: bool = False, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = """SELECT TutarsizlikID, SiparisID, FaturaID, StokKod, StokAdi, SiparisFiyati, FaturaFiyati, FarkYuzdesi, Tarih, IncelendiMi
+                    FROM SiparisFaturaTutarsizliklari"""
+        if sadece_incelenmemis:
+            sorgu += " WHERE IncelendiMi = 0"
+        sorgu += " ORDER BY Tarih DESC"
+        cursor.execute(sorgu)
+        return {"tutarsizliklar": [{"TutarsizlikID": r[0], "SiparisID": r[1], "FaturaID": r[2], "StokKod": r[3] or "-",
+                                     "StokAdi": r[4] or "-", "SiparisFiyati": float(r[5]), "FaturaFiyati": float(r[6]),
+                                     "FarkYuzdesi": float(r[7]), "Tarih": str(r[8])[:16], "IncelendiMi": bool(r[9])}
+                                    for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.put("/siparis-fatura-tutarsizlik-incelendi/{tutarsizlik_id}")
+def siparis_fatura_tutarsizlik_incelendi(tutarsizlik_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE SiparisFaturaTutarsizliklari SET IncelendiMi=1 WHERE TutarsizlikID=?", (tutarsizlik_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Kayıt bulunamadı.")
+        conn.commit()
+        return {"mesaj": "İncelendi olarak işaretlendi."}
     finally:
         conn.close()
 
@@ -3480,8 +4270,9 @@ def musteri_listesi_getir(user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT MusteriID, FirmaAdi, YetkiliKisi, Telefon, VergiDairesi, VergiNo, Adres, ISNULL(RiskLimiti,0) FROM Musteriler")
-        return {"musteriler": [{"MusteriID": s[0], "FirmaAdi": s[1], "YetkiliKisi": s[2], "Telefon": s[3], "VergiDairesi": s[4], "VergiNo": s[5], "Adres": s[6], "RiskLimiti": s[7]} for s in cursor.fetchall()]}
+        cursor.execute("SELECT MusteriID, FirmaAdi, YetkiliKisi, Telefon, VergiDairesi, VergiNo, Adres, ISNULL(RiskLimiti,0), EPosta FROM Musteriler")
+        return {"musteriler": [{"MusteriID": s[0], "FirmaAdi": s[1], "YetkiliKisi": s[2], "Telefon": s[3], "VergiDairesi": s[4],
+                                 "VergiNo": s[5], "Adres": s[6], "RiskLimiti": s[7], "EPosta": s[8] or ""} for s in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -3502,8 +4293,8 @@ def musteri_ekle(musteri: MusteriEkle, user: dict = Depends(yetki_kontrol(["Yön
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO Musteriler (FirmaAdi, YetkiliKisi, Telefon, VergiDairesi, VergiNo, Adres, RiskLimiti) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                       (musteri.FirmaAdi, musteri.YetkiliKisi, musteri.Telefon, musteri.VergiDairesi, musteri.VergiNo, musteri.Adres, musteri.RiskLimiti))
+        cursor.execute("INSERT INTO Musteriler (FirmaAdi, YetkiliKisi, Telefon, VergiDairesi, VergiNo, Adres, RiskLimiti, EPosta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                       (musteri.FirmaAdi, musteri.YetkiliKisi, musteri.Telefon, musteri.VergiDairesi, musteri.VergiNo, musteri.Adres, musteri.RiskLimiti, musteri.EPosta))
         log_islem(cursor, f"Yeni müşteri eklendi: {musteri.FirmaAdi}", user["username"])
         conn.commit()
         return {"mesaj": f"Müşteri '{musteri.FirmaAdi}' kaydedildi."}
@@ -3761,6 +4552,50 @@ def alarm_kurallarini_kontrol_et():
                     mesaj = f"Sözleşme/belge süresi doluyor: {dosya_adi} (Bitiş: {bitis})"
                     if not zaten_var_mi(kural_id, mesaj):
                         cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+
+            elif kural_tipi == "AnormalIslem":
+                # Katsayı: bugünkü işlem, son 30 günün ORTALAMASININ kaç katından fazlaysa
+                # anormal sayılsın (varsayılan 3x). Küçük işletmelerde çok az veri varken
+                # yanlış alarm vermemek için en az 5 geçmiş işlem şartı aranır.
+                katsayi = float(esik) if esik else 3.0
+
+                # 1) Kasa çıkışı anomalisi
+                cursor.execute("""
+                    SELECT HareketID, Tutar, Aciklama FROM KasaHareketleri
+                    WHERE Yon = 'Çıkış' AND CAST(Tarih AS DATE) = CAST(GETDATE() AS DATE)
+                """)
+                bugunku_kasa_cikislari = cursor.fetchall()
+                if bugunku_kasa_cikislari:
+                    cursor.execute("""
+                        SELECT AVG(Tutar), COUNT(*) FROM KasaHareketleri
+                        WHERE Yon = 'Çıkış' AND Tarih >= DATEADD(day, -30, GETDATE()) AND Tarih < CAST(GETDATE() AS DATE)
+                    """)
+                    ortalama_satir = cursor.fetchone()
+                    ortalama, adet = (float(ortalama_satir[0]) if ortalama_satir[0] else 0), ortalama_satir[1]
+                    if adet >= 5 and ortalama > 0:
+                        for hareket_id, tutar, aciklama in bugunku_kasa_cikislari:
+                            if float(tutar) > ortalama * katsayi:
+                                mesaj = f"Olağandışı büyük kasa çıkışı: {tutar:,.2f} TL ({aciklama or '-'}) - son 30 gün ortalamasının {tutar/ortalama:.1f} katı"
+                                if not zaten_var_mi(kural_id, mesaj):
+                                    cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+
+                # 2) Stok çıkışı anomalisi (ürün bazında, kendi geçmişiyle kıyaslanır)
+                cursor.execute("""
+                    SELECT StokKod, Miktar, Aciklama FROM StokHareketleri
+                    WHERE IslemTuru = 'ÇIKIŞ' AND CAST(Tarih AS DATE) = CAST(GETDATE() AS DATE)
+                """)
+                bugunku_stok_cikislari = cursor.fetchall()
+                for stok_kod, miktar, aciklama in bugunku_stok_cikislari:
+                    cursor.execute("""
+                        SELECT AVG(Miktar), COUNT(*) FROM StokHareketleri
+                        WHERE StokKod = ? AND IslemTuru = 'ÇIKIŞ' AND Tarih >= DATEADD(day, -30, GETDATE()) AND Tarih < CAST(GETDATE() AS DATE)
+                    """, (stok_kod,))
+                    ortalama_satir = cursor.fetchone()
+                    ortalama, adet = (float(ortalama_satir[0]) if ortalama_satir[0] else 0), ortalama_satir[1]
+                    if adet >= 5 and ortalama > 0 and float(miktar) > ortalama * katsayi:
+                        mesaj = f"Olağandışı büyük stok çıkışı: {stok_kod} - {miktar:g} birim ({aciklama or '-'}) - son 30 gün ortalamasının {miktar/ortalama:.1f} katı"
+                        if not zaten_var_mi(kural_id, mesaj):
+                            cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
 
         conn.commit()
     except Exception as e:
@@ -4226,10 +5061,10 @@ def musteri_guncelle(musteri: MusteriGuncelle, user: dict = Depends(yetki_kontro
     try:
         cursor.execute("SELECT FirmaAdi, YetkiliKisi, Telefon, VergiDairesi, VergiNo, Adres, ISNULL(RiskLimiti,0) FROM Musteriler WHERE MusteriID=?", (musteri.MusteriID,))
         eski = cursor.fetchone()
-        cursor.execute("""UPDATE Musteriler SET FirmaAdi=?, YetkiliKisi=?, Telefon=?, VergiDairesi=?, VergiNo=?, Adres=?, RiskLimiti=?
+        cursor.execute("""UPDATE Musteriler SET FirmaAdi=?, YetkiliKisi=?, Telefon=?, VergiDairesi=?, VergiNo=?, Adres=?, RiskLimiti=?, EPosta=?
                            WHERE MusteriID=?""",
                        (musteri.FirmaAdi, musteri.YetkiliKisi, musteri.Telefon, musteri.VergiDairesi, musteri.VergiNo, musteri.Adres,
-                        musteri.RiskLimiti, musteri.MusteriID))
+                        musteri.RiskLimiti, musteri.EPosta, musteri.MusteriID))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Müşteri bulunamadı.")
         if eski:
@@ -4321,8 +5156,16 @@ def tahsilat_ekle(tahsilat: TahsilatEkle, user: dict = Depends(yetki_kontrol(["Y
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO Tahsilatlar (MusteriID, Tutar, OdemeTuru, Aciklama) VALUES (?, ?, ?, ?)",
-                       (tahsilat.MusteriID, tahsilat.Tutar, tahsilat.OdemeTuru, tahsilat.Aciklama))
+        if tahsilat.SiparisID:
+            cursor.execute("SELECT MusteriID FROM Siparisler WHERE SiparisID=?", (tahsilat.SiparisID,))
+            sip = cursor.fetchone()
+            if not sip:
+                raise HTTPException(status_code=404, detail="Belirtilen sipariş bulunamadı.")
+            if sip[0] != tahsilat.MusteriID:
+                raise HTTPException(status_code=400, detail="Bu sipariş seçilen müşteriye ait değil.")
+
+        cursor.execute("INSERT INTO Tahsilatlar (MusteriID, Tutar, OdemeTuru, Aciklama, SiparisID) VALUES (?, ?, ?, ?, ?)",
+                       (tahsilat.MusteriID, tahsilat.Tutar, tahsilat.OdemeTuru, tahsilat.Aciklama, tahsilat.SiparisID))
         if tahsilat.OdemeTuru == "Nakit":
             cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi=?", (tahsilat.ParaBirimi,))
             kasa = cursor.fetchone()
@@ -4333,9 +5176,13 @@ def tahsilat_ekle(tahsilat: TahsilatEkle, user: dict = Depends(yetki_kontrol(["Y
             (hesap_kodu_kasa, tahsilat.Tutar, 0, f"{tahsilat.OdemeTuru} tahsilat girişi"),
             ("120", 0, tahsilat.Tutar, "Alıcılar hesabından düşüm"),
         ], user["username"])
-        log_islem(cursor, f"Tahsilat girildi: {tahsilat.Tutar} TL (Müşteri ID:{tahsilat.MusteriID})", user["username"])
+        siparis_notu = f" (Sipariş #{tahsilat.SiparisID} karşılığı)" if tahsilat.SiparisID else ""
+        log_islem(cursor, f"Tahsilat girildi: {tahsilat.Tutar} TL (Müşteri ID:{tahsilat.MusteriID}){siparis_notu}", user["username"])
         conn.commit()
-        return {"mesaj": f"{tahsilat.Tutar} TL tahsilat kasaya işlendi."}
+        return {"mesaj": f"{tahsilat.Tutar} TL tahsilat kasaya işlendi.{siparis_notu}"}
+    except HTTPException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -4345,10 +5192,29 @@ def tahsilat_listesi_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muh
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT t.TahsilatID, m.FirmaAdi, t.Tutar, t.OdemeTuru, t.Aciklama, t.Tarih, ISNULL(t.ParaBirimi, 'TL')
+            SELECT t.TahsilatID, m.FirmaAdi, t.Tutar, t.OdemeTuru, t.Aciklama, t.Tarih, ISNULL(t.ParaBirimi, 'TL'), t.SiparisID
             FROM Tahsilatlar t JOIN Musteriler m ON t.MusteriID = m.MusteriID ORDER BY t.Tarih DESC
         """)
-        return {"tahsilatlar": [{"TahsilatID": r[0], "FirmaAdi": r[1], "Tutar": r[2], "OdemeTuru": r[3], "Aciklama": r[4], "Tarih": str(r[5]), "ParaBirimi": r[6]} for r in cursor.fetchall()]}
+        return {"tahsilatlar": [{"TahsilatID": r[0], "FirmaAdi": r[1], "Tutar": r[2], "OdemeTuru": r[3], "Aciklama": r[4],
+                                  "Tarih": str(r[5]), "ParaBirimi": r[6], "SiparisID": r[7]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/siparis-tahsilat-ozeti/{siparis_id}")
+def siparis_tahsilat_ozeti_getir(siparis_id: int, user: dict = Depends(get_current_user)):
+    """Belirli bir sipariş için şimdiye kadar ne kadar tahsilat yapıldığını, sipariş
+    tutarının ne kadarının karşılandığını ve kalan bakiyeyi hesaplar."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT ToplamTutar FROM Siparisler WHERE SiparisID=?", (siparis_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+        siparis_tutari = float(row[0])
+        cursor.execute("SELECT ISNULL(SUM(Tutar), 0) FROM Tahsilatlar WHERE SiparisID=?", (siparis_id,))
+        tahsil_edilen = float(cursor.fetchone()[0])
+        return {"SiparisTutari": siparis_tutari, "TahsilEdilen": tahsil_edilen, "KalanBakiye": siparis_tutari - tahsil_edilen}
     finally:
         conn.close()
 
@@ -4513,17 +5379,27 @@ def en_cok_satanlar(user: dict = Depends(get_current_user)):
         conn.close()
 
 @app.post("/teklif-olustur")
-def teklif_olustur(veri: TeklifOlusturRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
+def teklif_olustur(veri: TeklifOlusturRequest, background_tasks: BackgroundTasks, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT FirmaAdi, YetkiliKisi, Adres, VergiDairesi, VergiNo FROM Musteriler WHERE MusteriID = ?", (veri.MusteriID,))
+        cursor.execute("SELECT FirmaAdi, YetkiliKisi, Adres, VergiDairesi, VergiNo, EPosta FROM Musteriler WHERE MusteriID = ?", (veri.MusteriID,))
         musteri = cursor.fetchone()
         if not musteri:
             raise HTTPException(status_code=404, detail="Müşteri bulunamadı!")
 
-        firma_adi, yetkili, adres, vd, vno = musteri[0], musteri[1], musteri[2], musteri[3], musteri[4]
-        toplam_tutar = sum(k.Miktar * k.BirimFiyat for k in veri.Kalemler)
+        firma_adi, yetkili, adres, vd, vno, musteri_eposta = musteri[0], musteri[1], musteri[2], musteri[3], musteri[4], musteri[5]
+
+        # Karma Para Birimi Desteği: her kalem kendi para biriminde (TL/USD/EUR)
+        # olabilir. Toplamı tek bir anlamlı rakamda göstermek için TÜM kalemler
+        # güncel TCMB kuruyla TL'ye çevrilip GENEL TOPLAM TL olarak hesaplanır -
+        # ama her kalemin PDF'teki satırı KENDİ orijinal para biriminde kalır.
+        kurlar = guncel_kur_getir()
+        toplam_tutar = 0.0
+        for k in veri.Kalemler:
+            satir_tutari = k.Miktar * k.BirimFiyat
+            kur = kurlar.get(k.ParaBirimi, 1.0)
+            toplam_tutar += satir_tutari * kur
 
         cursor.execute("""INSERT INTO Teklifler (MusteriID, ToplamTutar, PdfYolu)
                            OUTPUT inserted.TeklifID VALUES (?, ?, 'Gecici')""",
@@ -4531,45 +5407,46 @@ def teklif_olustur(veri: TeklifOlusturRequest, user: dict = Depends(yetki_kontro
         teklif_id = int(cursor.fetchone()[0])
 
         for kalem in veri.Kalemler:
-            cursor.execute("""INSERT INTO TeklifSatirlari (TeklifID, StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami)
-                               VALUES (?, ?, ?, ?, ?, ?)""",
-                           (teklif_id, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.BirimFiyat, kalem.Miktar * kalem.BirimFiyat))
+            cursor.execute("""INSERT INTO TeklifSatirlari (TeklifID, StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami, ParaBirimi)
+                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                           (teklif_id, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.BirimFiyat,
+                            kalem.Miktar * kalem.BirimFiyat, kalem.ParaBirimi))
 
         pdf = FPDF()
         pdf.add_page()
+        font = pdf_unicode_font_yukle(pdf)
         pdf_filigran_ekle(pdf)
-        pdf.set_font("Arial", "B", 16)
-        pdf.cell(190, 10, txt="NISAN PLASTIK - FIYAT TEKLIFI", ln=True, align="C")
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(190, 6, txt=f"Teklif No: #TK-{teklif_id} | Tarih: {datetime.date.today().isoformat()}", ln=True, align="C")
+        pdf_profesyonel_baslik(pdf, "FIYAT TEKLIFI", f"TK-{teklif_id}", datetime.date.today().strftime("%d.%m.%Y"),
+                               [f"Firma: {firma_adi}", f"Yetkili: {yetkili}   Vergi Dairesi: {vd}   Vergi No: {vno}"], font)
+
+        pdf_tablo_basligi(pdf, [("Stok Adi", 65, "L"), ("Miktar", 25, "C"), ("Birim Fiyat", 35, "R"), ("P.B.", 20, "C"), ("Toplam", 45, "R")], font)
+        # Aynı zamanda para birimi bazında ara toplamlar da tutulur (PDF altına eklenir)
+        pb_alt_toplam = {}
+        for idx, kalem in enumerate(veri.Kalemler):
+            satir_tutari = kalem.Miktar * kalem.BirimFiyat
+            pb_alt_toplam[kalem.ParaBirimi] = pb_alt_toplam.get(kalem.ParaBirimi, 0) + satir_tutari
+            pdf_tablo_satiri(pdf, [(kalem.StokAdi, 65, "L"), (f"{kalem.Miktar}", 25, "C"),
+                                    (f"{kalem.BirimFiyat:.2f}", 35, "R"), (kalem.ParaBirimi, 20, "C"),
+                                    (f"{satir_tutari:.2f} {kalem.ParaBirimi}", 45, "R")], idx, font)
+
+        pdf.ln(3)
+        if len(pb_alt_toplam) > 1:
+            pdf.set_font(font, "", 10)
+            for pb, tutar in pb_alt_toplam.items():
+                pdf.cell(190, 6, txt=f"Ara Toplam ({pb}): {tutar:,.2f} {pb}", ln=True, align="R")
+            pdf.ln(2)
+
+        pdf.set_fill_color(*PDF_MARKA_RENGI)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font(font, "B", 12)
+        pdf.cell(150, 10, "GENEL TOPLAM (TL karsiligi):", 1, 0, "R", fill=True)
+        pdf.cell(40, 10, f"{toplam_tutar:.2f} TL", 1, 1, "R", fill=True)
+        pdf.set_text_color(0, 0, 0)
+
         pdf.ln(10)
-        pdf.set_font("Arial", "B", 11)
-        pdf.cell(190, 6, txt=f"Sayin Musteri: {firma_adi}", ln=True)
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(190, 5, txt=f"Yetkili: {yetkili} | Vergi Dairesi: {vd} | Vergi No: {vno}", ln=True)
-        pdf.ln(10)
-        
-        pdf.set_font("Arial", "B", 10)
-        pdf.cell(80, 8, "Stok Adi", 1)
-        pdf.cell(30, 8, "Miktar", 1, 0, "C")
-        pdf.cell(40, 8, "Birim Fiyat", 1, 0, "R")
-        pdf.cell(40, 8, "Toplam", 1, 1, "R")
-        
-        pdf.set_font("Arial", "", 10)
-        for kalem in veri.Kalemler:
-            pdf.cell(80, 8, str(kalem.StokAdi), 1)
-            pdf.cell(30, 8, f"{kalem.Miktar}", 1, 0, "C")
-            pdf.cell(40, 8, f"{kalem.BirimFiyat:.2f} TL", 1, 0, "R")
-            pdf.cell(40, 8, f"{kalem.Miktar * kalem.BirimFiyat:.2f} TL", 1, 1, "R")
-            
-        pdf.ln(5)
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(150, 10, "GENEL TOPLAM:", 1, 0, "R")
-        pdf.cell(40, 10, f"{toplam_tutar:.2f} TL", 1, 1, "R")
-        
-        pdf.ln(10)
-        pdf.set_font("Arial", "I", 9)
-        pdf.cell(190, 5, txt="* Bu teklif 15 gun gecerlidir.", ln=True)
+        pdf.set_font(font, "I", 9)
+        pdf.cell(190, 5, txt="* Bu teklif 15 gun gecerlidir. Doviz kalemleri, teklif tarihindeki TCMB satis kuru uzerinden TL'ye cevrilmistir.", ln=True)
+        pdf_footer_ekle(pdf, font_ailesi=font)
 
         os.makedirs("Teklifler", exist_ok=True)
         pdf_yolu = os.path.join("Teklifler", f"Teklif_{teklif_id}.pdf")
@@ -4577,6 +5454,14 @@ def teklif_olustur(veri: TeklifOlusturRequest, user: dict = Depends(yetki_kontro
 
         cursor.execute("UPDATE Teklifler SET PdfYolu = ? WHERE TeklifID = ?", (pdf_yolu, teklif_id))
         log_islem(cursor, f"Yeni teklif hazırlandı: #{teklif_id} (Müşteri ID:{veri.MusteriID})", user["username"])
+
+        if musteri_eposta:
+            background_tasks.add_task(
+                eposta_gonder_pdf_ekli, musteri_eposta, f"Fiyat Teklifimiz #{teklif_id} - {firma_adi}",
+                f"Sayın {firma_adi},\n\n{toplam_tutar:,.2f} TL tutarındaki fiyat teklifimiz ektedir. Teklifimiz 15 gün geçerlidir.\n\nİyi çalışmalar dileriz.",
+                pdf_yolu, f"Teklif_{teklif_id}.pdf"
+            )
+
         conn.commit()
         return {"mesaj": f"Teklif #{teklif_id} başarıyla oluşturuldu!", "PdfYolu": pdf_yolu, "TeklifID": teklif_id}
     except Exception as e:
@@ -4616,7 +5501,7 @@ def teklif_durum_guncelle(veri: TeklifDurumGuncelle, user: dict = Depends(yetki_
         musteri_id, mevcut_durum = teklif[0], teklif[1]
         
         if veri.Durum == "Onaylandı" and mevcut_durum != "Onaylandı":
-            cursor.execute("SELECT StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami FROM TeklifSatirlari WHERE TeklifID = ?", (veri.TeklifID,))
+            cursor.execute("SELECT StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami, ParaBirimi FROM TeklifSatirlari WHERE TeklifID = ?", (veri.TeklifID,))
             satirlar = cursor.fetchall()
 
             # Birden fazla kalem varsa, Çok Kalemli Sipariş özelliğiyle tutarlı olacak
@@ -4630,9 +5515,11 @@ def teklif_durum_guncelle(veri: TeklifDurumGuncelle, user: dict = Depends(yetki_
                 grup_id = int(cursor.fetchone()[0])
 
             for satir in satirlar:
-                cursor.execute("""INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, Durum, SiparisGrupID, TeklifID)
-                                   VALUES (?, ?, ?, ?, ?, ?, 'Bekliyor', ?, ?)""",
-                               (musteri_id, satir[0], satir[1], satir[2], satir[3], satir[4], grup_id, veri.TeklifID))
+                cursor.execute("""INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, Durum, SiparisGrupID, TeklifID, ParaBirimi)
+                                   VALUES (?, ?, ?, ?, ?, ?, 'Bekliyor', ?, ?, ?)""",
+                               (musteri_id, satir[0], satir[1], satir[2], satir[3], satir[4], grup_id, veri.TeklifID, satir[5]))
+                if satir[0]:
+                    stok_rezerve_et(cursor, satir[0], satir[2])
             log_islem(cursor, f"Teklif #{veri.TeklifID} Onaylandı ve Siparişe dönüştürüldü.", user["username"])
 
         cursor.execute("UPDATE Teklifler SET Durum = ? WHERE TeklifID = ?", (veri.Durum, veri.TeklifID))
@@ -4641,6 +5528,192 @@ def teklif_durum_guncelle(veri: TeklifDurumGuncelle, user: dict = Depends(yetki_
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+class SablonKalemGiris(BaseModel):
+    StokKod: str
+    StokAdi: str
+    Miktar: float = Field(gt=0)
+    BirimFiyat: float = Field(ge=0)
+    ParaBirimi: str = "TL"
+
+class SiparisSablonuKaydetRequest(BaseModel):
+    SablonAdi: str
+    MusteriID: Optional[int] = None
+    Kalemler: list[SablonKalemGiris]
+
+@app.post("/siparis-sablonu-kaydet")
+def siparis_sablonu_kaydet(veri: SiparisSablonuKaydetRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
+    if not veri.Kalemler:
+        raise HTTPException(status_code=400, detail="En az bir kalem eklemelisiniz.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""INSERT INTO SiparisSablonlari (SablonAdi, MusteriID, KullaniciAdi)
+                           OUTPUT inserted.SablonID VALUES (?, ?, ?)""", (veri.SablonAdi, veri.MusteriID, user["username"]))
+        sablon_id = int(cursor.fetchone()[0])
+        for k in veri.Kalemler:
+            cursor.execute("""INSERT INTO SiparisSablonKalemleri (SablonID, StokKod, StokAdi, Miktar, BirimFiyat, ParaBirimi)
+                               VALUES (?, ?, ?, ?, ?, ?)""", (sablon_id, k.StokKod, k.StokAdi, k.Miktar, k.BirimFiyat, k.ParaBirimi))
+        log_islem(cursor, f"Sipariş şablonu kaydedildi: {veri.SablonAdi}", user["username"])
+        conn.commit()
+        return {"mesaj": f"'{veri.SablonAdi}' şablonu kaydedildi.", "SablonID": sablon_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/siparis-sablonlari")
+def siparis_sablonlari_getir(user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT s.SablonID, s.SablonAdi, s.MusteriID, ISNULL(m.FirmaAdi, 'Genel'), s.OlusturmaTarihi
+            FROM SiparisSablonlari s LEFT JOIN Musteriler m ON s.MusteriID = m.MusteriID
+            ORDER BY s.OlusturmaTarihi DESC
+        """)
+        return {"sablonlar": [{"SablonID": r[0], "SablonAdi": r[1], "MusteriID": r[2], "FirmaAdi": r[3],
+                                "OlusturmaTarihi": str(r[4])[:16]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/siparis-sablon-kalemleri/{sablon_id}")
+def siparis_sablon_kalemleri_getir(sablon_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT StokKod, StokAdi, Miktar, BirimFiyat, ParaBirimi FROM SiparisSablonKalemleri WHERE SablonID=?", (sablon_id,))
+        return {"kalemler": [{"StokKod": r[0], "StokAdi": r[1], "Miktar": float(r[2]), "BirimFiyat": float(r[3]),
+                               "ParaBirimi": r[4]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.delete("/siparis-sablonu-sil/{sablon_id}")
+def siparis_sablonu_sil(sablon_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM SiparisSablonKalemleri WHERE SablonID=?", (sablon_id,))
+        cursor.execute("DELETE FROM SiparisSablonlari WHERE SablonID=?", (sablon_id,))
+        log_islem(cursor, f"Sipariş şablonu silindi: #{sablon_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Şablon silindi."}
+    finally:
+        conn.close()
+
+class SablondanSiparisOlusturRequest(BaseModel):
+    SablonID: int
+    MusteriID: int
+
+@app.post("/siparis-sablonundan-olustur")
+def siparis_sablonundan_olustur(veri: SablondanSiparisOlusturRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
+    """Kayıtlı bir şablondaki tüm kalemler için, tek seferde birden fazla Sipariş
+    satırı oluşturur (aynı SiparisGrupID altında, çok kalemli sipariş gibi)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT StokKod, StokAdi, Miktar, BirimFiyat, ParaBirimi FROM SiparisSablonKalemleri WHERE SablonID=?", (veri.SablonID,))
+        kalemler = cursor.fetchall()
+        if not kalemler:
+            raise HTTPException(status_code=404, detail="Şablon bulunamadı ya da boş.")
+
+        cursor.execute("SELECT ISNULL(MAX(SiparisGrupID), 0) + 1 FROM Siparisler")
+        grup_id = cursor.fetchone()[0]
+
+        siparis_id_listesi = []
+        for stok_kod, stok_adi, miktar, birim_fiyat, para_birimi in kalemler:
+            toplam = miktar * birim_fiyat
+            cursor.execute("""INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, Durum, SiparisGrupID, ParaBirimi)
+                               OUTPUT inserted.SiparisID VALUES (?, ?, ?, ?, ?, ?, 'Bekliyor', ?, ?)""",
+                           (veri.MusteriID, stok_kod, stok_adi, miktar, birim_fiyat, toplam, grup_id, para_birimi))
+            siparis_id_listesi.append(int(cursor.fetchone()[0]))
+            if stok_kod:
+                stok_rezerve_et(cursor, stok_kod, miktar)
+
+        log_islem(cursor, f"Şablondan {len(kalemler)} kalemli sipariş oluşturuldu (Şablon #{veri.SablonID})", user["username"])
+        conn.commit()
+        return {"mesaj": f"Şablondan {len(kalemler)} kalemli yeni sipariş oluşturuldu.", "SiparisIDListesi": siparis_id_listesi, "SiparisGrupID": grup_id}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+class TopluOnayRequest(BaseModel):
+    OnayIDListesi: list[int]
+
+@app.post("/onay-toplu-onayla")
+def onay_toplu_onayla(veri: TopluOnayRequest, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    """Birden fazla onay bekleyen işlemi TEK seferde onaylar - mevcut, tek tekli
+    onay_ver() fonksiyonunu her ID için sırayla çağırır (kendi bağlantısını kendi
+    yönetiyor), hangi ID'lerin başarılı/başarısız olduğunu raporlar."""
+    basarili, basarisiz = [], []
+    for onay_id in veri.OnayIDListesi:
+        try:
+            onay_ver(onay_id=onay_id, user=user)
+            basarili.append(onay_id)
+        except HTTPException as e:
+            basarisiz.append({"OnayID": onay_id, "Hata": e.detail})
+        except Exception as e:
+            basarisiz.append({"OnayID": onay_id, "Hata": str(e)})
+    return {"mesaj": f"{len(basarili)} işlem onaylandı, {len(basarisiz)} işlem başarısız oldu.",
+            "Basarili": basarili, "Basarisiz": basarisiz}
+
+class TopluFaturayaCevirRequest(BaseModel):
+    SiparisIDListesi: list[int]
+
+@app.post("/siparis-toplu-faturaya-cevir")
+def siparis_toplu_faturaya_cevir(veri: TopluFaturayaCevirRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış"]))):
+    """Seçilen birden fazla siparişi TEK seferde faturaya çevirir - her sipariş için
+    ayrı bir fatura oluşturur (farklı müşterilere ait siparişler kabul edilir)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    basarili, basarisiz = [], []
+    try:
+        for siparis_id in veri.SiparisIDListesi:
+            try:
+                cursor.execute("""SELECT MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, Durum
+                                   FROM Siparisler WHERE SiparisID=?""", (siparis_id,))
+                row = cursor.fetchone()
+                if not row:
+                    basarisiz.append({"SiparisID": siparis_id, "Hata": "Sipariş bulunamadı."})
+                    continue
+                musteri_id, stok_kod, stok_adi, miktar, birim_fiyat, toplam_tutar, durum = row
+                if durum == "Tamamlandı":
+                    basarisiz.append({"SiparisID": siparis_id, "Hata": "Bu sipariş zaten faturalanmış."})
+                    continue
+
+                cursor.execute("""INSERT INTO Faturalar (MusteriID, Tarih, AraToplam, KdvToplam, ToplamTutar, ParaBirimi, SiparisID)
+                                   OUTPUT inserted.FaturaID VALUES (?, GETDATE(), ?, 0, ?, 'TL', ?)""",
+                               (musteri_id, toplam_tutar, toplam_tutar, siparis_id))
+                fatura_id = int(cursor.fetchone()[0])
+                cursor.execute("""INSERT INTO FaturaSatirlari (FaturaID, StokKod, StokAdi, Miktar, BirimFiyat, SatirToplami, KdvOrani)
+                                   VALUES (?, ?, ?, ?, ?, ?, 0)""", (fatura_id, stok_kod, stok_adi, miktar, birim_fiyat, toplam_tutar))
+                cursor.execute("UPDATE StokKartlari SET MevcutMiktar = MevcutMiktar - ? WHERE StokKod = ?", (miktar, stok_kod))
+                cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'ÇIKIŞ', ?, ?)",
+                               (stok_kod, miktar, f"Toplu Fatura - Sipariş #{siparis_id}"))
+                depo_stok_guncelle(cursor, stok_kod, varsayilan_depo_id(cursor), -miktar)
+                cursor.execute("UPDATE Siparisler SET Durum='Tamamlandı', TeslimEdilenMiktar=? WHERE SiparisID=?", (miktar, siparis_id))
+                stok_rezerve_coz(cursor, stok_kod, miktar)
+
+                yevmiye_fisi_olustur(cursor, f"Toplu Fatura - Sipariş #{siparis_id}", "TopluFatura", fatura_id, [
+                    ("120", toplam_tutar, 0, "Alıcılar"), ("600", 0, toplam_tutar, "Yurtiçi Satışlar"),
+                ], user["username"])
+
+                basarili.append({"SiparisID": siparis_id, "FaturaID": fatura_id})
+            except Exception as e:
+                basarisiz.append({"SiparisID": siparis_id, "Hata": str(e)})
+
+        log_islem(cursor, f"Toplu faturalama: {len(basarili)} başarılı, {len(basarisiz)} başarısız", user["username"])
+        conn.commit()
+        return {"mesaj": f"{len(basarili)} sipariş faturaya çevrildi, {len(basarisiz)} sipariş başarısız oldu.",
+                "Basarili": basarili, "Basarisiz": basarisiz}
     finally:
         conn.close()
 
@@ -4662,8 +5735,23 @@ def siparis_ekle(siparis: SiparisEkleRequest, user: dict = Depends(yetki_kontrol
         cursor.execute("INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar) VALUES (?, ?, ?, ?, ?, ?)",
                        (siparis.MusteriID, siparis.StokKod, siparis.StokAdi, siparis.Miktar, siparis.BirimFiyat, toplam))
         log_islem(cursor, f"Yeni sipariş alındı: {siparis.StokAdi}", user["username"])
+
+        # Stok Rezervasyonu: bu sipariş miktarını fiziksel olarak düşmeden "rezerve
+        # edilmiş" olarak işaretliyoruz - böylece başka bir sipariş aynı stoğu bir
+        # kez daha satamaz. Kullanılabilir miktar eksiye düşerse uyarı döndürülür.
+        uyari = None
+        if siparis.StokKod:
+            stok_rezerve_et(cursor, siparis.StokKod, siparis.Miktar)
+            kalan = stok_kullanilabilir_miktar(cursor, siparis.StokKod)
+            if kalan < 0:
+                uyari = f"⚠️ Bu sipariş sonrası '{siparis.StokKod}' kullanılabilir stoğu eksiye düştü ({kalan:g}) - tedarik/üretim planlaması gerekebilir."
+
         conn.commit()
-        return {"mesaj": "Sipariş başarıyla alındı."}
+        sonuc = {"mesaj": "Sipariş başarıyla alındı."}
+        if uyari:
+            sonuc["mesaj"] += f"\n{uyari}"
+            sonuc["StokUyarisi"] = uyari
+        return sonuc
     finally:
         conn.close()
 
@@ -4678,7 +5766,10 @@ def siparis_grup_ekle(veri: SiparisGrupEkleRequest, user: dict = Depends(yetki_k
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        grup_toplam = sum(k.Miktar * k.BirimFiyat for k in veri.Kalemler)
+        # Karma Para Birimi Desteği: her kalem kendi para biriminde olabilir - onay
+        # eşiği kontrolü ve grup toplamı için TÜMÜ güncel TCMB kuruyla TL'ye çevrilir.
+        kurlar = guncel_kur_getir()
+        grup_toplam = sum((k.Miktar * k.BirimFiyat) * kurlar.get(k.ParaBirimi, 1.0) for k in veri.Kalemler)
         esik = onay_esigi_asildi_mi(cursor, grup_toplam, user)
         if esik:
             onay_id = onaya_gonder(cursor, "SiparisGrupEkle", veri.dict(), grup_toplam,
@@ -4693,17 +5784,26 @@ def siparis_grup_ekle(veri: SiparisGrupEkleRequest, user: dict = Depends(yetki_k
         grup_id = int(cursor.fetchone()[0])
 
         siparis_idler = []
+        uyarilar = []
         for kalem in veri.Kalemler:
             toplam = kalem.Miktar * kalem.BirimFiyat
             cursor.execute("""INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, ParaBirimi, SiparisGrupID)
                                OUTPUT inserted.SiparisID VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                           (veri.MusteriID, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.BirimFiyat, toplam, veri.ParaBirimi, grup_id))
+                           (veri.MusteriID, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.BirimFiyat, toplam, kalem.ParaBirimi, grup_id))
             siparis_idler.append(int(cursor.fetchone()[0]))
+
+            if kalem.StokKod:
+                stok_rezerve_et(cursor, kalem.StokKod, kalem.Miktar)
+                kalan = stok_kullanilabilir_miktar(cursor, kalem.StokKod)
+                if kalan < 0:
+                    uyarilar.append(f"'{kalem.StokKod}' kullanılabilir stoğu eksiye düştü ({kalan:g})")
 
         log_islem(cursor, f"Çok kalemli sipariş alındı: Grup #{grup_id} ({len(veri.Kalemler)} kalem)", user["username"])
         conn.commit()
-        return {"mesaj": f"Sipariş grubu #{grup_id} oluşturuldu ({len(veri.Kalemler)} kalem).",
-                "SiparisGrupID": grup_id, "SiparisIDler": siparis_idler}
+        mesaj = f"Sipariş grubu #{grup_id} oluşturuldu ({len(veri.Kalemler)} kalem)."
+        if uyarilar:
+            mesaj += "\n⚠️ " + " | ".join(uyarilar)
+        return {"mesaj": mesaj, "SiparisGrupID": grup_id, "SiparisIDler": siparis_idler, "StokUyarilari": uyarilar}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -4716,13 +5816,15 @@ def siparis_listesi_getir(user: dict = Depends(get_current_user)):
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT s.SiparisID, m.FirmaAdi, s.StokKod, s.StokAdi, s.Miktar, s.BirimFiyat, s.ToplamTutar, s.SiparisTarihi, s.Durum, ISNULL(s.ParaBirimi, 'TL'), s.MusteriID, ISNULL(s.TeslimEdilenMiktar, 0), s.SiparisGrupID
+            SELECT s.SiparisID, m.FirmaAdi, s.StokKod, s.StokAdi, s.Miktar, s.BirimFiyat, s.ToplamTutar, s.SiparisTarihi, s.Durum, ISNULL(s.ParaBirimi, 'TL'), s.MusteriID, ISNULL(s.TeslimEdilenMiktar, 0), s.SiparisGrupID,
+                   ISNULL((SELECT SUM(t.Tutar) FROM Tahsilatlar t WHERE t.SiparisID = s.SiparisID), 0) AS TahsilEdilen
             FROM Siparisler s JOIN Musteriler m ON s.MusteriID = m.MusteriID ORDER BY s.SiparisTarihi DESC
         """)
         return {"siparisler": [{"SiparisID": r[0], "FirmaAdi": r[1], "StokKod": r[2], "StokAdi": r[3], "Miktar": float(r[4]), "BirimFiyat": float(r[5]),
                                  "ToplamTutar": float(r[6]), "Tarih": str(r[7]), "Durum": r[8], "ParaBirimi": r[9], "MusteriID": r[10],
                                  "TeslimEdilenMiktar": float(r[11]), "KalanMiktar": float(r[4]) - float(r[11]),
-                                 "SiparisGrupID": r[12]} for r in cursor.fetchall()]}
+                                 "SiparisGrupID": r[12], "TahsilEdilen": float(r[13]), "KalanBakiye": float(r[6]) - float(r[13])}
+                                for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -4734,16 +5836,32 @@ def siparis_durum_guncelle(veri: SiparisDurumGuncelle, user: dict = Depends(yetk
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT Durum FROM Siparisler WHERE SiparisID=?", (veri.SiparisID,))
-        eski = cursor.fetchone()
+        cursor.execute("SELECT Durum, StokKod, Miktar, ISNULL(TeslimEdilenMiktar,0) FROM Siparisler WHERE SiparisID=?", (veri.SiparisID,))
+        eski_satir = cursor.fetchone()
+        if not eski_satir:
+            raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+        eski_durum, stok_kod, miktar, teslim_edilen = eski_satir
+
         cursor.execute("UPDATE Siparisler SET Durum=? WHERE SiparisID=?", (veri.Durum, veri.SiparisID))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
-        if eski:
-            log_degisiklik(cursor, "Siparisler", veri.SiparisID, "Durum", eski[0], veri.Durum, user["username"])
+
+        # Stok Rezervasyonu: sipariş İPTAL edilirse ya da (teslimat dışı bir yoldan)
+        # TAMAMLANDI olarak işaretlenirse, henüz teslim edilmemiş kalan miktarın
+        # rezervasyonu serbest bırakılır - aksi halde o stok sonsuza kadar "rezerve"
+        # görünüp gerçekte kimse tarafından satılamaz hale gelirdi.
+        if veri.Durum in ("İptal", "Tamamlandı") and eski_durum not in ("İptal", "Tamamlandı") and stok_kod:
+            kalan_rezerve = float(miktar) - float(teslim_edilen)
+            if kalan_rezerve > 0:
+                stok_rezerve_coz(cursor, stok_kod, kalan_rezerve)
+
+        log_degisiklik(cursor, "Siparisler", veri.SiparisID, "Durum", eski_durum, veri.Durum, user["username"])
         log_islem(cursor, f"Sipariş #{veri.SiparisID} durumu: {veri.Durum}", user["username"])
         conn.commit()
         return {"mesaj": f"Sipariş durumu güncellendi."}
+    except HTTPException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -4752,12 +5870,28 @@ def siparis_sil(siparis_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        cursor.execute("SELECT Durum, StokKod, Miktar, ISNULL(TeslimEdilenMiktar,0) FROM Siparisler WHERE SiparisID=?", (siparis_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+        durum, stok_kod, miktar, teslim_edilen = row
+
         cursor.execute("DELETE FROM Siparisler WHERE SiparisID=?", (siparis_id,))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
+
+        # Silinen siparişin henüz teslim edilmemiş kısmının rezervasyonunu serbest bırak.
+        if durum not in ("İptal", "Tamamlandı") and stok_kod:
+            kalan_rezerve = float(miktar) - float(teslim_edilen)
+            if kalan_rezerve > 0:
+                stok_rezerve_coz(cursor, stok_kod, kalan_rezerve)
+
         log_islem(cursor, f"Sipariş silindi: ID {siparis_id}", user["username"])
         conn.commit()
         return {"mesaj": "Sipariş silindi."}
+    except HTTPException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -4961,31 +6095,23 @@ def cari_ekstre_pdf(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönet
 
         pdf = FPDF()
         pdf.add_page()
+        font = pdf_unicode_font_yukle(pdf)
         pdf_filigran_ekle(pdf)
-        pdf.set_font("Arial", "B", 16)
-        pdf.cell(190, 10, txt="NISAN PLASTIK - CARI HESAP EKSTRESI", ln=True, align="C")
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(190, 6, txt=f"Rapor Tarihi: {datetime.date.today().isoformat()}", ln=True, align="C")
-        pdf.ln(8)
-        pdf.set_font("Arial", "B", 11)
-        pdf.cell(190, 6, txt=f"Musteri: {firma_adi}", ln=True)
-        pdf.ln(6)
-        
-        pdf.set_font("Arial", "B", 10)
-        pdf.cell(35, 8, "Tarih", 1)
-        pdf.cell(90, 8, "Aciklama", 1)
-        pdf.cell(32, 8, "Borc", 1, 0, "R")
-        pdf.cell(33, 8, "Alacak", 1, 1, "R")
-        pdf.set_font("Arial", "", 10)
-        for h in hareketler:
-            pdf.cell(35, 7, h["Tarih"], 1)
-            pdf.cell(90, 7, h["Aciklama"], 1)
-            pdf.cell(32, 7, f"{h['Borc']:.2f}" if h['Borc'] else "-", 1, 0, "R")
-            pdf.cell(33, 7, f"{h['Alacak']:.2f}" if h['Alacak'] else "-", 1, 1, "R")
+        pdf_profesyonel_baslik(pdf, "CARI HESAP EKSTRESI", "-", datetime.date.today().strftime("%d.%m.%Y"), [f"Musteri: {firma_adi}"], font)
+
+        pdf_tablo_basligi(pdf, [("Tarih", 35, "L"), ("Aciklama", 90, "L"), ("Borç", 32, "R"), ("Alacak", 33, "R")], font)
+        for idx, h in enumerate(hareketler):
+            pdf_tablo_satiri(pdf, [(h["Tarih"], 35, "L"), (h["Aciklama"], 90, "L"),
+                                    (f"{h['Borc']:.2f}" if h['Borc'] else "-", 32, "R"),
+                                    (f"{h['Alacak']:.2f}" if h['Alacak'] else "-", 33, "R")], idx, font)
         pdf.ln(4)
-        pdf.set_font("Arial", "B", 11)
-        pdf.cell(125, 9, "Toplam Borc / Tahsilat / NET BAKIYE:", 1, 0, "R")
-        pdf.cell(65, 9, f"{toplam_borc:.2f} / {toplam_tahsilat:.2f} / {net_bakiye:.2f} TL", 1, 1, "R")
+        pdf.set_fill_color(*PDF_MARKA_RENGI)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font(font, "B", 11)
+        pdf.cell(125, 9, "Toplam Borc / Tahsilat / NET BAKIYE:", 1, 0, "R", fill=True)
+        pdf.cell(65, 9, f"{toplam_borc:.2f} / {toplam_tahsilat:.2f} / {net_bakiye:.2f} TL", 1, 1, "R", fill=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf_footer_ekle(pdf, font_ailesi=font)
 
         os.makedirs("Ekstreler", exist_ok=True)
         pdf_yolu = os.path.join("Ekstreler", f"Ekstre_{musteri_id}_{datetime.date.today().isoformat()}.pdf")
@@ -5109,41 +6235,38 @@ def fatura_kes(veri: FaturaOlusturRequest, background_tasks: BackgroundTasks, us
             yeni_teslim = min(sip_teslim + teslim_bu_faturada, sip_miktar)
             yeni_durum = "Tamamlandı" if yeni_teslim >= sip_miktar - 0.0001 else "Kısmi Teslim"
             cursor.execute("UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=? WHERE SiparisID=?", (yeni_teslim, yeni_durum, sid))
+            if sip_stok_kod and teslim_bu_faturada > 0:
+                stok_rezerve_coz(cursor, sip_stok_kod, teslim_bu_faturada)
+            ilgili_kalem = next((k for k in veri.Kalemler if k.StokKod == sip_stok_kod), None)
+            if ilgili_kalem:
+                siparis_fatura_tutarlilik_kontrol_et(cursor, sid, fatura_id, sip_stok_kod, ilgili_kalem.StokAdi, ilgili_kalem.BirimFiyat)
             log_islem(cursor, f"Sipariş #{sid}: {teslim_bu_faturada} teslim edildi ({yeni_teslim}/{sip_miktar}) -> {yeni_durum}", user["username"])
 
         pdf = FPDF()
         pdf.add_page()
+        font = pdf_unicode_font_yukle(pdf)
         pdf_filigran_ekle(pdf)
-        pdf.set_font("Arial", "B", 16)
-        pdf.cell(190, 10, txt="NISAN PLASTIK - SATIS FATURASI", ln=True, align="C")
-        pdf.set_font("Arial", "", 10)
-        pdf.cell(190, 6, txt=f"Fatura No: #FT-{fatura_id} | Tarih: {datetime.datetime.now().strftime('%Y-%m-%d')}", ln=True, align="C")
-        pdf.ln(10)
-        pdf.set_font("Arial", "B", 11)
-        pdf.cell(190, 6, txt=f"Sayin Musteri: {firma_adi}", ln=True)
-        pdf.ln(10)
-        pdf.set_font("Arial", "B", 10)
-        pdf.cell(60, 8, "Stok Adi", 1)
-        pdf.cell(25, 8, "Miktar", 1, 0, "C")
-        pdf.cell(35, 8, "Birim Fiyat", 1, 0, "R")
-        pdf.cell(20, 8, "KDV%", 1, 0, "C")
-        pdf.cell(50, 8, "Satir Toplam", 1, 1, "R")
-        pdf.set_font("Arial", "", 10)
-        for kalem in veri.Kalemler:
-            pdf.cell(60, 8, str(kalem.StokAdi), 1)
-            pdf.cell(25, 8, f"{kalem.Miktar}", 1, 0, "C")
-            pdf.cell(35, 8, f"{kalem.BirimFiyat:.2f} {veri.ParaBirimi}", 1, 0, "R")
-            pdf.cell(20, 8, f"%{kalem.KdvOrani:g}", 1, 0, "C")
-            pdf.cell(50, 8, f"{kalem.Miktar * kalem.BirimFiyat:.2f} {veri.ParaBirimi}", 1, 1, "R")
+        pdf_profesyonel_baslik(pdf, "SATIS FATURASI", f"FT-{fatura_id}", datetime.datetime.now().strftime("%d.%m.%Y"),
+                               [f"Firma: {firma_adi}"], font)
+
+        pdf_tablo_basligi(pdf, [("Stok Adi", 60, "L"), ("Miktar", 25, "C"), ("Birim Fiyat", 35, "R"), ("KDV%", 20, "C"), ("Satir Toplam", 50, "R")], font)
+        for idx, kalem in enumerate(veri.Kalemler):
+            pdf_tablo_satiri(pdf, [(kalem.StokAdi, 60, "L"), (f"{kalem.Miktar}", 25, "C"),
+                                    (f"{kalem.BirimFiyat:.2f} {veri.ParaBirimi}", 35, "R"), (f"%{kalem.KdvOrani:g}", 20, "C"),
+                                    (f"{kalem.Miktar * kalem.BirimFiyat:.2f} {veri.ParaBirimi}", 50, "R")], idx, font)
         pdf.ln(2)
-        pdf.set_font("Arial", "B", 11)
+        pdf.set_font(font, "B", 11)
         pdf.cell(140, 8, "ARA TOPLAM:", 1, 0, "R")
         pdf.cell(50, 8, f"{ara_toplam:.2f} {veri.ParaBirimi}", 1, 1, "R")
         pdf.cell(140, 8, "KDV TOPLAMI:", 1, 0, "R")
         pdf.cell(50, 8, f"{kdv_toplam:.2f} {veri.ParaBirimi}", 1, 1, "R")
-        pdf.set_font("Arial", "B", 12)
-        pdf.cell(140, 10, "GENEL TOPLAM:", 1, 0, "R")
-        pdf.cell(50, 10, f"{genel_toplam:.2f} {veri.ParaBirimi}", 1, 1, "R")
+        pdf.set_fill_color(*PDF_MARKA_RENGI)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font(font, "B", 12)
+        pdf.cell(140, 10, "GENEL TOPLAM:", 1, 0, "R", fill=True)
+        pdf.cell(50, 10, f"{genel_toplam:.2f} {veri.ParaBirimi}", 1, 1, "R", fill=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf_footer_ekle(pdf, font_ailesi=font)
 
         os.makedirs("Faturalar", exist_ok=True)
         pdf_yolu = os.path.join("Faturalar", f"Fatura_{fatura_id}.pdf")
@@ -5595,6 +6718,309 @@ def lot_sorgula(lot_no: Optional[str] = None, musteri_id: Optional[int] = None, 
                                "LotNo": r[4], "StokAdi": r[5]} for r in cursor.fetchall()]}
     finally:
         conn.close()
+
+@app.get("/satis-tahmini")
+def satis_tahmini_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Üretim", "Depo"]))):
+    """Her ürün için son 6 aylık satış geçmişinden basit bir talep tahmini üretir:
+    - Son 3 ayın ağırlıklı ortalaması alınır (en yakın ay 3x, ortadaki ay 2x, en eski ay 1x ağırlıklı)
+      böylece güncel trend eski verilerden daha baskın olur.
+    - Bu tahmin, mevcut stokla karşılaştırılıp stoğun önümüzdeki ayki tahmini talebi
+      karşılayıp karşılamadığı işaretlenir - üretim/satınalma planlaması için erken uyarı sağlar.
+    NOT: Bu istatistiksel bir yaklaşık tahmindir, kesin bir taahhüt değildir - mevsimsellik,
+    kampanya, yeni müşteri gibi faktörleri hesaba katmaz."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT fs.StokKod, ISNULL(s.StokAdi, fs.StokAdi) AS StokAdi, ISNULL(s.MevcutMiktar, 0) AS MevcutStok,
+                   DATEDIFF(month, f.Tarih, GETDATE()) AS AyFarki, SUM(fs.Miktar) AS ToplamMiktar
+            FROM FaturaSatirlari fs
+            JOIN Faturalar f ON fs.FaturaID = f.FaturaID
+            LEFT JOIN StokKartlari s ON fs.StokKod = s.StokKod
+            WHERE f.Tarih >= DATEADD(month, -6, GETDATE())
+            GROUP BY fs.StokKod, s.StokAdi, fs.StokAdi, s.MevcutMiktar, DATEDIFF(month, f.Tarih, GETDATE())
+        """)
+        urun_verileri = {}
+        for stok_kod, stok_adi, mevcut_stok, ay_farki, toplam_miktar in cursor.fetchall():
+            if stok_kod not in urun_verileri:
+                urun_verileri[stok_kod] = {"StokAdi": stok_adi, "MevcutStok": float(mevcut_stok or 0), "aylar": {}}
+            urun_verileri[stok_kod]["aylar"][int(ay_farki)] = urun_verileri[stok_kod]["aylar"].get(int(ay_farki), 0) + float(toplam_miktar)
+
+        sonuclar = []
+        for stok_kod, veri in urun_verileri.items():
+            aylar = veri["aylar"]
+            # Son 3 ayı ağırlıklı ortalama al: bu ay(0)*3 + geçen ay(1)*2 + iki ay önce(2)*1, ağırlık toplamına böl
+            agirliklar = {0: 3, 1: 2, 2: 1}
+            toplam_agirlik = 0
+            agirlikli_toplam = 0
+            for ay_indeksi, agirlik in agirliklar.items():
+                if ay_indeksi in aylar:
+                    agirlikli_toplam += aylar[ay_indeksi] * agirlik
+                    toplam_agirlik += agirlik
+            if toplam_agirlik == 0:
+                continue  # bu ürün son 3 ayda hiç satılmamış, tahmin üretilemez
+            tahmini_talep = agirlikli_toplam / toplam_agirlik
+
+            gecen_ay = aylar.get(1, 0)
+            bu_ay_kismi = aylar.get(0, 0)  # ay henüz bitmemiş olabilir, sadece trend yönü için kullanılır
+            trend_yonu = "→"
+            if gecen_ay > 0 and len(aylar) >= 2:
+                iki_ay_once = aylar.get(2, gecen_ay)
+                if gecen_ay > iki_ay_once * 1.1:
+                    trend_yonu = "↑"
+                elif gecen_ay < iki_ay_once * 0.9:
+                    trend_yonu = "↓"
+
+            mevcut_stok = veri["MevcutStok"]
+            yetersiz_mi = mevcut_stok < tahmini_talep
+            sonuclar.append({
+                "StokKod": stok_kod, "StokAdi": veri["StokAdi"], "MevcutStok": round(mevcut_stok, 2),
+                "TahminiAylikTalep": round(tahmini_talep, 2), "TrendYonu": trend_yonu,
+                "StokYetersizMi": yetersiz_mi, "EksikMiktar": round(max(0, tahmini_talep - mevcut_stok), 2)
+            })
+
+        sonuclar.sort(key=lambda x: (not x["StokYetersizMi"], -x["TahminiAylikTalep"]))
+        return {"tahminler": sonuclar,
+                "Not": "İstatistiksel bir yaklaşık tahmindir (son 3 ayın ağırlıklı ortalaması) - kesin taahhüt değildir."}
+    finally:
+        conn.close()
+
+@app.get("/donem-karsilastirma")
+def donem_karsilastirma_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe", "Finans", "Patron"]))):
+    """Bu ayı hem geçen ayla (aylık trend) hem geçen yılın aynı ayıyla (yıllık büyüme/
+    küçülme) karşılaştırır. Ayrıca bu ay en çok satan ürünleri listeler."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        def donem_ozeti(baslangic_ay_farki, bitis_ay_farki_haric):
+            # baslangic_ay_farki=0 -> bu ayın 1'i; bitis_ay_farki_haric=1 -> bir sonraki ayın 1'inden ÖNCE
+            cursor.execute("""
+                SELECT ISNULL(SUM(ToplamTutar), 0), COUNT(*)
+                FROM Faturalar
+                WHERE Tarih >= DATEADD(month, DATEDIFF(month, 0, GETDATE()) - ?, 0)
+                  AND Tarih < DATEADD(month, DATEDIFF(month, 0, GETDATE()) - ? + 1, 0)
+            """, (baslangic_ay_farki, baslangic_ay_farki))
+            ciro, fatura_sayisi = cursor.fetchone()
+            cursor.execute("""
+                SELECT COUNT(*) FROM Siparisler
+                WHERE SiparisTarihi >= DATEADD(month, DATEDIFF(month, 0, GETDATE()) - ?, 0)
+                  AND SiparisTarihi < DATEADD(month, DATEDIFF(month, 0, GETDATE()) - ? + 1, 0)
+            """, (baslangic_ay_farki, baslangic_ay_farki))
+            siparis_sayisi = cursor.fetchone()[0]
+            return {"Ciro": float(ciro), "FaturaSayisi": int(fatura_sayisi), "SiparisSayisi": int(siparis_sayisi)}
+
+        bu_ay = donem_ozeti(0, 1)
+        gecen_ay = donem_ozeti(1, 1)
+        gecen_yil_ayni_ay = donem_ozeti(12, 1)
+
+        def buyume_yuzdesi(yeni, eski):
+            if eski == 0:
+                return None
+            return round((yeni - eski) / eski * 100, 1)
+
+        # Bu ay en çok satan ürünler
+        cursor.execute("""
+            SELECT fs.StokKod, ISNULL(s.StokAdi, fs.StokAdi), SUM(fs.Miktar) AS ToplamMiktar, SUM(fs.SatirToplami) AS ToplamTutar
+            FROM FaturaSatirlari fs JOIN Faturalar f ON fs.FaturaID = f.FaturaID
+            LEFT JOIN StokKartlari s ON fs.StokKod = s.StokKod
+            WHERE f.Tarih >= DATEADD(month, DATEDIFF(month, 0, GETDATE()), 0)
+            GROUP BY fs.StokKod, s.StokAdi, fs.StokAdi ORDER BY ToplamMiktar DESC
+        """)
+        en_cok_satanlar = [{"StokKod": r[0], "StokAdi": r[1], "ToplamMiktar": float(r[2]), "ToplamTutar": float(r[3])}
+                            for r in cursor.fetchall()][:10]
+
+        return {
+            "BuAy": bu_ay, "GecenAy": gecen_ay, "GecenYilAyniAy": gecen_yil_ayni_ay,
+            "AylikCiroBuyumeYuzdesi": buyume_yuzdesi(bu_ay["Ciro"], gecen_ay["Ciro"]),
+            "YillikCiroBuyumeYuzdesi": buyume_yuzdesi(bu_ay["Ciro"], gecen_yil_ayni_ay["Ciro"]),
+            "EnCokSatanlar": en_cok_satanlar,
+            "Not": "Bu ayın verisi henüz tamamlanmamış olabilir (ay bitmeden karşılaştırma yapılıyor)."
+        }
+    finally:
+        conn.close()
+
+@app.get("/musteri-segmentasyonu")
+def musteri_segmentasyonu_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe", "Patron"]))):
+    """RFM (Recency-Frequency-Monetary) analiziyle her müşteriyi bir segmente ayırır:
+    - VIP: Yakın zamanda ALIŞVERİŞ yapmış VE yüksek harcamalı (üst %25)
+    - Sadık Müşteri: Sık sipariş veren (üst %25 frekans) ve makul yakınlıkta
+    - Risk Altında: Geçmişte yüksek harcama yapmış ama 120+ gündür sessiz
+    - Kayıp Müşteri: 180+ gündür hiç alışveriş yok
+    - Yeni Müşteri: İlk (tek) faturası son 30 gün içinde
+    - Normal: Yukarıdakilerin hiçbirine net girmeyenler
+    NOT: Basit, pratik bir sınıflandırmadır - profesyonel pazarlama analitiği yerine geçmez."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT m.MusteriID, m.FirmaAdi, COUNT(f.FaturaID) AS FaturaSayisi,
+                   ISNULL(SUM(f.ToplamTutar), 0) AS ToplamHarcama, MAX(f.Tarih) AS SonAlisveris, m.ManuelSegment
+            FROM Musteriler m LEFT JOIN Faturalar f ON m.MusteriID = f.MusteriID
+            GROUP BY m.MusteriID, m.FirmaAdi, m.ManuelSegment
+        """)
+        satirlar = cursor.fetchall()
+        veriler = []
+        for musteri_id, firma_adi, fatura_sayisi, toplam_harcama, son_alisveris, manuel_segment in satirlar:
+            if son_alisveris is None:
+                gunluk_fark = None
+            else:
+                gunluk_fark = (datetime.datetime.now() - son_alisveris).days
+            veriler.append({"MusteriID": musteri_id, "FirmaAdi": firma_adi, "FaturaSayisi": int(fatura_sayisi),
+                             "ToplamHarcama": float(toplam_harcama), "SonAlisverisGun": gunluk_fark, "ManuelSegment": manuel_segment})
+
+        # Sadece en az bir faturası olanlar üzerinden yüzdelik dilim (percentile) eşiği hesaplanır
+        harcamalar = sorted([v["ToplamHarcama"] for v in veriler if v["FaturaSayisi"] > 0], reverse=True)
+        frekanslar = sorted([v["FaturaSayisi"] for v in veriler if v["FaturaSayisi"] > 0], reverse=True)
+        ust_yuzde25_harcama = harcamalar[int(len(harcamalar) * 0.25)] if len(harcamalar) >= 4 else (harcamalar[0] if harcamalar else 0)
+        ust_yuzde25_frekans = frekanslar[int(len(frekanslar) * 0.25)] if len(frekanslar) >= 4 else (frekanslar[0] if frekanslar else 0)
+
+        for v in veriler:
+            gun = v["SonAlisverisGun"]
+            if v["FaturaSayisi"] == 0:
+                v["OtomatikSegment"] = "Hiç Alışveriş Yok"
+            elif gun is not None and gun <= 30 and v["FaturaSayisi"] == 1:
+                v["OtomatikSegment"] = "Yeni Müşteri"
+            elif gun is not None and gun > 180:
+                v["OtomatikSegment"] = "Kayıp Müşteri"
+            elif gun is not None and gun > 120 and v["ToplamHarcama"] >= ust_yuzde25_harcama:
+                v["OtomatikSegment"] = "Risk Altında"
+            elif gun is not None and gun <= 60 and v["ToplamHarcama"] >= ust_yuzde25_harcama:
+                v["OtomatikSegment"] = "VIP"
+            elif v["FaturaSayisi"] >= ust_yuzde25_frekans and gun is not None and gun <= 90:
+                v["OtomatikSegment"] = "Sadık Müşteri"
+            else:
+                v["OtomatikSegment"] = "Normal"
+            # Elle atanmış bir segment varsa, otomatik hesaplamanın ÖNÜNE geçer.
+            v["Segment"] = v["ManuelSegment"] if v["ManuelSegment"] else v["OtomatikSegment"]
+            v["ElleAtanmisMi"] = bool(v["ManuelSegment"])
+
+        veriler.sort(key=lambda x: -x["ToplamHarcama"])
+        ozet = {}
+        for v in veriler:
+            ozet[v["Segment"]] = ozet.get(v["Segment"], 0) + 1
+        return {"musteriler": veriler, "SegmentOzeti": ozet,
+                "GecerliSegmentler": ["VIP", "Sadık Müşteri", "Risk Altında", "Kayıp Müşteri", "Yeni Müşteri", "Normal"]}
+    finally:
+        conn.close()
+
+class MusteriSegmentAtaRequest(BaseModel):
+    Segment: Optional[str] = None  # None/boş verilirse elle atama silinir, otomatik hesaplamaya döner
+
+@app.put("/musteri-segment-ata/{musteri_id}")
+def musteri_segment_ata(musteri_id: int, veri: MusteriSegmentAtaRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe"]))):
+    """Bir müşterinin segmentini elle atar (otomatik RFM hesaplamasını geçersiz kılar).
+    Segment None/boş gönderilirse elle atama silinir, müşteri tekrar otomatik hesaplamaya döner."""
+    gecerli_segmentler = {"VIP", "Sadık Müşteri", "Risk Altında", "Kayıp Müşteri", "Yeni Müşteri", "Normal", None}
+    if veri.Segment not in gecerli_segmentler:
+        raise HTTPException(status_code=400, detail="Geçersiz segment adı.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE Musteriler SET ManuelSegment = ? WHERE MusteriID = ?", (veri.Segment, musteri_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Müşteri bulunamadı.")
+        log_islem(cursor, f"Müşteri #{musteri_id} segmenti elle {'ayarlandı: ' + veri.Segment if veri.Segment else 'sıfırlandı (otomatik hesaplamaya döndü)'}", user["username"])
+        conn.commit()
+        return {"mesaj": "Segment güncellendi." if veri.Segment else "Segment otomatik hesaplamaya döndürüldü."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+@app.get("/kar-marji-analizi")
+def kar_marji_analizi_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe", "Üretim", "Patron"]))):
+    """Her ürünün toplam satış tutarı, tahmini maliyeti (OrtalamaMaliyet üzerinden) ve
+    kâr marjını hesaplar. En çok satan ürün ile en kârlı ürünün genelde AYNI ürün
+    olmadığını göstermek için hem ciro hem kâr bazında sıralanabilir."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT fs.StokKod, ISNULL(s.StokAdi, fs.StokAdi) AS StokAdi, SUM(fs.Miktar) AS ToplamMiktar,
+                   SUM(fs.SatirToplami) AS ToplamCiro, ISNULL(s.OrtalamaMaliyet, 0) AS BirimMaliyet
+            FROM FaturaSatirlari fs
+            JOIN Faturalar f ON fs.FaturaID = f.FaturaID
+            LEFT JOIN StokKartlari s ON fs.StokKod = s.StokKod
+            GROUP BY fs.StokKod, s.StokAdi, fs.StokAdi, s.OrtalamaMaliyet
+        """)
+        sonuclar = []
+        for stok_kod, stok_adi, toplam_miktar, toplam_ciro, birim_maliyet in cursor.fetchall():
+            toplam_miktar, toplam_ciro, birim_maliyet = float(toplam_miktar), float(toplam_ciro), float(birim_maliyet or 0)
+            tahmini_maliyet = toplam_miktar * birim_maliyet
+            kar = toplam_ciro - tahmini_maliyet
+            kar_marji_yuzde = round(kar / toplam_ciro * 100, 1) if toplam_ciro > 0 else 0
+            sonuclar.append({"StokKod": stok_kod, "StokAdi": stok_adi, "ToplamMiktar": round(toplam_miktar, 2),
+                              "ToplamCiro": round(toplam_ciro, 2), "TahminiMaliyet": round(tahmini_maliyet, 2),
+                              "TahminiKar": round(kar, 2), "KarMarjiYuzde": kar_marji_yuzde})
+        return {"urunler": sonuclar,
+                "Not": "Maliyet, StokKartlari.OrtalamaMaliyet (ağırlıklı ortalama alış maliyeti) üzerinden TAHMİNİ hesaplanır."}
+    finally:
+        conn.close()
+
+@app.get("/dashboard-grafik-verisi")
+def dashboard_grafik_verisi(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış", "Patron"]))):
+    """Dashboard'daki grafikler için ham veri: son 12 ayın ciro trendi + bu ayın en
+    çok satan 5 ürününün dağılımı. Frontend bunu matplotlib ile çizip gömer."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        aylik_ciro = []
+        for i in range(11, -1, -1):
+            cursor.execute("""
+                SELECT ISNULL(SUM(ToplamTutar), 0) FROM Faturalar
+                WHERE Tarih >= DATEADD(month, DATEDIFF(month, 0, GETDATE()) - ?, 0)
+                  AND Tarih < DATEADD(month, DATEDIFF(month, 0, GETDATE()) - ? + 1, 0)
+            """, (i, i))
+            ciro = float(cursor.fetchone()[0])
+            ay_etiketi = (datetime.datetime.now().replace(day=1) - datetime.timedelta(days=1)).strftime("%m/%y") if i > 0 else datetime.datetime.now().strftime("%m/%y")
+            # Yukarıdaki etiket basitleştirmesi yerine doğrudan ay farkına göre hesaplayalım:
+            hedef_ay = datetime.datetime.now().month - i
+            hedef_yil = datetime.datetime.now().year
+            while hedef_ay <= 0:
+                hedef_ay += 12
+                hedef_yil -= 1
+            ay_etiketi = f"{hedef_ay:02d}/{str(hedef_yil)[2:]}"
+            aylik_ciro.append({"Ay": ay_etiketi, "Ciro": ciro})
+
+        cursor.execute("""
+            SELECT TOP 5 ISNULL(s.StokAdi, fs.StokAdi), SUM(fs.SatirToplami) AS Tutar
+            FROM FaturaSatirlari fs JOIN Faturalar f ON fs.FaturaID = f.FaturaID
+            LEFT JOIN StokKartlari s ON fs.StokKod = s.StokKod
+            WHERE f.Tarih >= DATEADD(month, DATEDIFF(month, 0, GETDATE()), 0)
+            GROUP BY fs.StokKod, s.StokAdi, fs.StokAdi ORDER BY Tutar DESC
+        """)
+        urun_dagilimi = [{"Urun": r[0], "Tutar": float(r[1])} for r in cursor.fetchall()]
+
+        return {"AylikCiro": aylik_ciro, "UrunDagilimi": urun_dagilimi}
+    finally:
+        conn.close()
+
+class FiyatOnerisiRequest(BaseModel):
+    Maliyet: float = Field(gt=0)
+    IstenilenMarjYuzde: float = Field(ge=0)
+    RakipFiyati: Optional[float] = None
+
+@app.post("/fiyat-onerisi-hesapla")
+def fiyat_onerisi_hesapla(veri: FiyatOnerisiRequest, user: dict = Depends(get_current_user)):
+    """Maliyet-artı (cost-plus) yöntemiyle önerilen satış fiyatını hesaplar:
+    Önerilen Fiyat = Maliyet x (1 + İstenilen Marj / 100).
+    Rakip fiyatı girilirse, önerilen fiyatla karşılaştırıp konumlandırma notu ekler."""
+    onerilen_fiyat = veri.Maliyet * (1 + veri.IstenilenMarjYuzde / 100)
+    sonuc = {"OnerilenFiyat": round(onerilen_fiyat, 2), "Maliyet": veri.Maliyet, "IstenilenMarjYuzde": veri.IstenilenMarjYuzde,
+             "TahminiKarBirimBasi": round(onerilen_fiyat - veri.Maliyet, 2)}
+    if veri.RakipFiyati:
+        fark_yuzde = round((onerilen_fiyat - veri.RakipFiyati) / veri.RakipFiyati * 100, 1)
+        if fark_yuzde > 5:
+            konum = f"Önerilen fiyatınız rakipten %{fark_yuzde} DAHA PAHALI - rekabet riski olabilir."
+        elif fark_yuzde < -5:
+            konum = f"Önerilen fiyatınız rakipten %{abs(fark_yuzde)} DAHA UCUZ - marjınızı artırabilirsiniz."
+        else:
+            konum = "Önerilen fiyatınız rakiple yakın seviyede."
+        sonuc["RakipFiyati"] = veri.RakipFiyati
+        sonuc["RakipFarkiYuzde"] = fark_yuzde
+        sonuc["KonumNotu"] = konum
+    return sonuc
 
 @app.get("/uretim-emirleri")
 def uretim_emirleri_getir(user: dict = Depends(get_current_user)):
@@ -6734,4 +8160,7 @@ def urun_maliyeti_sil(maliyet_id: int, user: dict = Depends(get_current_user)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # host="0.0.0.0" ÖNEMLİ: "127.0.0.1" sadece BU bilgisayardan gelen bağlantıları
+    # kabul eder - telefon gibi başka bir cihaz asla bağlanamaz, IP doğru yazılsa
+    # bile bağlantı reddedilir. "0.0.0.0" ile sunucu ağdaki TÜM cihazlara açılır.
+    uvicorn.run(app, host="0.0.0.0", port=8000)
