@@ -3443,7 +3443,7 @@ class MainApp(ctk.CTkToplevel):
         form_satiri = ctk.CTkFrame(form_cerceve, fg_color="transparent")
         form_satiri.pack(fill="x", padx=10, pady=(0, 10))
 
-        simdi = datetime.datetime.now()
+        simdi = datetime.now()
         self.bt_yil = ctk.CTkEntry(form_satiri, placeholder_text="Yıl", width=80)
         self.bt_yil.insert(0, str(simdi.year))
         self.bt_yil.pack(side="left", padx=(0, 8))
