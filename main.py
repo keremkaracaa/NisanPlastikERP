@@ -9,6 +9,7 @@ from typing import Optional
 import pyodbc
 import os
 import sys
+import secrets
 import json
 import time
 import io
@@ -2281,16 +2282,18 @@ def _konsinye_ve_sonraki_ozellik_migrationlari(cursor):
     """, "SiparisFaturaTutarsizliklari tablosu")
 
     # --- Master Kullanıcısını Otomatik Oluşturma ---
-    # "master" / "1234" ile giriş yapılabilecek, Master rolündeki kullanıcıyı sunucu
-    # her başladığında (henüz yoksa) otomatik oluşturur - elle Kullanıcı Yönetimi'nden
-    # eklemeye gerek kalmaz.
+    # Master rolündeki kullanıcıyı sunucu her başladığında (henüz yoksa) otomatik
+    # oluşturur - elle Kullanıcı Yönetimi'nden eklemeye gerek kalmaz. Şifre kaynak
+    # kodda sabit tutulmaz; her seferinde rastgele üretilip yalnızca konsola basılır.
     try:
         cursor.execute("SELECT 1 FROM Kullanicilar WHERE KullaniciAdi = 'master'")
         if not cursor.fetchone():
-            master_sifre_hash = pwd_context.hash("1234")
+            master_gecici_sifre = secrets.token_urlsafe(9)
+            master_sifre_hash = pwd_context.hash(master_gecici_sifre)
             cursor.execute("INSERT INTO Kullanicilar (KullaniciAdi, SifreHash, Rol) VALUES ('master', ?, 'Master')", (master_sifre_hash,))
             cursor.connection.commit()
-            print(">>> 'master' kullanıcısı otomatik oluşturuldu (şifre: 1234).")
+            print(">>> 'master' kullanıcısı otomatik oluşturuldu.")
+            print(f">>> GEÇİCİ ŞİFRE: {master_gecici_sifre}  (bu şifreyi not alın, ilk girişte değiştirin - bir daha gösterilmeyecek)")
     except Exception as e:
         print(f">>> 'master' kullanıcısı oluşturulamadı: {e}")
         try:
