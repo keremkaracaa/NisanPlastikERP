@@ -1207,6 +1207,112 @@ class TestTedarikciGuncelleDenetimIzi:
         assert yanit.status_code in (401, 403)
 
 
+class TestUretimEmriPlanlaCakismaKontrolu:
+    """/uretim-emri-planla önceden aynı hatta çakışan tarihte iki emrin planlanmasına
+    hiç engel olmuyordu (çift rezervasyon). Artık aynı hat + çakışan tarih aralığında
+    başka bir emir varsa 400 döner."""
+
+    def _gövde(self, **overrides):
+        gövde = {"EmirID": 7, "HatID": 1, "PlaniBaslangic": "2026-09-05", "PlaniBitis": "2026-09-12"}
+        gövde.update(overrides)
+        return gövde
+
+    def test_cakisan_tarihte_400_doner(self, client, monkeypatch):
+        cakisan_emir = (5, "Enjeksiyon Kalıbı A", "2026-09-01", "2026-09-10")
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=cakisan_emir)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/uretim-emri-planla", json=self._gövde())
+        assert yanit.status_code == 400
+        assert "#5" in yanit.json()["detail"]
+
+    def test_cakismayan_tarihte_basariyla_planlanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        cursor.rowcount = 1
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/uretim-emri-planla", json=self._gövde())
+        assert yanit.status_code == 200
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.put("/uretim-emri-planla", json=self._gövde())
+        assert yanit.status_code in (401, 403)
+
+
+class TestDashboardOzetKpiGenisletme:
+    """/dashboard-ozet önceden NetKar/KarMarji hesaplıyordu ama Stok Devir Hızı ve
+    Geç Teslimat Oranı hiç yoktu. Sorgu sırası: ToplamCiro, KasaNakit, BekleyenSiparis,
+    MusteriSayisi, (ToplamMaliyet, ToplamKdvHaricSatis), StokDegeri, (SiparisSayisi, GecSayisi)."""
+
+    def test_stok_devir_hizi_ve_gec_teslimat_orani_dogru_hesaplanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            (100000.0,),   # ToplamCiro
+            (20000.0,),    # KasaNakit
+            (3,),           # BekleyenSiparis
+            (12,),          # MusteriSayisi
+            (40000.0, 100000.0),  # ToplamMaliyet, ToplamKdvHaricSatis
+            (20000.0,),     # anlik stok degeri
+            (10, 3),        # degerlendirilen siparis, gec teslim sayisi
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/dashboard-ozet")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["StokDevirHizi"] == 2.0  # 40000 / 20000
+        assert veri["GecTeslimatOrani"] == 30.0  # 3/10 * 100
+        assert veri["DegerlendirilenSiparisSayisi"] == 10
+
+    def test_hic_teslim_verisi_yoksa_gec_teslimat_orani_none_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            (0.0,), (0.0,), (0,), (0,), (0.0, 0.0), (0.0,), (0, 0),
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/dashboard-ozet")
+        assert yanit.status_code == 200
+        assert yanit.json()["GecTeslimatOrani"] is None
+
+
+class TestSiparisEkleSozVerilenTeslimTarihi:
+    """/siparis-ekle önceden söz verilen teslim tarihi almıyordu - Geç Teslimat Oranı
+    KPI'sının hesaplanabilmesi için bu alan artık INSERT'e geçiriliyor."""
+
+    def test_teslim_tarihi_insert_e_dogru_geciyor(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(0,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "onay_gerekli_mi", lambda *a, **k: (None, None))
+        monkeypatch.setattr(main, "fiyat_politikasi_kontrol_et", lambda *a, **k: None)
+        monkeypatch.setattr(main, "stok_rezerve_et", lambda *a, **k: None)
+        monkeypatch.setattr(main, "stok_kullanilabilir_miktar", lambda *a, **k: 10.0)
+
+        yanit = client.post("/siparis-ekle", json={
+            "MusteriID": 1, "StokKod": "PP-001", "StokAdi": "Test", "Miktar": 5, "BirimFiyat": 10,
+            "SozVerilenTeslimTarihi": "2026-09-20"
+        })
+        assert yanit.status_code == 200
+        insert_cagrisi = [c for c in cursor.execute.call_args_list if "INSERT INTO Siparisler" in c.args[0]][0]
+        assert "2026-09-20" in insert_cagrisi.args[1]
+
+
+class TestSiparisDurumGuncelleTeslimDamgasi:
+    """/siparis-durum-guncelle ile bir sipariş manuel olarak 'Tamamlandı' yapıldığında
+    GercekTeslimTarihi artık otomatik damgalanıyor (Geç Teslimat Oranı KPI'sı için)."""
+
+    def test_tamamlandi_yapinca_teslim_tarihi_case_parametresi_dogru(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("Bekliyor", "PP-001", 10.0, 0.0))
+        cursor.rowcount = 1
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/siparis-durum-guncelle", json={"SiparisID": 1, "Durum": "Tamamlandı"})
+        assert yanit.status_code == 200
+        guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Siparisler SET Durum" in c.args[0]][0]
+        assert guncelleme.args[1] == ("Tamamlandı", "Tamamlandı", 1)
+
+
 class TestOtomatikYedekleme:
     """Otomatik veritabanı yedeklemesi önceden hiç yoktu - /veritabani-yedekle
     sadece elle tıklanınca çalışıyordu. Artık her gece otomatik çalışan ve eski

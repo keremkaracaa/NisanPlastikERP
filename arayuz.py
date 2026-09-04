@@ -7466,11 +7466,16 @@ class MainApp(ctk.CTkToplevel):
             ("KasaNakit", "💵 Kasa Nakit / Tahsilat", "#10b981"),
             ("BekleyenSiparis", "📦 Bekleyen Sipariş", "#38bdf8"),
             ("MusteriSayisi", "👥 Kayıtlı Müşteri", "#a78bfa"),
+            ("NetKar", "📈 Net Kâr", "#22c55e"),
+            ("KarMarji", "📊 Kâr Marjı", "#eab308"),
+            ("StokDevirHizi", "🔄 Stok Devir Hızı", "#06b6d4"),
+            ("GecTeslimatOrani", "⏰ Geç Teslimat Oranı", "#ef4444"),
         ]
         for i, (anahtar, baslik, renk) in enumerate(kpi_tanim):
+            satir, sutun = divmod(i, 4)
             kart = ctk.CTkFrame(kart_alani, fg_color=RENK_KART, corner_radius=10, border_width=2, border_color=renk)
-            kart.grid(row=0, column=i, padx=8, pady=5, sticky="nsew")
-            kart_alani.grid_columnconfigure(i, weight=1)
+            kart.grid(row=satir, column=sutun, padx=8, pady=5, sticky="nsew")
+            kart_alani.grid_columnconfigure(sutun, weight=1)
             ctk.CTkLabel(kart, text=baslik, font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(pady=(14, 4), padx=14)
             deger_label = ctk.CTkLabel(kart, text="—", font=("Arial", 22, "bold"), text_color=renk)
             deger_label.pack(pady=(0, 14), padx=14)
@@ -7514,6 +7519,11 @@ class MainApp(ctk.CTkToplevel):
             self.kpi_labels["KasaNakit"].configure(text=f"{d['KasaNakit']:,.2f} TL")
             self.kpi_labels["BekleyenSiparis"].configure(text=f"{d['BekleyenSiparis']} Adet")
             self.kpi_labels["MusteriSayisi"].configure(text=f"{d['MusteriSayisi']} Firma")
+            self.kpi_labels["NetKar"].configure(text=f"{d.get('NetKar', 0):,.2f} TL")
+            self.kpi_labels["KarMarji"].configure(text=f"%{d.get('KarMarji', 0):.1f}")
+            self.kpi_labels["StokDevirHizi"].configure(text=f"{d.get('StokDevirHizi', 0):.2f}x")
+            gec_oran = d.get("GecTeslimatOrani")
+            self.kpi_labels["GecTeslimatOrani"].configure(text=f"%{gec_oran:.1f}" if gec_oran is not None else "Henüz veri yok")
             if hasattr(self, "status_left"):
                 self.status_left.configure(text=f"●  Güvenli Bağlantı (JWT)  ·  Aktif Kullanıcı: {self.username}", text_color="#10b981")
         except requests.exceptions.RequestException:
@@ -8829,12 +8839,14 @@ class MainApp(ctk.CTkToplevel):
         self.sp_fiyat.grid(row=1, column=1, padx=10, pady=10)
         self.sp_kur = ctk.CTkOptionMenu(sip_frame, values=["TL", "USD", "EUR"], width=70)
         self.sp_kur.grid(row=1, column=2, padx=10, pady=10, sticky="w")
+        self.sp_teslim_tarihi = ctk.CTkEntry(sip_frame, placeholder_text="Teslim Tarihi (YYYY-AA-GG, opsiyonel)", width=200)
+        self.sp_teslim_tarihi.grid(row=1, column=3, padx=10, pady=10)
         ctk.CTkButton(sip_frame, text="Sipariş Al", fg_color="#0d9488", hover_color="#0f766e",
-                      command=self.siparis_ver).grid(row=1, column=3, padx=10, pady=10)
+                      command=self.siparis_ver).grid(row=1, column=4, padx=10, pady=10)
         ctk.CTkButton(sip_frame, text="📦 Çok Kalemli Sipariş", fg_color="#7c3aed", hover_color="#6d28d9",
-                      command=self.cok_kalemli_siparis_penceresi).grid(row=1, column=4, padx=10, pady=10)
+                      command=self.cok_kalemli_siparis_penceresi).grid(row=1, column=5, padx=10, pady=10)
         ctk.CTkButton(sip_frame, text="📋 Şablonlar", fg_color="#0891b2", hover_color="#0e7490",
-                      command=self.siparis_sablonlari_penceresi).grid(row=1, column=5, padx=10, pady=10)
+                      command=self.siparis_sablonlari_penceresi).grid(row=1, column=6, padx=10, pady=10)
 
         durum_satiri = ctk.CTkFrame(self.tab_siparis, fg_color="transparent")
         durum_satiri.pack(pady=(0, 5), padx=10, fill="x")
@@ -9075,7 +9087,8 @@ class MainApp(ctk.CTkToplevel):
     def siparis_ver(self):
         try:
             data = {"MusteriID": int(self.sp_mus.get()), "StokKod": self.sp_kod.get(), "StokAdi": self.sp_ad.get(),
-                    "Miktar": float(self.sp_mik.get()),"ParaBirimi": self.sp_kur.get(), "BirimFiyat": float(self.sp_fiyat.get())}
+                    "Miktar": float(self.sp_mik.get()),"ParaBirimi": self.sp_kur.get(), "BirimFiyat": float(self.sp_fiyat.get()),
+                    "SozVerilenTeslimTarihi": self.sp_teslim_tarihi.get().strip() or None}
         except ValueError:
             messagebox.showwarning("Eksik/Hatalı Bilgi", "Müşteri ID, Miktar ve Fiyat sayısal olmalıdır.")
             return
@@ -9088,6 +9101,7 @@ class MainApp(ctk.CTkToplevel):
                 self.sp_ad.delete(0, "end")
                 self.sp_mik.delete(0, "end")
                 self.sp_fiyat.delete(0, "end")
+                self.sp_teslim_tarihi.delete(0, "end")
                 self.siparisleri_yukle()
                 self.dashboard_yukle()
                 self.stoklari_yukle()

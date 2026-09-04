@@ -1201,8 +1201,10 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
                                               if (k.stok_kod and k.stok_kod == sip_stok_kod) or (not k.stok_kod and k.urun_ad == sip_urun_adi))
                     yeni_teslim = min(sip_teslim + teslim_bu_faturada, sip_miktar)
                     yeni_durum = "Tamamlandı" if yeni_teslim >= sip_miktar - 0.0001 else "Kısmi Teslim"
-                    cursor.execute("UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=? WHERE SiparisID=?",
-                                   (yeni_teslim, yeni_durum, data.siparis_id))
+                    cursor.execute("""UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=?,
+                                       GercekTeslimTarihi=CASE WHEN ?='Tamamlandı' THEN GETDATE() ELSE GercekTeslimTarihi END
+                                       WHERE SiparisID=?""",
+                                   (yeni_teslim, yeni_durum, yeni_durum, data.siparis_id))
                     # Fatura kesilince mal fiziksel olarak gerçekten çıktığı için, bu
                     # kadarlık miktarın rezervasyonu da serbest bırakılır (artık "rezerve
                     # bekleyen" değil, "satılmış" durumda).
@@ -1367,8 +1369,10 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
                         yeni_durum = "Kısmi Teslim" if teslim_bu_irsaliyede > 0 else "Kargoda"
                     else:
                         yeni_durum = sip_durum
-                    cursor.execute("UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=? WHERE SiparisID=?",
-                                   (yeni_teslim, yeni_durum, data.siparis_id))
+                    cursor.execute("""UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=?,
+                                       GercekTeslimTarihi=CASE WHEN ?='Tamamlandı' THEN GETDATE() ELSE GercekTeslimTarihi END
+                                       WHERE SiparisID=?""",
+                                   (yeni_teslim, yeni_durum, yeni_durum, data.siparis_id))
                     if sip_stok_kod and teslim_bu_irsaliyede > 0:
                         stok_rezerve_coz(cursor, sip_stok_kod, teslim_bu_irsaliyede)
             
@@ -1531,6 +1535,7 @@ class SiparisEkleRequest(BaseModel):
     Miktar: float = Field(gt=0)
     BirimFiyat: float = Field(ge=0)
     ParaBirimi: str = "TL"
+    SozVerilenTeslimTarihi: Optional[str] = None  # "YYYY-MM-DD", opsiyonel
 
 class SiparisGrupKalem(BaseModel):
     StokKod: str
@@ -1543,6 +1548,7 @@ class SiparisGrupEkleRequest(BaseModel):
     MusteriID: int
     Aciklama: Optional[str] = None
     Kalemler: list[SiparisGrupKalem]
+    SozVerilenTeslimTarihi: Optional[str] = None  # "YYYY-MM-DD", opsiyonel, grubun tüm kalemlerine uygulanır
 
 class FaturaKalem(BaseModel):
     StokKod: str
@@ -1899,6 +1905,11 @@ def _eski_migrationlar_calistir(cursor):
     """, "SiparisGruplari tablosu")
     guvenli_sutun_ekle(cursor, "Siparisler", "SiparisGrupID", "INT NULL")
     guvenli_sutun_ekle(cursor, "Siparisler", "TeklifID", "INT NULL")
+    # Geç Teslimat Oranı KPI'sı için: söz verilen teslim tarihi (opsiyonel, sipariş
+    # girişinde belirtilirse) ve fiili tam teslim tarihi (sipariş "Tamamlandı" durumuna
+    # düştüğü anda otomatik damgalanır).
+    guvenli_sutun_ekle(cursor, "Siparisler", "SozVerilenTeslimTarihi", "DATE NULL")
+    guvenli_sutun_ekle(cursor, "Siparisler", "GercekTeslimTarihi", "DATE NULL")
 
     # --- Üretim Planlama / Kapasite Çizelgesi ---
     guvenli_migrasyon(cursor, """
@@ -6513,14 +6524,36 @@ def dashboard_ozet(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", 
         net_kar = kdv_haric_satis - toplam_maliyet
         kar_marji = (net_kar / kdv_haric_satis * 100) if kdv_haric_satis > 0 else 0.0
 
+        # Stok Devir Hızı: toplam satış maliyeti / anlık envanter değeri (OrtalamaMaliyet
+        # bazlı). Geçmiş dönem envanter anlık görüntüsü tutulmadığından ortalama stok
+        # değeri yerine ANLIK stok değeri kullanılır - yaklaşık bir gösterge, kesin
+        # muhasebesel devir hızı değildir.
+        cursor.execute("SELECT ISNULL(SUM(MevcutMiktar * OrtalamaMaliyet), 0) FROM StokKartlari")
+        anlik_stok_degeri = float(cursor.fetchone()[0])
+        stok_devir_hizi = (toplam_maliyet / anlik_stok_degeri) if anlik_stok_degeri > 0 else 0.0
+
+        # Geç Teslimat Oranı: söz verilen teslim tarihi girilmiş VE fiilen teslim
+        # edilmiş siparişler arasında, gerçek teslimin söz verilenden geç kaldığı oran.
+        cursor.execute("""
+            SELECT COUNT(*), SUM(CASE WHEN GercekTeslimTarihi > SozVerilenTeslimTarihi THEN 1 ELSE 0 END)
+            FROM Siparisler WHERE SozVerilenTeslimTarihi IS NOT NULL AND GercekTeslimTarihi IS NOT NULL
+        """)
+        teslim_row = cursor.fetchone()
+        degerlendirilen_siparis = int(teslim_row[0]) if teslim_row and teslim_row[0] else 0
+        gec_teslim_sayisi = int(teslim_row[1]) if teslim_row and teslim_row[1] else 0
+        gec_teslimat_orani = (gec_teslim_sayisi / degerlendirilen_siparis * 100) if degerlendirilen_siparis > 0 else None
+
         return {
-            "ToplamCiro": toplam_ciro, 
-            "KasaNakit": toplam_kasa, 
-            "BekleyenSiparis": bekleyen_siparis, 
+            "ToplamCiro": toplam_ciro,
+            "KasaNakit": toplam_kasa,
+            "BekleyenSiparis": bekleyen_siparis,
             "MusteriSayisi": musteri_sayisi,
             "ToplamMaliyet": toplam_maliyet,
             "NetKar": net_kar,
-            "KarMarji": kar_marji
+            "KarMarji": kar_marji,
+            "StokDevirHizi": stok_devir_hizi,
+            "GecTeslimatOrani": gec_teslimat_orani,
+            "DegerlendirilenSiparisSayisi": degerlendirilen_siparis
         }
     finally:
         conn.close()
@@ -6887,7 +6920,7 @@ def siparis_toplu_faturaya_cevir(veri: TopluFaturayaCevirRequest, user: dict = D
                 cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'ÇIKIŞ', ?, ?)",
                                (stok_kod, miktar, f"Toplu Fatura - Sipariş #{siparis_id}"))
                 depo_stok_guncelle(cursor, stok_kod, varsayilan_depo_id(cursor), -miktar)
-                cursor.execute("UPDATE Siparisler SET Durum='Tamamlandı', TeslimEdilenMiktar=? WHERE SiparisID=?", (miktar, siparis_id))
+                cursor.execute("UPDATE Siparisler SET Durum='Tamamlandı', TeslimEdilenMiktar=?, GercekTeslimTarihi=GETDATE() WHERE SiparisID=?", (miktar, siparis_id))
                 stok_rezerve_coz(cursor, stok_kod, miktar)
 
                 yevmiye_fisi_olustur(cursor, f"Toplu Fatura - Sipariş #{siparis_id}", "TopluFatura", fatura_id, [
@@ -6921,8 +6954,9 @@ def siparis_ekle(siparis: SiparisEkleRequest, user: dict = Depends(yetki_kontrol
             return {"mesaj": f"Sipariş tutarı ({toplam:,.2f} TL) onay eşiğini ({esik:,.2f} TL) aştığı için onaya gönderildi.",
                     "OnayBekliyor": True, "OnayID": onay_id}
 
-        cursor.execute("INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar) VALUES (?, ?, ?, ?, ?, ?)",
-                       (siparis.MusteriID, siparis.StokKod, siparis.StokAdi, siparis.Miktar, siparis.BirimFiyat, toplam))
+        cursor.execute("""INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, SozVerilenTeslimTarihi)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (siparis.MusteriID, siparis.StokKod, siparis.StokAdi, siparis.Miktar, siparis.BirimFiyat, toplam, siparis.SozVerilenTeslimTarihi))
         log_islem(cursor, f"Yeni sipariş alındı: {siparis.StokAdi}", user["username"])
 
         # Stok Rezervasyonu: bu sipariş miktarını fiziksel olarak düşmeden "rezerve
@@ -6978,9 +7012,9 @@ def siparis_grup_ekle(veri: SiparisGrupEkleRequest, user: dict = Depends(yetki_k
         uyarilar = []
         for kalem in veri.Kalemler:
             toplam = kalem.Miktar * kalem.BirimFiyat
-            cursor.execute("""INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, ParaBirimi, SiparisGrupID)
-                               OUTPUT inserted.SiparisID VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                           (veri.MusteriID, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.BirimFiyat, toplam, kalem.ParaBirimi, grup_id))
+            cursor.execute("""INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, ParaBirimi, SiparisGrupID, SozVerilenTeslimTarihi)
+                               OUTPUT inserted.SiparisID VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           (veri.MusteriID, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.BirimFiyat, toplam, kalem.ParaBirimi, grup_id, veri.SozVerilenTeslimTarihi))
             siparis_idler.append(int(cursor.fetchone()[0]))
 
             if kalem.StokKod:
@@ -7033,7 +7067,9 @@ def siparis_durum_guncelle(veri: SiparisDurumGuncelle, user: dict = Depends(yetk
             raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
         eski_durum, stok_kod, miktar, teslim_edilen = eski_satir
 
-        cursor.execute("UPDATE Siparisler SET Durum=? WHERE SiparisID=?", (veri.Durum, veri.SiparisID))
+        cursor.execute("""UPDATE Siparisler SET Durum=?,
+                           GercekTeslimTarihi=CASE WHEN ?='Tamamlandı' THEN GETDATE() ELSE GercekTeslimTarihi END
+                           WHERE SiparisID=?""", (veri.Durum, veri.Durum, veri.SiparisID))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Sipariş bulunamadı.")
 
@@ -7437,7 +7473,9 @@ def fatura_kes(veri: FaturaOlusturRequest, background_tasks: BackgroundTasks, us
             teslim_bu_faturada = sum(k.Miktar for k in veri.Kalemler if k.StokKod == sip_stok_kod)
             yeni_teslim = min(sip_teslim + teslim_bu_faturada, sip_miktar)
             yeni_durum = "Tamamlandı" if yeni_teslim >= sip_miktar - 0.0001 else "Kısmi Teslim"
-            cursor.execute("UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=? WHERE SiparisID=?", (yeni_teslim, yeni_durum, sid))
+            cursor.execute("""UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=?,
+                               GercekTeslimTarihi=CASE WHEN ?='Tamamlandı' THEN GETDATE() ELSE GercekTeslimTarihi END
+                               WHERE SiparisID=?""", (yeni_teslim, yeni_durum, yeni_durum, sid))
             if sip_stok_kod and teslim_bu_faturada > 0:
                 stok_rezerve_coz(cursor, sip_stok_kod, teslim_bu_faturada)
             ilgili_kalem = next((k for k in veri.Kalemler if k.StokKod == sip_stok_kod), None)
@@ -8906,9 +8944,27 @@ class UretimPlanlaRequest(BaseModel):
 
 @app.put("/uretim-emri-planla")
 def uretim_emri_planla(veri: UretimPlanlaRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Üretim"]))):
+    """Bir üretim emrini bir hatta ve tarih aralığına planlar. Aynı hatta, aynı tarih
+    aralığında başka bir emir zaten planlanmışsa (çift rezervasyon) sert bir 400 ile
+    engeller - önceden hiçbir çakışma kontrolü yoktu, iki emir aynı hatta aynı haftaya
+    planlanabiliyordu."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        cursor.execute("""
+            SELECT e.EmirID, ISNULL(s.StokAdi, r.MamulKodu), e.PlaniBaslangic, e.PlaniBitis
+            FROM UretimEmirleri e
+            LEFT JOIN UretimReceteleri r ON e.ReceteID = r.ReceteID
+            LEFT JOIN StokKartlari s ON r.MamulKodu = s.StokKod
+            WHERE e.HatID = ? AND e.EmirID <> ? AND e.Durum <> 'İptal'
+              AND e.PlaniBaslangic IS NOT NULL AND e.PlaniBitis IS NOT NULL
+              AND e.PlaniBaslangic <= ? AND e.PlaniBitis >= ?
+        """, (veri.HatID, veri.EmirID, veri.PlaniBitis, veri.PlaniBaslangic))
+        cakisan = cursor.fetchone()
+        if cakisan:
+            raise HTTPException(status_code=400, detail=(
+                f"Bu hat, {str(cakisan[2])[:10]} - {str(cakisan[3])[:10]} tarihleri arasında "
+                f"#{cakisan[0]} ({cakisan[1]}) emrine ayrılmış. Çakışan bir tarih aralığı seçtiniz."))
         cursor.execute("""UPDATE UretimEmirleri SET HatID=?, PlaniBaslangic=?, PlaniBitis=? WHERE EmirID=?""",
                        (veri.HatID, veri.PlaniBaslangic, veri.PlaniBitis, veri.EmirID))
         if cursor.rowcount == 0:
