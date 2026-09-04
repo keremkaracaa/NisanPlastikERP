@@ -5029,6 +5029,8 @@ class MainApp(ctk.CTkToplevel):
             self.init_kullanici_yonetimi()
             self.tab_onay_zincirleri = yeni_sekme("🔗 Onay Zincirleri")
             self.init_onay_zincirleri()
+            self.tab_dokuman_kontrol = yeni_sekme("📋 Kalite Doküman Kontrolü")
+            self.init_dokuman_kontrol()
 
         sidebar_yeniden_diz()  # Sidebar'ı ilk kez kaydedilen sırayla ve doğru aç/kapa durumlarıyla çiz
         self.sekmeye_git("📊 Finans Özet")  # açılışta varsayılan olarak Dashboard görünsün
@@ -6661,6 +6663,32 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(bakim_cerceve, text="✅ Seçileni Tamamla", fg_color="#16a34a", hover_color="#15803d",
                       command=self.makine_bakim_tamamla_islem).pack(anchor="w", padx=10, pady=(0, 10))
 
+        enerji_cerceve = ctk.CTkFrame(self.tab_uretim_planlama, fg_color=RENK_KART, corner_radius=8)
+        enerji_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(enerji_cerceve, text="⚡ Enerji Tüketimi / Maliyeti", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        enerji_satiri1 = ctk.CTkFrame(enerji_cerceve, fg_color="transparent")
+        enerji_satiri1.pack(fill="x", padx=10, pady=(0, 5))
+        self.en_hat_secim = ctk.CTkOptionMenu(enerji_satiri1, values=["Yükleniyor..."], width=180)
+        self.en_hat_secim.pack(side="left", padx=(0, 8))
+        self.en_baslangic = ctk.CTkEntry(enerji_satiri1, placeholder_text="Başlangıç (YYYY-AA-GG)", width=140)
+        self.en_baslangic.pack(side="left", padx=(0, 8))
+        self.en_bitis = ctk.CTkEntry(enerji_satiri1, placeholder_text="Bitiş (YYYY-AA-GG)", width=140)
+        self.en_bitis.pack(side="left", padx=(0, 8))
+        enerji_satiri2 = ctk.CTkFrame(enerji_cerceve, fg_color="transparent")
+        enerji_satiri2.pack(fill="x", padx=10, pady=(0, 5))
+        self.en_kwh = ctk.CTkEntry(enerji_satiri2, placeholder_text="Tüketim (kWh)", width=140)
+        self.en_kwh.pack(side="left", padx=(0, 8))
+        self.en_birim_fiyat = ctk.CTkEntry(enerji_satiri2, placeholder_text="Birim Fiyat (TL/kWh)", width=150)
+        self.en_birim_fiyat.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(enerji_satiri2, text="+ Kayıt Ekle", fg_color="#f97316", hover_color="#c2410c",
+                      command=self.enerji_tuketim_ekle_islem).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(enerji_satiri2, text="📊 Maliyet Raporu", fg_color="#7c3aed", hover_color="#6d28d9",
+                      command=self.enerji_maliyet_raporu_goster).pack(side="left")
+        enerji_liste_cerceve, self.enerji_tree = tablo_olustur(
+            enerji_cerceve, ["ID", "Hat", "Başlangıç", "Bitiş", "kWh", "TL/kWh", "Toplam Maliyet"],
+            [40, 130, 100, 100, 80, 80, 110], height=5)
+        enerji_liste_cerceve.pack(fill="x", padx=10, pady=(5, 10))
+
         planla_cerceve = ctk.CTkFrame(self.tab_uretim_planlama, fg_color=RENK_KART, corner_radius=8)
         planla_cerceve.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkLabel(planla_cerceve, text="Üretim Emrini Çizelgeye Ekle", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
@@ -6684,6 +6712,7 @@ class MainApp(ctk.CTkToplevel):
         self._up_hatlar_cache = []
         self.uretim_planlama_yenile()
         self.makine_bakimlarini_yukle()
+        self.enerji_tuketimlerini_yukle()
 
     def uretim_hatti_ekle_islem(self):
         ad = self.up_yeni_hat_entry.get().strip()
@@ -6741,6 +6770,9 @@ class MainApp(ctk.CTkToplevel):
             self.bk_hat_secim.configure(values=hat_isimleri)
             if hatlar:
                 self.bk_hat_secim.set(hat_isimleri[0])
+            self.en_hat_secim.configure(values=hat_isimleri)
+            if hatlar:
+                self.en_hat_secim.set(hat_isimleri[0])
 
             emir_res = requests.get(f"{API}/uretim-emirleri", headers=self.req_headers(), timeout=5)
             emirler = emir_res.json().get("emirler", []) if emir_res.status_code == 200 else []
@@ -7162,6 +7194,70 @@ class MainApp(ctk.CTkToplevel):
                 self.bakim_tree.insert("", "end", iid=str(b["BakimID"]),
                                         values=(b["BakimID"], b["HatAdi"], b["BakimTuru"], b["BaslangicTarihi"],
                                                 b["BitisTarihi"], b["Aciklama"], b["Durum"]))
+        except Exception:
+            pass
+
+    def enerji_tuketim_ekle_islem(self):
+        hat_adi = self.en_hat_secim.get()
+        hat_id = next((h["HatID"] for h in self._up_hatlar_cache if h["HatAdi"] == hat_adi), None)
+        if hat_id is None:
+            messagebox.showwarning("Eksik Bilgi", "Bir üretim hattı seçin.")
+            return
+        baslangic, bitis = self.en_baslangic.get().strip(), self.en_bitis.get().strip()
+        if not baslangic or not bitis:
+            messagebox.showwarning("Eksik Bilgi", "Başlangıç ve bitiş tarihlerini YYYY-AA-GG formatında girin.")
+            return
+        try:
+            kwh = float(self.en_kwh.get())
+            birim_fiyat = float(self.en_birim_fiyat.get())
+        except ValueError:
+            messagebox.showwarning("Hatalı Değer", "Tüketim ve birim fiyat sayısal olmalıdır.")
+            return
+        data = {"HatID": hat_id, "BaslangicTarihi": baslangic, "BitisTarihi": bitis, "TuketimKWh": kwh, "BirimFiyatKWh": birim_fiyat}
+        try:
+            res = requests.post(f"{API}/enerji-tuketim-ekle", json=data, headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                for e in (self.en_baslangic, self.en_bitis, self.en_kwh, self.en_birim_fiyat):
+                    e.delete(0, "end")
+                self.enerji_tuketimlerini_yukle()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kayıt eklendi."))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def enerji_tuketimlerini_yukle(self):
+        try:
+            res = requests.get(f"{API}/enerji-tuketim-listesi", headers=self.req_headers(), timeout=5)
+            for i in self.enerji_tree.get_children():
+                self.enerji_tree.delete(i)
+            for k in res.json().get("kayitlar", []):
+                self.enerji_tree.insert("", "end", iid=str(k["KayitID"]),
+                                         values=(k["KayitID"], k["HatAdi"], k["BaslangicTarihi"], k["BitisTarihi"],
+                                                 f"{k['TuketimKWh']:g}", f"{k['BirimFiyatKWh']:g}", f"{k['ToplamMaliyet']:,.2f} TL"))
+        except Exception:
+            pass
+
+    def enerji_maliyet_raporu_goster(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Enerji Maliyet Raporu")
+        pencere.geometry("620x420")
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+        ctk.CTkLabel(pencere, text="📊 Hat Bazlı Enerji Maliyet Raporu", font=("Arial", 14, "bold"), text_color="#f97316").pack(pady=(15, 5))
+        ctk.CTkLabel(pencere, text="'Birim Başına Maliyet' sadece o hatta HatID'si atanmış, tamamlanmış üretim emri varsa hesaplanabilir.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=580, justify="left").pack(pady=(0, 10))
+        cerceve, tree = tablo_olustur(pencere, ["Hat", "Toplam kWh", "Toplam Maliyet", "Üretim Miktarı", "Birim Başına Maliyet"],
+                                       [140, 100, 120, 110, 140], height=10)
+        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        try:
+            res = requests.get(f"{API}/enerji-maliyet-raporu", headers=self.req_headers(), timeout=8)
+            for r in res.json().get("rapor", []):
+                birim_metin = f"{r['BirimBasinaMaliyet']:,.4f} TL" if r["BirimBasinaMaliyet"] is not None else "Veri Yok"
+                tree.insert("", "end", values=(r["HatAdi"], f"{r['ToplamKWh']:g}", f"{r['ToplamMaliyet']:,.2f} TL",
+                                                f"{r['UretimMiktari']:g}", birim_metin))
         except Exception:
             pass
 
@@ -11337,6 +11433,190 @@ class MainApp(ctk.CTkToplevel):
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def init_dokuman_kontrol(self):
+        ust = ctk.CTkFrame(self.tab_dokuman_kontrol, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="📋 Kalite Doküman Kontrolü", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
+        ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=self.dokumanlari_yukle).pack(side="right")
+        ctk.CTkLabel(self.tab_dokuman_kontrol,
+                     text="Prosedür/talimat gibi resmi dokümanları versiyonlayıp onay altına alır (ISO 9001 doküman kontrolü). "
+                          "Not: Bu, genel 'Doküman Arşivi' (sözleşme/teklif için) ile AYNI şey değildir - burası versiyon "
+                          "geçmişi ve onay iş akışı gerektiren resmi dokümanlar içindir. Yeni yüklenen bir versiyon, bir "
+                          "Yönetici onaylayana kadar 'taslak' sayılır; önceki yürürlükteki versiyon geçerliliğini korur.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+
+        yukle_cerceve = ctk.CTkFrame(self.tab_dokuman_kontrol, fg_color=RENK_KART, corner_radius=8)
+        yukle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(yukle_cerceve, text="Yeni Doküman Ekle", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        satir1 = ctk.CTkFrame(yukle_cerceve, fg_color="transparent")
+        satir1.pack(fill="x", padx=10, pady=(0, 5))
+        self.dk_dosya_yolu = ctk.StringVar(value="")
+        ctk.CTkButton(satir1, text="📎 Dosya Seç", fg_color="#7c3aed", hover_color="#6d28d9",
+                      command=self.dk_dosya_sec).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(satir1, textvariable=self.dk_dosya_yolu, font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=300).pack(side="left")
+        satir2 = ctk.CTkFrame(yukle_cerceve, fg_color="transparent")
+        satir2.pack(fill="x", padx=10, pady=(0, 10))
+        self.dk_ad = ctk.CTkEntry(satir2, placeholder_text="Doküman Adı (örn: Üretim Prosedürü PR-01)", width=300)
+        self.dk_ad.pack(side="left", padx=(0, 8))
+        self.dk_kategori = ctk.CTkOptionMenu(satir2, values=["Prosedür", "Talimat", "Form", "Politika"], width=130)
+        self.dk_kategori.pack(side="left", padx=(0, 8))
+        self.dk_aciklama = ctk.CTkEntry(satir2, placeholder_text="Açıklama (opsiyonel)", width=220)
+        self.dk_aciklama.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(satir2, text="⬆️ Yükle", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.dokuman_ekle_islem).pack(side="left")
+
+        ctk.CTkLabel(self.tab_dokuman_kontrol, text="Bir dokümana çift tıklayarak versiyon geçmişini/onay ekranını açabilirsiniz.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
+        liste_cerceve, self.dokuman_tree = tablo_olustur(
+            self.tab_dokuman_kontrol, ["ID", "Ad", "Kategori", "Güncel Versiyon", "Durum", "Son Onay"], [40, 260, 110, 110, 110, 130], height=14)
+        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.dokuman_tree.bind("<Double-Button-1>", lambda e: self.dokuman_versiyon_penceresi())
+
+        self.dokumanlari_yukle()
+
+    def dk_dosya_sec(self):
+        yol = filedialog.askopenfilename(title="Yüklenecek Dosyayı Seçin")
+        if yol:
+            self.dk_dosya_yolu.set(os.path.basename(yol))
+            self._dk_secili_dosya_tam_yol = yol
+
+    def dokuman_ekle_islem(self):
+        tam_yol = getattr(self, "_dk_secili_dosya_tam_yol", None)
+        if not tam_yol:
+            messagebox.showwarning("Eksik Bilgi", "Lütfen önce bir dosya seçin.")
+            return
+        ad = self.dk_ad.get().strip()
+        if not ad:
+            messagebox.showwarning("Eksik Bilgi", "Doküman adı zorunludur.")
+            return
+        try:
+            with open(tam_yol, "rb") as f:
+                dosyalar = {"dosya": (os.path.basename(tam_yol), f)}
+                form_data = {"Ad": ad, "Kategori": self.dk_kategori.get(), "Aciklama": self.dk_aciklama.get().strip() or ""}
+                res = requests.post(f"{API}/kontrollu-dokuman-ekle", files=dosyalar, data=form_data, headers=self.req_headers(), timeout=30)
+            if res.status_code == 200:
+                self.dk_dosya_yolu.set("")
+                self._dk_secili_dosya_tam_yol = None
+                self.dk_ad.delete(0, "end")
+                self.dk_aciklama.delete(0, "end")
+                self.dokumanlari_yukle()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def dokumanlari_yukle(self):
+        try:
+            res = requests.get(f"{API}/kontrollu-dokumanlar", headers=self.req_headers(), timeout=6)
+            for i in self.dokuman_tree.get_children():
+                self.dokuman_tree.delete(i)
+            for d in res.json().get("dokumanlar", []):
+                versiyon_metni = f"v{d['GuncelVersiyonNo']}" if d["GuncelVersiyonNo"] else "-"
+                self.dokuman_tree.insert("", "end", iid=str(d["DokumanID"]),
+                                          values=(d["DokumanID"], d["Ad"], d["Kategori"], versiyon_metni,
+                                                  d["Durum"], d["SonOnayTarihi"] or "-"))
+        except Exception:
+            pass
+
+    def dokuman_versiyon_penceresi(self):
+        secili = self.dokuman_tree.selection()
+        if not secili:
+            return
+        dokuman_id = secili[0]
+        dokuman_adi = self.dokuman_tree.item(secili[0])["values"][1]
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title(f"{dokuman_adi} — Versiyon Geçmişi")
+        pencere.geometry("680x480")
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+        ctk.CTkLabel(pencere, text=f"🕓 {dokuman_adi} — Versiyon Geçmişi", font=("Arial", 14, "bold"), text_color="#f97316").pack(pady=(15, 10))
+
+        cerceve, tree = tablo_olustur(pencere, ["Versiyon ID", "No", "Durum", "Not", "Hazırlayan", "Onaylayan", "Onay Tarihi"],
+                                       [80, 40, 90, 150, 100, 100, 130], height=10)
+        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        def gecmisi_yukle():
+            for i in tree.get_children():
+                tree.delete(i)
+            try:
+                res = requests.get(f"{API}/dokuman-versiyon-gecmisi/{dokuman_id}", headers=self.req_headers(), timeout=6)
+                for v in res.json().get("versiyonlar", []):
+                    tree.insert("", "end", iid=str(v["VersiyonID"]),
+                                values=(v["VersiyonID"], v["VersiyonNo"], v["Durum"], v["DegisiklikNotu"],
+                                        v["HazirlayanKullanici"], v["OnaylayanKullanici"], v["OnayTarihi"]))
+            except Exception:
+                pass
+        gecmisi_yukle()
+
+        def indir():
+            sec = tree.selection()
+            if not sec:
+                return
+            try:
+                res = requests.get(f"{API}/dokuman-versiyon-indir/{sec[0]}", headers=self.req_headers(), timeout=15)
+                if res.status_code == 200:
+                    dosya_adi = tree.item(sec[0])["values"][0]
+                    hedef = filedialog.asksaveasfilename(initialfile=f"versiyon_{dosya_adi}")
+                    if hedef:
+                        with open(hedef, "wb") as f:
+                            f.write(res.content)
+                        messagebox.showinfo("İndirildi", f"Dosya kaydedildi: {hedef}")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        def onayla():
+            sec = tree.selection()
+            if not sec:
+                messagebox.showinfo("Seçim Yok", "Lütfen onaylanacak versiyonu seçin.")
+                return
+            if not messagebox.askyesno("Onay", "Bu versiyon yürürlüğe alınacak, önceki yürürlükteki versiyon otomatik arşive düşecek. Emin misiniz?"):
+                return
+            try:
+                res = requests.put(f"{API}/dokuman-versiyon-onayla/{sec[0]}", headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    gecmisi_yukle()
+                    self.dokumanlari_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        def yeni_versiyon_yukle():
+            yol = filedialog.askopenfilename(title="Yeni Versiyon Dosyasını Seçin")
+            if not yol:
+                return
+            not_metni = simpledialog.askstring("Değişiklik Notu", "Bu versiyonda ne değişti? (opsiyonel)") or ""
+            try:
+                with open(yol, "rb") as f:
+                    dosyalar = {"dosya": (os.path.basename(yol), f)}
+                    res = requests.post(f"{API}/kontrollu-dokuman/{dokuman_id}/yeni-versiyon", files=dosyalar,
+                                         data={"DegisiklikNotu": not_metni}, headers=self.req_headers(), timeout=30)
+                if res.status_code == 200:
+                    gecmisi_yukle()
+                    self.dokumanlari_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        buton_satiri = ctk.CTkFrame(pencere, fg_color="transparent")
+        buton_satiri.pack(pady=10)
+        ctk.CTkButton(buton_satiri, text="🆕 Yeni Versiyon Yükle", fg_color="#7c3aed", hover_color="#6d28d9",
+                      command=yeni_versiyon_yukle).pack(side="left", padx=6)
+        ctk.CTkButton(buton_satiri, text="✅ Seçileni Onayla", fg_color="#16a34a", hover_color="#15803d",
+                      command=onayla).pack(side="left", padx=6)
+        ctk.CTkButton(buton_satiri, text="⬇️ Seçileni İndir", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=indir).pack(side="left", padx=6)
 
 if __name__ == "__main__":
     app = LoginWindow()

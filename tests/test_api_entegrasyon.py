@@ -503,6 +503,122 @@ class TestStokHizliHareket:
         assert yanit.status_code in (401, 403)
 
 
+class TestEnerjiTuketim:
+    def test_enerji_tuketim_ekle_maliyet_dogru_hesaplanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(3,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/enerji-tuketim-ekle", json={
+            "HatID": 1, "BaslangicTarihi": "2026-08-01", "BitisTarihi": "2026-08-31",
+            "TuketimKWh": 1000, "BirimFiyatKWh": 3.5
+        })
+        assert yanit.status_code == 200
+        assert yanit.json()["ToplamMaliyet"] == 3500.0
+
+    def test_enerji_tuketim_ekle_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/enerji-tuketim-ekle", json={
+            "HatID": 1, "BaslangicTarihi": "2026-08-01", "BitisTarihi": "2026-08-31",
+            "TuketimKWh": 1000, "BirimFiyatKWh": 3.5
+        })
+        assert yanit.status_code in (401, 403)
+
+    def test_enerji_maliyet_raporu_uretim_varken_oran_hesaplar(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchall.return_value = [(1, 3500.0, 1000.0)]  # HatID, ToplamMaliyet, ToplamKWh
+        cursor.fetchone.side_effect = [("Hat 1",), (500.0,)]  # HatAdi, UretimMiktari
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/enerji-maliyet-raporu")
+        assert yanit.status_code == 200
+        rapor = yanit.json()["rapor"][0]
+        assert rapor["BirimBasinaMaliyet"] == 7.0  # 3500 / 500
+
+    def test_enerji_maliyet_raporu_uretim_yoksa_oran_hesaplanmaz(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchall.return_value = [(1, 3500.0, 1000.0)]
+        cursor.fetchone.side_effect = [("Hat 1",), (0.0,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/enerji-maliyet-raporu")
+        assert yanit.status_code == 200
+        rapor = yanit.json()["rapor"][0]
+        assert rapor["BirimBasinaMaliyet"] is None
+        assert "Not" in rapor
+
+
+class TestKontrolluDokuman:
+    def test_dokuman_ekle_basarili(self, client, monkeypatch, tmp_path):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1,), (10,)]  # DokumanID, VersiyonID
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.chdir(tmp_path)
+
+        yanit = client.post("/kontrollu-dokuman-ekle", data={"Ad": "Kalite El Kitabı", "Kategori": "Prosedür"},
+                             files={"dosya": ("kalite.pdf", b"icerik", "application/pdf")})
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["DokumanID"] == 1 and veri["VersiyonID"] == 10
+
+    def test_dokuman_ekle_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/kontrollu-dokuman-ekle", data={"Ad": "x"}, files={"dosya": ("a.pdf", b"x", "application/pdf")})
+        assert yanit.status_code in (401, 403)
+
+    def test_yeni_versiyon_basarili(self, client, monkeypatch, tmp_path):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1, "Kalite El Kitabı"), (1,), (11,)]  # doküman, max versiyon, yeni versiyon id
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.chdir(tmp_path)
+
+        yanit = client.post("/kontrollu-dokuman/1/yeni-versiyon", data={"DegisiklikNotu": "Revizyon 2"},
+                             files={"dosya": ("kalite_v2.pdf", b"icerik2", "application/pdf")})
+        assert yanit.status_code == 200
+        assert yanit.json()["VersiyonNo"] == 2
+
+    def test_yeni_versiyon_dokuman_bulunamadi_404_doner(self, client, monkeypatch, tmp_path):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.chdir(tmp_path)
+
+        yanit = client.post("/kontrollu-dokuman/999/yeni-versiyon", data={}, files={"dosya": ("x.pdf", b"x", "application/pdf")})
+        assert yanit.status_code == 404
+
+    def test_versiyon_onayla_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1, "TASLAK"))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/dokuman-versiyon-onayla/11")
+        assert yanit.status_code == 200
+        # Önceki yürürlükteki versiyonu arşive düşüren UPDATE çalıştırılmış olmalı.
+        arsive_dusuren_cagrilar = [c for c in cursor.execute.call_args_list if "ARSIVDE" in c.args[0]]
+        assert len(arsive_dusuren_cagrilar) == 1
+
+    def test_versiyon_onayla_zaten_yururlukteyse_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1, "YURURLUKTE"))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/dokuman-versiyon-onayla/11")
+        assert yanit.status_code == 400
+
+    def test_versiyon_onayla_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.put("/dokuman-versiyon-onayla/11")
+        assert yanit.status_code in (401, 403)
+
+    def test_dokumanlar_listesi(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchall.return_value = [(1, "Kalite El Kitabı", "Prosedür", None, "2026-01-01")]
+        cursor.fetchone.return_value = (10, 2, "YURURLUKTE", "2026-02-01")
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/kontrollu-dokumanlar")
+        assert yanit.status_code == 200
+        dokuman = yanit.json()["dokumanlar"][0]
+        assert dokuman["GuncelVersiyonNo"] == 2
+        assert dokuman["Durum"] == "YURURLUKTE"
+
+
 class _MrpSahteCursor:
     """MRP hesaplama fonksiyonu tek bir cursor üzerinden birden çok FARKLI SELECT
     çalıştırdığı için (talep, reçete, bileşen, stok, açık üretim, açık talep),

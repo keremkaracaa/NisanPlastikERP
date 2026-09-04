@@ -2432,6 +2432,24 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _enerji_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Enerji migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _dokuman_kontrol_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Doküman kontrol migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -2701,6 +2719,56 @@ def _onay_zinciri_migrationlari(cursor):
             cursor.connection.rollback()
         except Exception:
             pass
+
+def _enerji_migrationlari(cursor):
+    """Enerji Maliyeti Takibi için tablo eklemesi - diğer yeni özellik migration'ları
+    gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='EnerjiTuketimKayitlari' and xtype='U')
+        CREATE TABLE EnerjiTuketimKayitlari (
+            KayitID INT IDENTITY(1,1) PRIMARY KEY,
+            HatID INT NOT NULL FOREIGN KEY REFERENCES UretimHatlari(HatID),
+            BaslangicTarihi DATE NOT NULL,
+            BitisTarihi DATE NOT NULL,
+            TuketimKWh FLOAT NOT NULL,
+            BirimFiyatKWh FLOAT NOT NULL,
+            ToplamMaliyet FLOAT NOT NULL,
+            Aciklama NVARCHAR(255) NULL,
+            KullaniciAdi NVARCHAR(50) NOT NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "EnerjiTuketimKayitlari tablosu")
+
+def _dokuman_kontrol_migrationlari(cursor):
+    """ISO/Kalite Doküman Kontrolü için tablo eklemesi - diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='KontrolluDokumanlar' and xtype='U')
+        CREATE TABLE KontrolluDokumanlar (
+            DokumanID INT IDENTITY(1,1) PRIMARY KEY,
+            Ad NVARCHAR(200) NOT NULL,
+            Kategori NVARCHAR(50) NOT NULL DEFAULT 'Prosedür',
+            Aciklama NVARCHAR(500) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE(),
+            OlusturanKullanici NVARCHAR(50) NOT NULL
+        )
+    """, "KontrolluDokumanlar tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='DokumanVersiyonlari' and xtype='U')
+        CREATE TABLE DokumanVersiyonlari (
+            VersiyonID INT IDENTITY(1,1) PRIMARY KEY,
+            DokumanID INT NOT NULL FOREIGN KEY REFERENCES KontrolluDokumanlar(DokumanID),
+            VersiyonNo INT NOT NULL,
+            DosyaAdi NVARCHAR(255) NOT NULL,
+            DosyaYolu NVARCHAR(500) NOT NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'TASLAK',
+            DegisiklikNotu NVARCHAR(500) NULL,
+            HazirlayanKullanici NVARCHAR(50) NOT NULL,
+            OnaylayanKullanici NVARCHAR(50) NULL,
+            OnayTarihi DATETIME NULL,
+            YuklemeTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "DokumanVersiyonlari tablosu")
 
 @app.post("/virman-yap")
 def virman_yap(req: VirmanRequest, current_user: dict = Depends(get_current_user)):
@@ -4895,6 +4963,169 @@ def belge_sil(belge_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"])))
         log_islem(cursor, f"Belge silindi: #{belge_id}", user["username"])
         conn.commit()
         return {"mesaj": "Belge silindi."}
+    finally:
+        conn.close()
+
+# --- ISO/KALİTE DOKÜMAN KONTROLÜ ---
+# Belgeler/belge-yukle (yukarıda) ile KARIŞTIRILMAMALI - o genel sözleşme/teklif
+# arşivi için düz, versiyonsuz bir sistemdir. Bu ise versiyonlu, onay iş akışlı
+# "kontrollü doküman" (ISO 9001 prosedür/talimat) sistemidir - bilinçli olarak
+# ayrı tablolar/klasör kullanır (belgeler/kontrollu/), karışmasın diye.
+KONTROLLU_DOKUMAN_KLASORU = os.path.join(BELGE_KLASORU, "kontrollu")
+
+@app.post("/kontrollu-dokuman-ekle")
+def kontrollu_dokuman_ekle(dosya: UploadFile = File(...), Ad: str = Form(...), Kategori: str = Form("Prosedür"),
+                            Aciklama: Optional[str] = Form(None), user: dict = Depends(yetki_kontrol(["Yönetici", "Master"]))):
+    """Yeni bir kontrollü doküman oluşturur ve ilk versiyonunu (VersiyonNo=1,
+    Durum='TASLAK') yükler. Doküman, bir Yönetici onaylayana kadar (bkz.
+    /dokuman-versiyon-onayla) resmi olarak 'yürürlükte' sayılmaz."""
+    try:
+        os.makedirs(KONTROLLU_DOKUMAN_KLASORU, exist_ok=True)
+        guvenli_ad = f"{int(time.time()*1000)}_{dosya.filename}"
+        hedef_yol = os.path.join(KONTROLLU_DOKUMAN_KLASORU, guvenli_ad)
+        with open(hedef_yol, "wb") as f:
+            f.write(dosya.file.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Dosya kaydedilemedi: {e}")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO KontrolluDokumanlar (Ad, Kategori, Aciklama, OlusturanKullanici) OUTPUT inserted.DokumanID VALUES (?, ?, ?, ?)",
+                       (Ad, Kategori, Aciklama, user["username"]))
+        dokuman_id = int(cursor.fetchone()[0])
+        cursor.execute("""INSERT INTO DokumanVersiyonlari (DokumanID, VersiyonNo, DosyaAdi, DosyaYolu, HazirlayanKullanici)
+                           OUTPUT inserted.VersiyonID VALUES (?, 1, ?, ?, ?)""",
+                       (dokuman_id, dosya.filename, hedef_yol, user["username"]))
+        versiyon_id = int(cursor.fetchone()[0])
+        log_islem(cursor, f"Kontrollü doküman eklendi: {Ad} (v1)", user["username"])
+        conn.commit()
+        return {"mesaj": f"'{Ad}' oluşturuldu (v1, taslak). Yürürlüğe girmesi için bir Yönetici'nin onaylaması gerekir.",
+                "DokumanID": dokuman_id, "VersiyonID": versiyon_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.post("/kontrollu-dokuman/{dokuman_id}/yeni-versiyon")
+def kontrollu_dokuman_yeni_versiyon(dokuman_id: int, dosya: UploadFile = File(...), DegisiklikNotu: Optional[str] = Form(None),
+                                     user: dict = Depends(yetki_kontrol(["Yönetici", "Master"]))):
+    """Var olan bir dokümana yeni bir TASLAK versiyon ekler - önceki YÜRÜRLÜKTEKİ
+    versiyona DOKUNMAZ, o hâlâ geçerli kalır ta ki bu yeni versiyon onaylanana kadar
+    (bkz. /dokuman-versiyon-onayla) - böylece 'onay bekleyen bir taslak var' diye
+    kullanıcılar elinde geçersiz bir doküman kalmaz."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT DokumanID, Ad FROM KontrolluDokumanlar WHERE DokumanID=?", (dokuman_id,))
+        dokuman = cursor.fetchone()
+        if not dokuman:
+            raise HTTPException(status_code=404, detail="Doküman bulunamadı.")
+
+        try:
+            os.makedirs(KONTROLLU_DOKUMAN_KLASORU, exist_ok=True)
+            guvenli_ad = f"{int(time.time()*1000)}_{dosya.filename}"
+            hedef_yol = os.path.join(KONTROLLU_DOKUMAN_KLASORU, guvenli_ad)
+            with open(hedef_yol, "wb") as f:
+                f.write(dosya.file.read())
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Dosya kaydedilemedi: {e}")
+
+        cursor.execute("SELECT ISNULL(MAX(VersiyonNo),0) FROM DokumanVersiyonlari WHERE DokumanID=?", (dokuman_id,))
+        yeni_versiyon_no = int(cursor.fetchone()[0]) + 1
+        cursor.execute("""INSERT INTO DokumanVersiyonlari (DokumanID, VersiyonNo, DosyaAdi, DosyaYolu, DegisiklikNotu, HazirlayanKullanici)
+                           OUTPUT inserted.VersiyonID VALUES (?, ?, ?, ?, ?, ?)""",
+                       (dokuman_id, yeni_versiyon_no, dosya.filename, hedef_yol, DegisiklikNotu, user["username"]))
+        versiyon_id = int(cursor.fetchone()[0])
+        log_islem(cursor, f"Yeni doküman versiyonu yüklendi: {dokuman[1]} (v{yeni_versiyon_no})", user["username"])
+        conn.commit()
+        return {"mesaj": f"v{yeni_versiyon_no} yüklendi (taslak). Yürürlüğe girmesi için onaylanmalı.",
+                "VersiyonID": versiyon_id, "VersiyonNo": yeni_versiyon_no}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+@app.put("/dokuman-versiyon-onayla/{versiyon_id}")
+def dokuman_versiyon_onayla(versiyon_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    """Bir taslak versiyonu YÜRÜRLÜĞE koyar. Aynı dokümana ait ÖNCEKİ yürürlükteki
+    versiyon (varsa) otomatik olarak ARŞİVE düşer - SİLİNMEZ, denetim/izlenebilirlik
+    için kalıcı olarak saklanır (ISO doküman kontrolünün temel gerekliliği)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT DokumanID, Durum FROM DokumanVersiyonlari WHERE VersiyonID=?", (versiyon_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Versiyon bulunamadı.")
+        dokuman_id, durum = row[0], row[1]
+        if durum == "YURURLUKTE":
+            raise HTTPException(status_code=400, detail="Bu versiyon zaten yürürlükte.")
+
+        cursor.execute("UPDATE DokumanVersiyonlari SET Durum='ARSIVDE' WHERE DokumanID=? AND Durum='YURURLUKTE'", (dokuman_id,))
+        cursor.execute("""UPDATE DokumanVersiyonlari SET Durum='YURURLUKTE', OnaylayanKullanici=?, OnayTarihi=GETDATE()
+                           WHERE VersiyonID=?""", (user["username"], versiyon_id))
+        log_islem(cursor, f"Doküman versiyonu onaylandı ve yürürlüğe alındı: #{versiyon_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Versiyon onaylandı ve yürürlüğe alındı. Önceki yürürlükteki versiyon (varsa) arşive alındı."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+@app.get("/kontrollu-dokumanlar")
+def kontrollu_dokumanlar_getir(user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT DokumanID, Ad, Kategori, Aciklama, OlusturmaTarihi FROM KontrolluDokumanlar ORDER BY Ad")
+        dokumanlar = []
+        for r in cursor.fetchall():
+            dokuman_id = r[0]
+            cursor.execute("""SELECT TOP 1 VersiyonID, VersiyonNo, Durum, OnayTarihi FROM DokumanVersiyonlari
+                               WHERE DokumanID=? ORDER BY CASE WHEN Durum='YURURLUKTE' THEN 0 ELSE 1 END, VersiyonNo DESC""", (dokuman_id,))
+            guncel = cursor.fetchone()
+            dokumanlar.append({"DokumanID": dokuman_id, "Ad": r[1], "Kategori": r[2], "Aciklama": r[3] or "",
+                                "OlusturmaTarihi": str(r[4])[:16],
+                                "GuncelVersiyonNo": guncel[1] if guncel else None,
+                                "GuncelVersiyonID": guncel[0] if guncel else None,
+                                "Durum": guncel[2] if guncel else "TASLAK",
+                                "SonOnayTarihi": str(guncel[3])[:16] if guncel and guncel[3] else None})
+        return {"dokumanlar": dokumanlar}
+    finally:
+        conn.close()
+
+@app.get("/dokuman-versiyon-gecmisi/{dokuman_id}")
+def dokuman_versiyon_gecmisi(dokuman_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT VersiyonID, VersiyonNo, Durum, DegisiklikNotu, HazirlayanKullanici,
+                                  OnaylayanKullanici, OnayTarihi, YuklemeTarihi
+                           FROM DokumanVersiyonlari WHERE DokumanID=? ORDER BY VersiyonNo DESC""", (dokuman_id,))
+        return {"versiyonlar": [{"VersiyonID": r[0], "VersiyonNo": r[1], "Durum": r[2], "DegisiklikNotu": r[3] or "",
+                                  "HazirlayanKullanici": r[4], "OnaylayanKullanici": r[5] or "-",
+                                  "OnayTarihi": str(r[6])[:16] if r[6] else "-", "YuklemeTarihi": str(r[7])[:16]}
+                                 for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/dokuman-versiyon-indir/{versiyon_id}")
+def dokuman_versiyon_indir(versiyon_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT DosyaAdi, DosyaYolu FROM DokumanVersiyonlari WHERE VersiyonID=?", (versiyon_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Versiyon bulunamadı.")
+        dosya_adi, dosya_yolu = row
+        if not os.path.exists(dosya_yolu):
+            raise HTTPException(status_code=404, detail="Dosya sunucuda bulunamadı (silinmiş olabilir).")
+        return FileResponse(dosya_yolu, filename=dosya_adi)
     finally:
         conn.close()
 
@@ -7846,6 +8077,108 @@ def makine_bakim_listesi(user: dict = Depends(get_current_user)):
         return {"bakimlar": [{"BakimID": r[0], "HatAdi": r[1], "BakimTuru": r[2], "BaslangicTarihi": str(r[3])[:16],
                                "BitisTarihi": str(r[4])[:16] if r[4] else "-", "Aciklama": r[5] or "", "Durum": r[6],
                                "KullaniciAdi": r[7]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+# --- ENERJİ MALİYETİ TAKİBİ ---
+class EnerjiTuketimEkleRequest(BaseModel):
+    HatID: int
+    BaslangicTarihi: str  # YYYY-MM-DD
+    BitisTarihi: str
+    TuketimKWh: float = Field(gt=0)
+    BirimFiyatKWh: float = Field(gt=0)
+    Aciklama: Optional[str] = None
+
+@app.post("/enerji-tuketim-ekle")
+def enerji_tuketim_ekle(veri: EnerjiTuketimEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Üretim", "Finans"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        toplam_maliyet = veri.TuketimKWh * veri.BirimFiyatKWh
+        cursor.execute("""INSERT INTO EnerjiTuketimKayitlari
+                           (HatID, BaslangicTarihi, BitisTarihi, TuketimKWh, BirimFiyatKWh, ToplamMaliyet, Aciklama, KullaniciAdi)
+                           OUTPUT inserted.KayitID VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (veri.HatID, veri.BaslangicTarihi, veri.BitisTarihi, veri.TuketimKWh, veri.BirimFiyatKWh,
+                        toplam_maliyet, veri.Aciklama, user["username"]))
+        kayit_id = int(cursor.fetchone()[0])
+        log_islem(cursor, f"Enerji tüketim kaydı eklendi: Hat #{veri.HatID}, {veri.TuketimKWh:g} kWh, {toplam_maliyet:,.2f} TL", user["username"])
+        conn.commit()
+        return {"mesaj": "Enerji tüketim kaydı eklendi.", "KayitID": kayit_id, "ToplamMaliyet": toplam_maliyet}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/enerji-tuketim-listesi")
+def enerji_tuketim_listesi(hat_id: Optional[int] = None, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = """SELECT e.KayitID, h.HatAdi, e.BaslangicTarihi, e.BitisTarihi, e.TuketimKWh, e.BirimFiyatKWh,
+                          e.ToplamMaliyet, e.Aciklama, e.KullaniciAdi
+                   FROM EnerjiTuketimKayitlari e JOIN UretimHatlari h ON e.HatID = h.HatID WHERE 1=1"""
+        parametreler = []
+        if hat_id:
+            sorgu += " AND e.HatID=?"
+            parametreler.append(hat_id)
+        sorgu += " ORDER BY e.BaslangicTarihi DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"kayitlar": [{"KayitID": r[0], "HatAdi": r[1], "BaslangicTarihi": str(r[2]), "BitisTarihi": str(r[3]),
+                               "TuketimKWh": float(r[4]), "BirimFiyatKWh": float(r[5]), "ToplamMaliyet": float(r[6]),
+                               "Aciklama": r[7] or "", "KullaniciAdi": r[8]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/enerji-maliyet-raporu")
+def enerji_maliyet_raporu(baslangic: Optional[str] = None, bitis: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Hat bazında dönemsel toplam enerji maliyetini, VARSA aynı dönemde o hatta
+    tamamlanmış üretim çıktısıyla oranlayıp 'birim başına enerji maliyeti' üretir.
+    ÖNEMLİ KISIT: Bu oran sadece üretim emri oluşturulurken HatID'si belirtilmiş
+    kayıtları sayabilir (UretimEmirleri.HatID nullable) - hat bilgisi hiç
+    girilmemişse o hat için sadece toplam maliyet döner, oran hesaplanmaz
+    (BirimBasinaMaliyet: null) ve bunun sebebi 'UretimEmriHatBilgisiEksik' ile belirtilir."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = "SELECT HatID, SUM(ToplamMaliyet), SUM(TuketimKWh) FROM EnerjiTuketimKayitlari WHERE 1=1"
+        parametreler = []
+        if baslangic:
+            sorgu += " AND BaslangicTarihi >= ?"
+            parametreler.append(baslangic)
+        if bitis:
+            sorgu += " AND BitisTarihi <= ?"
+            parametreler.append(bitis)
+        sorgu += " GROUP BY HatID"
+        cursor.execute(sorgu, parametreler)
+        hat_maliyetleri = cursor.fetchall()
+
+        rapor = []
+        for hat_id, toplam_maliyet, toplam_kwh in hat_maliyetleri:
+            cursor.execute("SELECT HatAdi FROM UretimHatlari WHERE HatID=?", (hat_id,))
+            hat_satiri = cursor.fetchone()
+            hat_adi = hat_satiri[0] if hat_satiri else f"Hat #{hat_id}"
+
+            uretim_sorgu = """SELECT ISNULL(SUM(GerceklesenMiktar),0) FROM UretimEmirleri
+                               WHERE HatID=? AND Durum='Tamamlandı'"""
+            uretim_params = [hat_id]
+            if baslangic:
+                uretim_sorgu += " AND TamamlanmaTarihi >= ?"
+                uretim_params.append(baslangic)
+            if bitis:
+                uretim_sorgu += " AND TamamlanmaTarihi <= ?"
+                uretim_params.append(bitis)
+            cursor.execute(uretim_sorgu, uretim_params)
+            uretim_miktari = float(cursor.fetchone()[0] or 0)
+
+            satir = {"HatID": hat_id, "HatAdi": hat_adi, "ToplamMaliyet": round(float(toplam_maliyet), 2),
+                      "ToplamKWh": float(toplam_kwh), "UretimMiktari": uretim_miktari, "BirimBasinaMaliyet": None}
+            if uretim_miktari > 0:
+                satir["BirimBasinaMaliyet"] = round(float(toplam_maliyet) / uretim_miktari, 4)
+            else:
+                satir["Not"] = "Bu dönemde bu hatta HatID'si atanmış tamamlanmış üretim emri bulunamadı - birim başına maliyet hesaplanamıyor."
+            rapor.append(satir)
+        return {"rapor": rapor}
     finally:
         conn.close()
 
