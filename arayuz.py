@@ -5186,6 +5186,8 @@ class MainApp(ctk.CTkToplevel):
         self._sekme_butonlari = {}   # ad -> CTkButton (aktif/pasif vurgu için)
         self._kategori_durumlari = {}  # kategori_adi -> {"acik": bool, "konteyner": CTkFrame}
         self._sidebar_ogeler = []   # [(widget, "header"), (widget, "konteyner", kategori_adi), ...] - sırayla
+        self._kategori_sekmeleri = {}  # kategori_adi -> [sekme_adi, ...] - Giriş paneli/modül pencereleri için
+        self._acik_modul_pencereleri = {}  # kategori_adi -> CTkToplevel (aynı kategori için ikinci pencere açılmasın diye)
         aktif_kategori = {"ad": None}
 
         def sidebar_yeniden_diz():
@@ -5248,11 +5250,13 @@ class MainApp(ctk.CTkToplevel):
             frame = ctk.CTkFrame(icerik_container, fg_color="transparent")
             frame.grid(row=0, column=0, sticky="nsew")
             self._sekme_kayitlari[ad] = frame
+            self._kategori_sekmeleri.setdefault(aktif_kategori["ad"], []).append(ad)
             return frame
 
         # ROL BAZLI SEKME GÖSTERİMİ
         # ROL BAZLI SEKME GÖSTERİMİ
         kategori_basligi("GENEL")
+        self.tab_giris = yeni_sekme("🏠 Giriş")
         self.tab_dash = yeni_sekme("📊 Finans Özet")
         self.tab_donem_karsilastirma = yeni_sekme("📊 Dönem Karşılaştırma")
         self.tab_ana_takvim = yeni_sekme("📅 Ana Takvim")
@@ -5436,7 +5440,8 @@ class MainApp(ctk.CTkToplevel):
             self.init_dokuman_kontrol()
 
         sidebar_yeniden_diz()  # Sidebar'ı ilk kez kaydedilen sırayla ve doğru aç/kapa durumlarıyla çiz
-        self.sekmeye_git("📊 Finans Özet")  # açılışta varsayılan olarak Dashboard görünsün
+        self.init_giris_paneli()  # _kategori_sekmeleri artık tüm kategorilerle dolu, burada kurulmalı
+        self.sekmeye_git("🏠 Giriş")  # açılışta varsayılan olarak Giriş paneli görünsün
         self.after(800, self.bildirimleri_kontrol_et)
 
     def req_headers(self):
@@ -5453,6 +5458,84 @@ class MainApp(ctk.CTkToplevel):
             self.trend_canvas.configure(bg=gecerli_renk(RENK_KART))
         if hasattr(self, "tema_buton"):
             self.tema_buton.configure(text="☀️" if ctk.get_appearance_mode() == "Dark" else "🌙")
+
+    def init_giris_paneli(self):
+        """Uygulama açılışında karşılanan modül seçim ekranı - her kart bir kategoriyi
+        temsil eder, tıklanınca o kategorinin ekranlarını listeleyen bağımsız bir
+        'hızlı menü' penceresi açılır (modul_penceresi_ac). Ekran içeriği hep ANA
+        pencerede açılır (sekmeye_git) - mevcut 67 ekranın hiçbirine dokunulmadan,
+        sıfıra yakın riskle 'modül bazlı gezinme' hissi verir."""
+        frame = self.tab_giris
+        for w in frame.winfo_children():
+            w.destroy()
+
+        ikon_eslemesi = {
+            "GENEL": "🏠", "ÜRETİM": "⚙️", "STOK": "📦", "SATINALMA": "🛒",
+            "ÜRÜN & MALİYET": "💲", "SATIŞ & CRM": "🏢", "FİNANS": "🏦",
+            "MUHASEBE": "📚", "FATURALAR": "📄", "İNSAN KAYNAKLARI": "👥",
+            "ORTAK": "🔗", "SİSTEM": "🔒",
+        }
+
+        ust = ctk.CTkFrame(frame, fg_color="transparent")
+        ust.pack(fill="x", padx=30, pady=(25, 5))
+        ctk.CTkLabel(ust, text=f"Hoş geldin, {getattr(self, 'username', '')} 👋", font=("Arial", 20, "bold"), text_color="#f97316").pack(anchor="w")
+        ctk.CTkLabel(ust, text="Bir modül seç - o modülün ekranlarını listeleyen ayrı bir pencere açılır.",
+                     font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(2, 0))
+
+        kart_alani = ctk.CTkFrame(frame, fg_color="transparent")
+        kart_alani.pack(fill="both", expand=True, padx=30, pady=20)
+
+        kategoriler = [k for k in self._kategori_sekmeleri.keys() if k]
+        for i, kategori_adi in enumerate(kategoriler):
+            satir, sutun = divmod(i, 4)
+            ikon = ikon_eslemesi.get(kategori_adi, "📁")
+            ekran_sayisi = len(self._kategori_sekmeleri[kategori_adi])
+            kart = ctk.CTkFrame(kart_alani, fg_color=RENK_KART, corner_radius=12, border_width=2, border_color=RENK_IKINCIL,
+                                 cursor="hand2", width=180, height=120)
+            kart.grid(row=satir, column=sutun, padx=10, pady=10, sticky="nsew")
+            kart.grid_propagate(False)
+            kart_alani.grid_columnconfigure(sutun, weight=1)
+            ikon_lbl = ctk.CTkLabel(kart, text=ikon, font=("Arial", 32))
+            ikon_lbl.pack(pady=(18, 4))
+            ad_lbl = ctk.CTkLabel(kart, text=kategori_adi, font=("Arial", 13, "bold"), text_color="#f97316")
+            ad_lbl.pack()
+            sayi_lbl = ctk.CTkLabel(kart, text=f"{ekran_sayisi} ekran", font=("Arial", 10), text_color=RENK_METIN_SOLUK)
+            sayi_lbl.pack(pady=(2, 10))
+            for widget in (kart, ikon_lbl, ad_lbl, sayi_lbl):
+                widget.bind("<Button-1>", lambda e, k=kategori_adi: self.modul_penceresi_ac(k))
+
+    def modul_penceresi_ac(self, kategori_adi):
+        mevcut = self._acik_modul_pencereleri.get(kategori_adi)
+        if mevcut is not None and mevcut.winfo_exists():
+            mevcut.lift()
+            mevcut.focus_force()
+            return
+
+        win = ctk.CTkToplevel(self)
+        win.title(kategori_adi)
+        win.geometry("340x480")
+        win.configure(fg_color=gecerli_renk(RENK_TABAN))
+        # BİLİNÇLİ OLARAK grab_set() YOK - modal değil, ana pencereyle ve diğer modül
+        # pencereleriyle aynı anda etkileşilebilir olsun, birden fazlası açık kalabilsin.
+        win.transient(self)
+        win.lift()
+
+        ctk.CTkLabel(win, text=kategori_adi, font=("Arial", 15, "bold"), text_color="#f97316").pack(anchor="w", padx=15, pady=(15, 10))
+
+        liste = ctk.CTkScrollableFrame(win, fg_color="transparent")
+        liste.pack(fill="both", expand=True, padx=10, pady=(0, 15))
+
+        def sekmeyi_ac_ve_one_getir(sekme_adi):
+            self.sekmeye_git(sekme_adi)
+            self.lift()
+            self.focus_force()
+
+        for sekme_adi in self._kategori_sekmeleri.get(kategori_adi, []):
+            ctk.CTkButton(liste, text=sekme_adi, anchor="w", fg_color="transparent", hover_color=RENK_IKINCIL,
+                          text_color=RENK_METIN, font=("Arial", 12), height=36, corner_radius=6,
+                          command=lambda a=sekme_adi: sekmeyi_ac_ve_one_getir(a)).pack(fill="x", pady=2)
+
+        self._acik_modul_pencereleri[kategori_adi] = win
 
     def sekmeye_git(self, ad):
         frame = self._sekme_kayitlari.get(ad)
