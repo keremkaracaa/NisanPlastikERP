@@ -4421,7 +4421,16 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/amortisman-hesapla-simdi", headers=self.req_headers(), timeout=20)
             if res.status_code == 200:
-                messagebox.showinfo("Başarılı", "Amortisman hesaplaması çalıştırıldı.")
+                sonuc = res.json()
+                if sonuc.get("IslenenSayisi", 0) > 0:
+                    mesaj = f"{sonuc['IslenenSayisi']} demirbaş için toplam {sonuc['ToplamGider']:,.2f} TL amortisman gideri işlendi.\n(Yevmiye Defteri: 770 Gider / 257 Birikmiş Amortisman)"
+                else:
+                    mesaj = "Hiçbir demirbaş için amortisman işlenmedi."
+                    if sonuc.get("AtlananFaydaliOmurYok", 0) > 0:
+                        mesaj += f"\n\n{sonuc['AtlananFaydaliOmurYok']} demirbaşta 'Faydalı Ömür (Yıl)' alanı boş - amortisman hesaplanabilmesi için bu alanı doldurup demirbaşı yeniden kaydetmeniz gerekir."
+                    if sonuc.get("AtlananBuAyIslendi", 0) > 0:
+                        mesaj += f"\n\n{sonuc['AtlananBuAyIslendi']} demirbaş bu ay zaten işlenmiş, ayda bir kez hesaplanır."
+                messagebox.showinfo("Amortisman Hesaplama Sonucu", mesaj)
                 self.demirbaslari_tabloya_yukle()
             else:
                 self.api_hata_goster(res)
@@ -5796,13 +5805,25 @@ class MainApp(ctk.CTkToplevel):
 
         secim_satiri = ctk.CTkFrame(win, fg_color="transparent")
         secim_satiri.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(secim_satiri, text="Hesap ID:").pack(side="left", padx=(0, 5))
-        bm_hesap_entry = ctk.CTkEntry(secim_satiri, width=80)
-        bm_hesap_entry.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(secim_satiri, text="Banka Hesabı:").pack(side="left", padx=(0, 5))
+        bm_hesap_secim = ctk.CTkOptionMenu(secim_satiri, values=["Yükleniyor..."], width=260)
+        bm_hesap_secim.pack(side="left", padx=(0, 10))
         ctk.CTkButton(secim_satiri, text="📤 Ekstre CSV Yükle (Tarih,Tutar,Aciklama)", fg_color="#7c3aed", hover_color="#6d28d9",
-                      command=lambda: self._banka_ekstre_csv_yukle(bm_hesap_entry)).pack(side="left", padx=(0, 10))
+                      command=lambda: self._banka_ekstre_csv_yukle(bm_hesap_secim)).pack(side="left", padx=(0, 10))
         ctk.CTkButton(secim_satiri, text="🔄 Öneri Getir", fg_color="#2563eb", hover_color="#1d4ed8",
-                      command=lambda: self._banka_mutabakat_onerileri_yukle(bm_hesap_entry)).pack(side="left")
+                      command=lambda: self._banka_mutabakat_onerileri_yukle(bm_hesap_secim)).pack(side="left")
+
+        self._bm_hesap_cache = []
+        try:
+            res = requests.get(f"{API}/banka-hesaplari", headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                self._bm_hesap_cache = res.json().get("hesaplar", [])
+                secenekler = [f"{h['HesapID']} - {h['BankaAdi']} {h.get('SubeAdi') or ''}".strip() for h in self._bm_hesap_cache] or ["Kayıtlı banka hesabı yok"]
+                bm_hesap_secim.configure(values=secenekler)
+                if self._bm_hesap_cache:
+                    bm_hesap_secim.set(secenekler[0])
+        except requests.exceptions.RequestException:
+            pass
 
         oneri_cerceve, self.bm_oneri_tree = tablo_olustur(
             win, ["Ekstre ID", "Ekstre Tarih", "Ekstre Tutar", "Ekstre Açıklama", "Önerilen Hareket", "Hareket Tarih", "Hareket Tutar"],
@@ -5812,11 +5833,17 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(win, text="✅ Seçili Öneriyi Onayla", fg_color="#16a34a", hover_color="#15803d",
                       command=self._banka_mutabakat_onayla_islem).pack(anchor="w", padx=20, pady=(0, 20))
 
-    def _banka_ekstre_csv_yukle(self, hesap_entry):
+    def _bm_secili_hesap_id(self, hesap_secim):
+        secim = hesap_secim.get()
         try:
-            hesap_id = int(hesap_entry.get())
-        except ValueError:
-            messagebox.showwarning("Eksik Bilgi", "Geçerli bir Hesap ID girin.")
+            return int(secim.split(" - ")[0])
+        except (ValueError, IndexError):
+            return None
+
+    def _banka_ekstre_csv_yukle(self, hesap_secim):
+        hesap_id = self._bm_secili_hesap_id(hesap_secim)
+        if hesap_id is None:
+            messagebox.showwarning("Eksik Bilgi", "Bir banka hesabı seçin.")
             return
         yol = filedialog.askopenfilename(title="Banka Ekstresi CSV Dosyasını Seçin", filetypes=[("CSV", "*.csv"), ("Tüm Dosyalar", "*.*")])
         if not yol:
@@ -5828,17 +5855,16 @@ class MainApp(ctk.CTkToplevel):
                                      headers=self.req_headers(), timeout=20)
             if res.status_code == 200:
                 messagebox.showinfo("Başarılı", res.json().get("mesaj"))
-                self._banka_mutabakat_onerileri_yukle(hesap_entry)
+                self._banka_mutabakat_onerileri_yukle(hesap_secim)
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
-    def _banka_mutabakat_onerileri_yukle(self, hesap_entry):
-        try:
-            hesap_id = int(hesap_entry.get())
-        except ValueError:
-            messagebox.showwarning("Eksik Bilgi", "Geçerli bir Hesap ID girin.")
+    def _banka_mutabakat_onerileri_yukle(self, hesap_secim):
+        hesap_id = self._bm_secili_hesap_id(hesap_secim)
+        if hesap_id is None:
+            messagebox.showwarning("Eksik Bilgi", "Bir banka hesabı seçin.")
             return
         for i in self.bm_oneri_tree.get_children():
             self.bm_oneri_tree.delete(i)

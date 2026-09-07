@@ -1810,18 +1810,20 @@ class TestAmortismanHesaplama:
     def test_aylik_gider_dogru_hesaplanir(self, monkeypatch):
         # AlisTutari=12000, FaydaliOmurYil=5 -> aylik = 12000/(5*12) = 200
         conn, cursor = sahte_cursor_olustur(
-            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 0.0, None)])
+            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 0.0, None)], fetchone_sonucu=(0,))
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
-        main.amortisman_hesapla_ve_isle()
+        sonuc = main.amortisman_hesapla_ve_isle()
         guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Demirbaslar SET BirikmisAmortisman" in c.args[0]]
         assert len(guncelleme) == 1
         assert guncelleme[0].args[1][0] == 200.0
+        assert sonuc["IslenenSayisi"] == 1
+        assert sonuc["ToplamGider"] == 200.0
 
     def test_tam_amorti_olunca_fazla_yazilmaz(self, monkeypatch):
         # BirikmisAmortisman zaten 11900, aylik 200 olsa bile sadece kalan 100 yazilmali
         conn, cursor = sahte_cursor_olustur(
-            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 11900.0, None)])
+            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 11900.0, None)], fetchone_sonucu=(0,))
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
         main.amortisman_hesapla_ve_isle()
@@ -1831,25 +1833,27 @@ class TestAmortismanHesaplama:
     def test_ayni_ay_icinde_tekrar_islenmez(self, monkeypatch):
         simdi = main.datetime.datetime.now()
         conn, cursor = sahte_cursor_olustur(
-            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 200.0, simdi)])
+            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 200.0, simdi)], fetchone_sonucu=(0,))
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
-        main.amortisman_hesapla_ve_isle()
+        sonuc = main.amortisman_hesapla_ve_isle()
         guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Demirbaslar SET BirikmisAmortisman" in c.args[0]]
         assert len(guncelleme) == 0
+        assert sonuc["AtlananBuAyIslendi"] == 1
 
     def test_faydali_omur_bossa_sorguda_hic_gelmez(self, monkeypatch):
         # SQL WHERE zaten FaydaliOmurYil IS NOT NULL filtresi yapıyor - burada
         # boş liste dönmesi durumunda hiçbir işlem yapılmadığını doğruluyoruz.
-        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[], fetchone_sonucu=(1,))
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
-        main.amortisman_hesapla_ve_isle()
+        sonuc = main.amortisman_hesapla_ve_isle()
         guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Demirbaslar SET BirikmisAmortisman" in c.args[0]]
         assert len(guncelleme) == 0
+        assert sonuc["AtlananFaydaliOmurYok"] == 1
 
     def test_manuel_tetikleme_ucu_calisir(self, client, monkeypatch):
-        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[], fetchone_sonucu=(0,))
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
         yanit = client.post("/amortisman-hesapla-simdi")

@@ -4730,16 +4730,24 @@ scheduler.add_job(otomatik_veritabani_yedekle, 'cron', hour=2, minute=0)
 def amortisman_hesapla_ve_isle():
     """Her ay aktif demirbaşlar için doğrusal (straight-line) amortisman gideri
     hesaplar ve Yevmiye'ye işler (770 Gider / 257 Birikmiş Amortisman). FaydaliOmurYil
-    girilmemiş demirbaşlar atlanır - amortisman süresi bilinmeden hesaplama yapılamaz."""
+    girilmemiş demirbaşlar atlanır - amortisman süresi bilinmeden hesaplama yapılamaz.
+    Kaç demirbaşın işlendiğini/atlandığını döner - önceden çağıran taraf (arayüz/endpoint)
+    hiçbir şey işlenmese bile aynı genel 'çalıştırıldı' mesajını gösteriyordu, kullanıcı
+    hiçbir şeyin neden olmadığını anlayamıyordu."""
     conn = get_db_connection()
     cursor = conn.cursor()
+    sonuc = {"IslenenSayisi": 0, "ToplamGider": 0.0, "AtlananFaydaliOmurYok": 0, "AtlananBuAyIslendi": 0}
     try:
+        cursor.execute("SELECT COUNT(*) FROM Demirbaslar WHERE Durumu='Aktif' AND (FaydaliOmurYil IS NULL OR FaydaliOmurYil <= 0)")
+        sonuc["AtlananFaydaliOmurYok"] = int(cursor.fetchone()[0])
+
         cursor.execute("""SELECT DemirbasID, DemirbasAdi, AlisTutari, FaydaliOmurYil, ISNULL(BirikmisAmortisman,0), SonAmortismanTarihi
                            FROM Demirbaslar WHERE Durumu='Aktif' AND FaydaliOmurYil IS NOT NULL AND FaydaliOmurYil > 0""")
         demirbaslar = cursor.fetchall()
         simdi = datetime.datetime.now()
         for demirbas_id, ad, alis_tutari, omur_yil, birikmis, son_tarih in demirbaslar:
             if son_tarih and son_tarih.year == simdi.year and son_tarih.month == simdi.month:
+                sonuc["AtlananBuAyIslendi"] += 1
                 continue  # bu ay zaten işlendi
             alis_tutari = float(alis_tutari or 0)
             birikmis = float(birikmis or 0)
@@ -4755,19 +4763,23 @@ def amortisman_hesapla_ve_isle():
                 ("770", aylik_gider, 0, f"{ad} amortisman gideri"),
                 ("257", 0, aylik_gider, f"{ad} birikmiş amortisman"),
             ], "Sistem")
+            sonuc["IslenenSayisi"] += 1
+            sonuc["ToplamGider"] += aylik_gider
         conn.commit()
-        print(f">>> Amortisman hesaplaması tamamlandı ({len(demirbaslar)} demirbaş kontrol edildi).")
+        print(f">>> Amortisman hesaplaması tamamlandı ({sonuc['IslenenSayisi']} demirbaş işlendi).")
     except Exception as e:
         print(f">>> Amortisman hesaplama hatası: {e}")
+        sonuc["Hata"] = str(e)
     finally:
         conn.close()
+    return sonuc
 
 scheduler.add_job(amortisman_hesapla_ve_isle, 'cron', day=1, hour=3, minute=30)
 
 @app.post("/amortisman-hesapla-simdi")
 def amortisman_hesapla_simdi(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
-    amortisman_hesapla_ve_isle()
-    return {"mesaj": "Amortisman hesaplaması çalıştırıldı."}
+    sonuc = amortisman_hesapla_ve_isle()
+    return sonuc
 
 @app.get("/son-yedek-bilgisi")
 def son_yedek_bilgisi(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
