@@ -220,6 +220,48 @@ def efatura_entegrator_gonder(xml_yolu: str, ayarlar: dict) -> dict:
     except Exception as e:
         return {"basarili": False, "hata": str(e)}
 
+def whatsapp_ayarlarini_getir():
+    """WhatsApp entegratör ayarlarını SistemAyarlari'ndan okur - efatura_ayarlarini_getir
+    ile aynı desen. Hiç ayarlanmamışsa None döner."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""SELECT AyarAnahtari, AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari IN
+                           ('WhatsAppEntegratorURL', 'WhatsAppApiKey', 'WhatsAppHedefNumara', 'WhatsAppOtomatikGonder')""")
+        ayarlar = {r[0]: r[1] for r in cursor.fetchall()}
+        conn.close()
+        url = ayarlar.get("WhatsAppEntegratorURL")
+        if not url:
+            return None
+        return {"url": url, "api_key": ayarlar.get("WhatsAppApiKey") or "",
+                "hedef_numara": ayarlar.get("WhatsAppHedefNumara") or "",
+                "otomatik": (ayarlar.get("WhatsAppOtomatikGonder") or "0") == "1"}
+    except Exception:
+        return None
+
+def whatsapp_mesaj_gonder(mesaj: str, ayarlar: dict = None) -> dict:
+    """Kritik bir uyarı mesajını yapılandırılmış WhatsApp entegratörüne gönderir.
+    KAPSAM: efatura_entegrator_gonder (main.py:195) ile AYNI İSKELET felsefesi -
+    gerçek bir sağlayıcı (Twilio, 360dialog vb.) seçilmedi, sadece yapılandırılan
+    URL'e JSON POST eder. Sağlayıcı seçildiğinde bu fonksiyonun gövdesi o
+    sağlayıcının kimlik doğrulama/istek şemasına göre güncellenmeli (TODO).
+    HİÇBİR ZAMAN exception fırlatmaz - alarm/rapor akışını bloklamamalı."""
+    try:
+        ayarlar = ayarlar or whatsapp_ayarlarini_getir()
+        if not ayarlar:
+            return {"basarili": False, "hata": "WhatsApp entegratör ayarları yapılandırılmamış."}
+        yanit = requests.post(
+            ayarlar["url"],
+            headers={"Authorization": f"Bearer {ayarlar['api_key']}", "Content-Type": "application/json"},
+            json={"to": ayarlar["hedef_numara"], "message": mesaj},
+            timeout=10,
+        )
+        if yanit.status_code in (200, 201, 202):
+            return {"basarili": True}
+        return {"basarili": False, "hata": f"Entegratör HTTP {yanit.status_code}: {yanit.text[:300]}"}
+    except Exception as e:
+        return {"basarili": False, "hata": str(e)}
+
 def otomatik_rapor_gonder():
     ayar = eposta_ayarlarini_getir()
     if not ayar:
@@ -4637,6 +4679,16 @@ def son_yedek_bilgisi(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
     except Exception as e:
         return {"YedekVarMi": False, "Hata": str(e)}
 
+@app.post("/whatsapp-test-gonder")
+def whatsapp_test_gonder(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    ayarlar = whatsapp_ayarlarini_getir()
+    if not ayarlar:
+        raise HTTPException(status_code=400, detail="WhatsApp entegratör ayarları yapılandırılmamış.")
+    sonuc = whatsapp_mesaj_gonder("✅ Nisan Plastik ERP - WhatsApp entegrasyonu test mesajı.", ayarlar)
+    if sonuc["basarili"]:
+        return {"mesaj": "Test mesajı gönderildi."}
+    raise HTTPException(status_code=400, detail=f"Gönderilemedi: {sonuc['hata']}")
+
 @app.get("/depolar")
 def depolari_getir(user: dict = Depends(get_current_user)):
     conn = get_db_connection()
@@ -5779,6 +5831,14 @@ def alarm_kurallarini_kontrol_et():
                            (kural_id, mesaj))
             return cursor.fetchone() is not None
 
+        yeni_alarmlar = []  # WhatsApp'a gönderilecek, bu çalıştırmada YENİ eklenen mesajlar
+
+        def yeni_alarm_ekle(kural_id, kural_adi, mesaj):
+            if zaten_var_mi(kural_id, mesaj):
+                return
+            cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+            yeni_alarmlar.append(mesaj)
+
         for kural_id, kural_adi, kural_tipi, esik in kurallar:
             if kural_tipi == "KritikStok":
                 # Negatif stok HER ZAMAN kritik kabul edilir (MinStokSeviyesi hiç
@@ -5791,8 +5851,7 @@ def alarm_kurallarini_kontrol_et():
                 """)
                 for stok_adi, miktar, min_sev in cursor.fetchall():
                     mesaj = f"Kritik stok: {stok_adi} (Mevcut: {miktar:g}, Min: {min_sev:g})"
-                    if not zaten_var_mi(kural_id, mesaj):
-                        cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+                    yeni_alarm_ekle(kural_id, kural_adi, mesaj)
 
             elif kural_tipi == "RiskLimitiAsimi":
                 cursor.execute("SELECT MusteriID, FirmaAdi, ISNULL(RiskLimiti,0) FROM Musteriler WHERE ISNULL(RiskLimiti,0) > 0")
@@ -5804,8 +5863,7 @@ def alarm_kurallarini_kontrol_et():
                     net_bakiye = toplam_borc - toplam_tahsilat
                     if net_bakiye > float(risk_limiti):
                         mesaj = f"Risk limiti aşıldı: {firma_adi} (Bakiye: {net_bakiye:,.2f} TL, Limit: {risk_limiti:,.2f} TL)"
-                        if not zaten_var_mi(kural_id, mesaj):
-                            cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+                        yeni_alarm_ekle(kural_id, kural_adi, mesaj)
 
             elif kural_tipi == "VadeYaklasan":
                 gun = int(esik) if esik else 3
@@ -5815,8 +5873,7 @@ def alarm_kurallarini_kontrol_et():
                 """, (gun,))
                 for fatura_id, firma_adi, tutar, tarih in cursor.fetchall():
                     mesaj = f"Vadesi yaklaşan fatura: {firma_adi} - #{fatura_id} ({tutar:,.2f} TL)"
-                    if not zaten_var_mi(kural_id, mesaj):
-                        cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+                    yeni_alarm_ekle(kural_id, kural_adi, mesaj)
 
             elif kural_tipi == "SozlesmeSuresiDoluyor":
                 gun = int(esik) if esik else 30
@@ -5826,8 +5883,7 @@ def alarm_kurallarini_kontrol_et():
                 """, (gun,))
                 for belge_id, dosya_adi, bitis in cursor.fetchall():
                     mesaj = f"Sözleşme/belge süresi doluyor: {dosya_adi} (Bitiş: {bitis})"
-                    if not zaten_var_mi(kural_id, mesaj):
-                        cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+                    yeni_alarm_ekle(kural_id, kural_adi, mesaj)
 
             elif kural_tipi == "TeslimTarihiYaklasiyor":
                 gun = int(esik) if esik else 3
@@ -5843,8 +5899,7 @@ def alarm_kurallarini_kontrol_et():
                         mesaj = f"Teslim tarihi geçti: Sipariş #{siparis_id} ({stok_adi}) - {abs(kalan_gun)} gün gecikti (Söz verilen: {str(teslim_tarihi)[:10]})"
                     else:
                         mesaj = f"Teslim tarihi yaklaşıyor: Sipariş #{siparis_id} ({stok_adi}) - {kalan_gun} gün kaldı (Söz verilen: {str(teslim_tarihi)[:10]})"
-                    if not zaten_var_mi(kural_id, mesaj):
-                        cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+                    yeni_alarm_ekle(kural_id, kural_adi, mesaj)
 
             elif kural_tipi == "AnormalIslem":
                 # Katsayı: bugünkü işlem, son 30 günün ORTALAMASININ kaç katından fazlaysa
@@ -5869,8 +5924,7 @@ def alarm_kurallarini_kontrol_et():
                         for hareket_id, tutar, aciklama in bugunku_kasa_cikislari:
                             if float(tutar) > ortalama * katsayi:
                                 mesaj = f"Olağandışı büyük kasa çıkışı: {tutar:,.2f} TL ({aciklama or '-'}) - son 30 gün ortalamasının {tutar/ortalama:.1f} katı"
-                                if not zaten_var_mi(kural_id, mesaj):
-                                    cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+                                yeni_alarm_ekle(kural_id, kural_adi, mesaj)
 
                 # 2) Stok çıkışı anomalisi (ürün bazında, kendi geçmişiyle kıyaslanır)
                 cursor.execute("""
@@ -5887,10 +5941,14 @@ def alarm_kurallarini_kontrol_et():
                     ortalama, adet = (float(ortalama_satir[0]) if ortalama_satir[0] else 0), ortalama_satir[1]
                     if adet >= 5 and ortalama > 0 and float(miktar) > ortalama * katsayi:
                         mesaj = f"Olağandışı büyük stok çıkışı: {stok_kod} - {miktar:g} birim ({aciklama or '-'}) - son 30 gün ortalamasının {miktar/ortalama:.1f} katı"
-                        if not zaten_var_mi(kural_id, mesaj):
-                            cursor.execute("INSERT INTO AlarmGecmisi (KuralID, KuralAdi, Mesaj) VALUES (?, ?, ?)", (kural_id, kural_adi, mesaj))
+                        yeni_alarm_ekle(kural_id, kural_adi, mesaj)
 
         conn.commit()
+        if yeni_alarmlar:
+            wa_ayarlar = whatsapp_ayarlarini_getir()
+            if wa_ayarlar and wa_ayarlar["otomatik"]:
+                for mesaj in yeni_alarmlar:
+                    whatsapp_mesaj_gonder(mesaj, wa_ayarlar)
     except Exception as e:
         print(f">>> Alarm kontrolü hatası: {e}")
     finally:

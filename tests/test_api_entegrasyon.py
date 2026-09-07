@@ -1378,6 +1378,123 @@ class TestSiparisDurumGuncelleTeslimDamgasi:
         assert guncelleme.args[1] == ("Tamamlandı", "Tamamlandı", 1)
 
 
+class TestWhatsappMesajGonder:
+    """WhatsApp entegrasyonu e-Fatura entegratörüyle aynı İSKELET felsefesinde eklendi -
+    gerçek bir sağlayıcı yok, sadece yapılandırılan URL'e POST atar, asla patlamaz."""
+
+    def test_ayar_yoksa_network_cagrisi_yapilmaz(self, monkeypatch):
+        monkeypatch.setattr(main, "whatsapp_ayarlarini_getir", lambda: None)
+        cagrildi = {"deger": False}
+
+        def sahte_post(*a, **k):
+            cagrildi["deger"] = True
+            raise AssertionError("requests.post cagrilmamali")
+        monkeypatch.setattr(main.requests, "post", sahte_post)
+
+        sonuc = main.whatsapp_mesaj_gonder("test mesajı")
+        assert sonuc["basarili"] is False
+        assert cagrildi["deger"] is False
+
+    def test_basarili_yanitta_basarili_true_doner(self, monkeypatch):
+        class SahteYanit:
+            status_code = 200
+            text = ""
+        monkeypatch.setattr(main.requests, "post", lambda *a, **k: SahteYanit())
+        ayarlar = {"url": "https://ornek.com/gonder", "api_key": "abc", "hedef_numara": "+905551112233", "otomatik": True}
+
+        sonuc = main.whatsapp_mesaj_gonder("test mesajı", ayarlar)
+        assert sonuc["basarili"] is True
+
+    def test_hata_yanitinda_basarisiz_ve_exception_firlamiyor(self, monkeypatch):
+        class SahteYanit:
+            status_code = 500
+            text = "Sunucu hatası"
+        monkeypatch.setattr(main.requests, "post", lambda *a, **k: SahteYanit())
+        ayarlar = {"url": "https://ornek.com/gonder", "api_key": "abc", "hedef_numara": "+905551112233", "otomatik": True}
+
+        sonuc = main.whatsapp_mesaj_gonder("test mesajı", ayarlar)
+        assert sonuc["basarili"] is False
+        assert "500" in sonuc["hata"]
+
+    def test_network_hatasinda_exception_yutulur(self, monkeypatch):
+        def patlayan_post(*a, **k):
+            raise ConnectionError("bağlantı koptu")
+        monkeypatch.setattr(main.requests, "post", patlayan_post)
+        ayarlar = {"url": "https://ornek.com/gonder", "api_key": "abc", "hedef_numara": "+905551112233", "otomatik": True}
+
+        sonuc = main.whatsapp_mesaj_gonder("test mesajı", ayarlar)
+        assert sonuc["basarili"] is False
+
+
+class TestAlarmWhatsappBaglantisi:
+    """alarm_kurallarini_kontrol_et artık yeni oluşan (dedupe edilmemiş) her alarmı,
+    WhatsAppOtomatikGonder açıkken whatsapp_mesaj_gonder'a iletiyor."""
+
+    def _kritik_stok_cursor(self, zaten_var_mi_sonucu=None):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=zaten_var_mi_sonucu)
+        cursor.fetchall.side_effect = [
+            [(1, "Kritik Stok Uyarısı", "KritikStok", None)],  # aktif kurallar
+            [("Test Ürünü", -5.0, 0.0)],  # kritik stoktaki ürün
+        ]
+        return conn, cursor
+
+    def test_otomatik_kapaliyken_whatsapp_cagrilmaz(self, monkeypatch):
+        conn, cursor = self._kritik_stok_cursor(zaten_var_mi_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "whatsapp_ayarlarini_getir", lambda: {"otomatik": False})
+        mock_gonder = MagicMock()
+        monkeypatch.setattr(main, "whatsapp_mesaj_gonder", mock_gonder)
+
+        main.alarm_kurallarini_kontrol_et()
+        mock_gonder.assert_not_called()
+
+    def test_otomatik_acikken_yeni_alarmda_whatsapp_cagrilir(self, monkeypatch):
+        conn, cursor = self._kritik_stok_cursor(zaten_var_mi_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        wa_ayarlar = {"otomatik": True, "url": "x", "api_key": "y", "hedef_numara": "z"}
+        monkeypatch.setattr(main, "whatsapp_ayarlarini_getir", lambda: wa_ayarlar)
+        mock_gonder = MagicMock()
+        monkeypatch.setattr(main, "whatsapp_mesaj_gonder", mock_gonder)
+
+        main.alarm_kurallarini_kontrol_et()
+        mock_gonder.assert_called_once()
+        assert "Kritik stok" in mock_gonder.call_args.args[0]
+
+    def test_zaten_var_olan_alarm_icin_tekrar_cagrilmaz(self, monkeypatch):
+        conn, cursor = self._kritik_stok_cursor(zaten_var_mi_sonucu=(1,))  # zaten bugün için var
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "whatsapp_ayarlarini_getir", lambda: {"otomatik": True})
+        mock_gonder = MagicMock()
+        monkeypatch.setattr(main, "whatsapp_mesaj_gonder", mock_gonder)
+
+        main.alarm_kurallarini_kontrol_et()
+        mock_gonder.assert_not_called()
+
+
+class TestWhatsappTestGonder:
+    def test_ayar_yoksa_400_doner(self, client, monkeypatch):
+        monkeypatch.setattr(main, "whatsapp_ayarlarini_getir", lambda: None)
+        yanit = client.post("/whatsapp-test-gonder")
+        assert yanit.status_code == 400
+
+    def test_basarili_gonderimde_200_doner(self, client, monkeypatch):
+        monkeypatch.setattr(main, "whatsapp_ayarlarini_getir", lambda: {"otomatik": True, "url": "x"})
+        monkeypatch.setattr(main, "whatsapp_mesaj_gonder", lambda *a, **k: {"basarili": True})
+        yanit = client.post("/whatsapp-test-gonder")
+        assert yanit.status_code == 200
+
+    def test_basarisiz_gonderimde_400_doner(self, client, monkeypatch):
+        monkeypatch.setattr(main, "whatsapp_ayarlarini_getir", lambda: {"otomatik": True, "url": "x"})
+        monkeypatch.setattr(main, "whatsapp_mesaj_gonder", lambda *a, **k: {"basarili": False, "hata": "bağlantı hatası"})
+        yanit = client.post("/whatsapp-test-gonder")
+        assert yanit.status_code == 400
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/whatsapp-test-gonder")
+        assert yanit.status_code in (401, 403)
+
+
 class TestOtomatikYedekleme:
     """Otomatik veritabanı yedeklemesi önceden hiç yoktu - /veritabani-yedekle
     sadece elle tıklanınca çalışıyordu. Artık her gece otomatik çalışan ve eski

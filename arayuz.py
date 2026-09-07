@@ -3127,9 +3127,33 @@ class MainApp(ctk.CTkToplevel):
                                                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left")
         self.yedek_son_bilgi_label.pack(anchor="w", padx=10, pady=(0, 10))
 
+        whatsapp_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=8)
+        whatsapp_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(whatsapp_cerceve, text="📱 WhatsApp Kritik Uyarı Entegrasyonu (İskelet)", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(whatsapp_cerceve, text="Gerçek kullanım için bir WhatsApp Business API sağlayıcısına (Twilio vb.) ihtiyaç var - burası sadece o sağlayıcıya bağlanacak iskelet.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 5))
+        wa_satiri1 = ctk.CTkFrame(whatsapp_cerceve, fg_color="transparent")
+        wa_satiri1.pack(fill="x", padx=10, pady=(0, 5))
+        self.wa_url_entry = ctk.CTkEntry(wa_satiri1, placeholder_text="Entegratör URL", width=280)
+        self.wa_url_entry.pack(side="left", padx=(0, 8))
+        self.wa_apikey_entry = ctk.CTkEntry(wa_satiri1, placeholder_text="API Key", width=180, show="•")
+        self.wa_apikey_entry.pack(side="left", padx=(0, 8))
+        self.wa_numara_entry = ctk.CTkEntry(wa_satiri1, placeholder_text="Hedef Numara (+90...)", width=160)
+        self.wa_numara_entry.pack(side="left")
+        wa_satiri2 = ctk.CTkFrame(whatsapp_cerceve, fg_color="transparent")
+        wa_satiri2.pack(fill="x", padx=10, pady=(0, 10))
+        self.wa_otomatik_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(wa_satiri2, text="Uyarılarda otomatik WhatsApp mesajı gönder", variable=self.wa_otomatik_var,
+                         command=self.whatsapp_ayarlarini_kaydet).pack(side="left", padx=(0, 15))
+        ctk.CTkButton(wa_satiri2, text="Kaydet", fg_color="#16a34a", hover_color="#15803d",
+                      command=self.whatsapp_ayarlarini_kaydet).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(wa_satiri2, text="📤 Test Mesajı Gönder", fg_color="#25D366", hover_color="#128C7E",
+                      command=self.whatsapp_test_gonder_islem).pack(side="left")
+
         self._eposta_ayarlarini_yukle()
         self._efatura_ayarlarini_yukle()
         self._yedek_ayarlarini_yukle()
+        self._whatsapp_ayarlarini_yukle()
 
     def _efatura_ayarlarini_yukle(self):
         try:
@@ -3192,6 +3216,44 @@ class MainApp(ctk.CTkToplevel):
         try:
             requests.put(f"{API}/sistem-ayarlari/OtomatikYedeklemeAktif", params={"deger": "1" if self.yedek_otomatik_var.get() else "0"}, headers=self.req_headers(), timeout=5)
             requests.put(f"{API}/sistem-ayarlari/YedekSaklamaGunu", params={"deger": saklama}, headers=self.req_headers(), timeout=5)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def _whatsapp_ayarlarini_yukle(self):
+        try:
+            res = requests.get(f"{API}/sistem-ayarlari", headers=self.req_headers(), timeout=5)
+            ayarlar = res.json().get("ayarlar", {})
+            self.wa_url_entry.delete(0, "end")
+            self.wa_url_entry.insert(0, ayarlar.get("WhatsAppEntegratorURL", ""))
+            if ayarlar.get("WhatsAppApiKey"):
+                self.wa_apikey_entry.configure(placeholder_text="•••••••••••• (kayıtlı, değiştirmek için yeniden yazın)")
+            self.wa_numara_entry.delete(0, "end")
+            self.wa_numara_entry.insert(0, ayarlar.get("WhatsAppHedefNumara", ""))
+            self.wa_otomatik_var.set(ayarlar.get("WhatsAppOtomatikGonder") == "1")
+        except Exception:
+            pass
+
+    def whatsapp_ayarlarini_kaydet(self):
+        url = self.wa_url_entry.get().strip()
+        numara = self.wa_numara_entry.get().strip()
+        apikey = self.wa_apikey_entry.get().strip()
+        try:
+            requests.put(f"{API}/sistem-ayarlari/WhatsAppEntegratorURL", params={"deger": url}, headers=self.req_headers(), timeout=5)
+            requests.put(f"{API}/sistem-ayarlari/WhatsAppHedefNumara", params={"deger": numara}, headers=self.req_headers(), timeout=5)
+            requests.put(f"{API}/sistem-ayarlari/WhatsAppOtomatikGonder", params={"deger": "1" if self.wa_otomatik_var.get() else "0"}, headers=self.req_headers(), timeout=5)
+            if apikey:
+                requests.put(f"{API}/sistem-ayarlari/WhatsAppApiKey", params={"deger": apikey}, headers=self.req_headers(), timeout=5)
+            self._whatsapp_ayarlarini_yukle()
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def whatsapp_test_gonder_islem(self):
+        try:
+            res = requests.post(f"{API}/whatsapp-test-gonder", headers=self.req_headers(), timeout=15)
+            if res.status_code == 200:
+                messagebox.showinfo("Başarılı", "Test mesajı gönderildi.")
+            else:
+                self.api_hata_goster(res)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
