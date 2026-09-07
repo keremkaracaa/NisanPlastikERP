@@ -52,9 +52,9 @@ def sahte_cursor_olustur(fetchall_sonucu=None, fetchone_sonucu=None):
 class TestStokListesiEndpoint:
     def test_stok_listesi_kar_marjini_dogru_hesaplayarak_doner(self, client, monkeypatch):
         """DB'den gelen ham satırların (StokKod, StokAdi, Birim, Miktar, Fiyat,
-        MinSeviye, OrtMaliyet, Barkod, RezerveMiktar) API üzerinden doğru JSON
-        alanlarına ve doğru KarMarji hesabına dönüştüğünü doğrular."""
-        sahte_satirlar = [("PP-001", "Test Ürünü", "KG", 100.0, 50.0, 10.0, 30.0, "1234567890", 20.0)]
+        MinSeviye, OrtMaliyet, Barkod, RezerveMiktar, UrunGrubu) API üzerinden doğru
+        JSON alanlarına ve doğru KarMarji hesabına dönüştüğünü doğrular."""
+        sahte_satirlar = [("PP-001", "Test Ürünü", "KG", 100.0, 50.0, 10.0, 30.0, "1234567890", 20.0, "Ham Madde")]
         conn, cursor = sahte_cursor_olustur(fetchall_sonucu=sahte_satirlar, fetchone_sonucu=(1,))
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
@@ -66,6 +66,7 @@ class TestStokListesiEndpoint:
         assert veri["KarMarji"] == 40.0  # (50-30)/50*100
         assert veri["RezerveMiktar"] == 20.0
         assert veri["KullanilabilirMiktar"] == 80.0  # 100 - 20
+        assert veri["UrunGrubu"] == "Ham Madde"
 
     def test_stok_listesi_yetkisiz_istekte_401_doner(self):
         """dependency_override YAPILMADAN çağrılan bir client, gerçek JWT
@@ -1165,6 +1166,417 @@ class TestElektronikImza:
         assert "i.KullaniciAdi=?" in cagri.args[0]
 
 
+class TestModulOzet:
+    """Giriş paneli -> modül modu için eklendi (deneme/giris-paneli dalı). Her
+    kategori kodu kendi basit COUNT/SUM sorgularını çalıştırıp gerçek sayılar
+    döner - burada sadece geçerli/geçersiz kod ve yetki davranışı doğrulanıyor,
+    her dalın SQL doğruluğu gerçek sunucuya karşı ayrıca test edildi."""
+
+    def test_genel_kategorisi_200_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(0,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/modul-ozet/genel")
+        assert yanit.status_code == 200
+        assert "Stats" in yanit.json()
+
+    def test_gecersiz_kategori_kodu_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(0,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/modul-ozet/olmayan-kategori")
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/modul-ozet/genel")
+        assert yanit.status_code in (401, 403)
+
+    def test_muhasebe_mizan_dengedeyse_dogru_mesaj_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1000.0, 1000.0), (5000.0,), (3000.0,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/modul-ozet/muhasebe")
+        assert yanit.status_code == 200
+        stats = {s["Etiket"]: s["Deger"] for s in yanit.json()["Stats"]}
+        assert "Dengede" in stats["Mizan Denge Farkı"]
+
+
+class TestStokOzetPaneli:
+    """Stok Ana Sayfa Özet Paneli - Toplam Stok Değeri/Depo/Aktif Ürün kartları +
+    ürün grubuna göre stok değeri pasta grafiği."""
+
+    def test_gruplu_veri_varsa_pasta_grafik_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(50000.0, 12), (3,)]
+        cursor.fetchall.return_value = [("Ham Madde", 30000.0), ("Yarı Mamul", 20000.0)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/stok-ozet-panel")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        stats = {s["Etiket"]: s["Deger"] for s in veri["Stats"]}
+        assert stats["Toplam Depo"] == "3"
+        assert stats["Toplam Aktif Ürün"] == "12"
+        assert veri["Grafik"]["Tip"] == "pasta"
+        assert veri["Grafik"]["Etiketler"] == ["Ham Madde", "Yarı Mamul"]
+
+    def test_hic_deger_yoksa_grafik_none_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        cursor.fetchone.side_effect = [(0.0, 0), (0,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/stok-ozet-panel")
+        assert yanit.status_code == 200
+        assert yanit.json()["Grafik"] is None
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/stok-ozet-panel")
+        assert yanit.status_code in (401, 403)
+
+
+class TestStokYaslandirma:
+    """Ölü Stok raporu - son hareketi eşik günden eski (veya hiç hareket görmemiş)
+    pozitif miktarlı stok kartları."""
+
+    def test_gun_farki_ve_deger_dogru_hesaplanir(self, client, monkeypatch):
+        import datetime
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            ("PP-001", "Test Ürünü", "KG", 50.0, 1500.0, datetime.datetime(2026, 1, 1), 249),
+            ("PP-002", "Hiç Hareket Görmeyen", "AD", 10.0, 0.0, None, None),
+        ])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/stok-yaslandirma")
+        assert yanit.status_code == 200
+        oluler = yanit.json()["OluStoklar"]
+        assert oluler[0]["StokKod"] == "PP-001"
+        assert oluler[0]["GunFarki"] == 249
+        assert oluler[1]["SonHareketTarihi"] is None
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/stok-yaslandirma")
+        assert yanit.status_code in (401, 403)
+
+
+class TestStokOngoru:
+    """Öngörülen Stok Miktarı - mevcut - rezerve - açık üretim tüketimi + bekleyen
+    satınalma. Rezerve/tüketim/satınalması hepsi sıfır olan kalemler rapora
+    hiç girmez (gürültü olmasın diye)."""
+
+    def test_ongoru_hesabi_ve_filtre_dogru_calisir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchall.side_effect = [
+            [("HM-001", 20.0)],          # açık üretim tüketimi
+            [("HM-001", 15.0)],          # bekleyen satınalma
+            [
+                ("HM-001", "Hammadde 1", "KG", 100.0, 10.0),   # 100 - 10 - 20 + 15 = 85
+                ("HM-002", "Hiç Hareketsiz", "KG", 50.0, 0.0),  # rezerve/tuketim/satinalma hepsi 0 -> filtrelenir
+            ],
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/stok-ongoru")
+        assert yanit.status_code == 200
+        sonuc = yanit.json()["Ongoru"]
+        assert len(sonuc) == 1
+        assert sonuc[0]["StokKod"] == "HM-001"
+        assert sonuc[0]["OngorulenMiktar"] == 85.0
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/stok-ongoru")
+        assert yanit.status_code in (401, 403)
+
+
+class TestUrunAlternatif:
+    """Ürün Alternatifi - bir hammadde bittiğinde önerilebilecek alternatif ürünler."""
+
+    def test_kendisi_alternatif_olamaz_400_doner(self, client):
+        yanit = client.post("/urun-alternatif", json={"StokKod": "PP-001", "AlternatifStokKod": "PP-001"})
+        assert yanit.status_code == 400
+
+    def test_stok_kodu_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/urun-alternatif", json={"StokKod": "PP-001", "AlternatifStokKod": "PP-002"})
+        assert yanit.status_code == 404
+
+    def test_listeleme_dogru_alanlari_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[(1, "PP-002", "Alternatif Ürün", 25.0, "KG", "İkinci kalite")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/urun-alternatif/PP-001")
+        assert yanit.status_code == 200
+        alt = yanit.json()["Alternatifler"][0]
+        assert alt["AlternatifStokKod"] == "PP-002"
+        assert alt["MevcutMiktar"] == 25.0
+
+    def test_silme_kayit_yoksa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.delete("/urun-alternatif/999")
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/urun-alternatif/PP-001")
+        assert yanit.status_code in (401, 403)
+
+
+class TestSatisHunisi:
+    """Satış Hunisi - sabit 5 aşamaya göre fırsat sayısı/tutarı. Veri olmayan
+    aşamalar da 0 olarak dönmeli (huni sırası her zaman aynı 5 aşama olsun diye)."""
+
+    def test_tum_asamalar_sirayla_ve_veri_olmayanlar_sifir_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[("Teklif", 3, 15000.0), ("Kazanıldı", 2, 8000.0)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/satis-hunisi")
+        assert yanit.status_code == 200
+        asamalar = yanit.json()["Asamalar"]
+        assert [a["Asama"] for a in asamalar] == ["İlk Görüşme", "Teklif", "Müzakere", "Kazanıldı", "Kaybedildi"]
+        assert asamalar[0]["Sayi"] == 0
+        assert asamalar[1]["Sayi"] == 3
+        assert asamalar[1]["TahminiTutar"] == 15000.0
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/satis-hunisi")
+        assert yanit.status_code in (401, 403)
+
+
+class TestMusteriPuan:
+    """POS Sadakat/Puan Programı - satış tutarının SistemAyarlari'ndaki orana göre
+    puana çevrilmesi + bakiye sorgulama."""
+
+    def test_puan_orani_ayardan_okunup_dogru_hesaplanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1,), ("2",), (None,), (10.0,)]  # musteri var, oran=%2, mevcut puan yok, yeni bakiye
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/musteri-puan-kazandir", json={"MusteriID": 1, "TutarTL": 500.0})
+        assert yanit.status_code == 200
+        assert yanit.json()["KazanilanPuan"] == 10.0
+
+    def test_ayar_yoksa_varsayilan_yuzde_1_kullanilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1,), None, (None,), (5.0,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/musteri-puan-kazandir", json={"MusteriID": 1, "TutarTL": 500.0})
+        assert yanit.status_code == 200
+        assert yanit.json()["KazanilanPuan"] == 5.0
+
+    def test_musteri_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/musteri-puan-kazandir", json={"MusteriID": 999, "TutarTL": 100.0})
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_bakiye_sorgusu_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/musteri-puan/1")
+        assert yanit.status_code in (401, 403)
+
+
+class TestTedarikciSkorKarti:
+    """Tedarikçi Skor Kartı - zamanında teslimat oranı + kalite kabul oranı, ikisi
+    de doldurulmamışsa GenelSkor None döner (uydurma veri gösterilmez)."""
+
+    def test_ikisi_de_doluysa_ortalamasi_genel_skor_olur(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("ABC Tedarik",), (10, 8), (20, 15)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/tedarikci-skor-karti/1")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["ZamanindaTeslimatOrani"] == 80.0
+        assert veri["KaliteKabulOrani"] == 75.0
+        assert veri["GenelSkor"] == 77.5
+
+    def test_hicbiri_dolu_degilse_genel_skor_none_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("ABC Tedarik",), (0, None), (0, None)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/tedarikci-skor-karti/1")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["ZamanindaTeslimatOrani"] is None
+        assert veri["GenelSkor"] is None
+
+    def test_tedarikci_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/tedarikci-skor-karti/999")
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/tedarikci-skor-karti/1")
+        assert yanit.status_code in (401, 403)
+
+
+class TestDemirbasTransfer:
+    """Varlık Hareketleri (Transfer/Lokasyon) - demirbaşın lokasyonunu günceller
+    ve geçmişini DemirbasHareketleri'ne kaydeder."""
+
+    def test_transfer_gecmisi_kaydedilir_ve_lokasyon_guncellenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("Merkez",))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/demirbas-transfer", json={"DemirbasID": 1, "YeniLokasyon": "Şube 2"})
+        assert yanit.status_code == 200
+        insert_cagrisi = [c for c in cursor.execute.call_args_list if "INSERT INTO DemirbasHareketleri" in c.args[0]]
+        assert len(insert_cagrisi) == 1
+        assert insert_cagrisi[0].args[1] == (1, "Merkez", "Şube 2", "test_kullanici", None)
+
+    def test_demirbas_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/demirbas-transfer", json={"DemirbasID": 999, "YeniLokasyon": "Şube 2"})
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/demirbas-transfer", json={"DemirbasID": 1, "YeniLokasyon": "Şube 2"})
+        assert yanit.status_code in (401, 403)
+
+    def test_hareket_gecmisi_listelenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (None, "Merkez", "2026-01-01 10:00", "master", "İlk kayıt"),
+            ("Merkez", "Şube 2", "2026-02-01 11:00", "master", None),
+        ])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/demirbas-hareketleri/1")
+        assert yanit.status_code == 200
+        hareketler = yanit.json()["Hareketler"]
+        assert hareketler[0]["EskiLokasyon"] == "-"
+        assert hareketler[1]["YeniLokasyon"] == "Şube 2"
+
+
+class TestProjeYonetimi:
+    """Proje / Görev / Zaman Planı - sıfırdan yeni modül."""
+
+    def test_proje_ekleme_id_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(7,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/proje", json={"ProjeAdi": "Kalıp Geliştirme", "Butce": 50000})
+        assert yanit.status_code == 200
+        assert yanit.json()["ProjeID"] == 7
+
+    def test_proje_listesi_dogru_alanlari_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (1, "Kalıp Geliştirme", None, "-", "2026-01-01", None, 50000.0, "Devam Ediyor", "")
+        ])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/proje")
+        assert yanit.status_code == 200
+        proje = yanit.json()["Projeler"][0]
+        assert proje["ProjeAdi"] == "Kalıp Geliştirme"
+        assert proje["Butce"] == 50000.0
+
+    def test_proje_guncelle_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/proje", json={"ProjeID": 999, "ProjeAdi": "X", "Butce": 0})
+        assert yanit.status_code == 404
+
+    def test_proje_ozet_tamamlanma_yuzdesi_dogru_hesaplanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("Kalıp Geliştirme", 50000.0), (4, 3, 22.5)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/proje/1/ozet")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["TamamlanmaYuzdesi"] == 75.0
+        assert veri["ToplamHarcananSaat"] == 22.5
+
+    def test_proje_bulunamazsa_ozet_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/proje/999/ozet")
+        assert yanit.status_code == 404
+
+    def test_gorev_ekleme_proje_yoksa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/proje-gorev", json={"ProjeID": 999, "GorevAdi": "Test"})
+        assert yanit.status_code == 404
+
+    def test_gorev_listesi_dogru_alanlari_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (1, "Kalıp Tasarımı", "master", "2026-01-01", "2026-01-10", 40.0, 38.0, "Tamamlandı", "Yüksek")
+        ])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/proje-gorev/1")
+        assert yanit.status_code == 200
+        gorev = yanit.json()["Gorevler"][0]
+        assert gorev["GorevAdi"] == "Kalıp Tasarımı"
+        assert gorev["Oncelik"] == "Yüksek"
+
+    def test_gorev_silme_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.delete("/proje-gorev/999")
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_proje_listesi_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/proje")
+        assert yanit.status_code in (401, 403)
+
+
+class TestKaliteToplanti:
+    """Kalite Toplantısı Kaydı - bireysel kontrol/NCR kaydının ötesinde kolektif
+    toplantı/karar kaydı."""
+
+    def test_toplanti_kaydedilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/kalite-toplanti", json={"Katilimcilar": "Ali, Veli", "GundemVeKararlar": "Hat 2 fire orani gorusuldu."})
+        assert yanit.status_code == 200
+
+    def test_listeleme_dogru_alanlari_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (1, "2026-09-01 10:00", "Ali, Veli", "Hat 2 fire orani gorusuldu.", None, "master")
+        ])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/kalite-toplanti")
+        assert yanit.status_code == 200
+        toplanti = yanit.json()["Toplantilar"][0]
+        assert toplanti["Katilimcilar"] == "Ali, Veli"
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/kalite-toplanti")
+        assert yanit.status_code in (401, 403)
+
+
 class TestMusteri360:
     """Müşteri 360° önceden hiç yoktu - ciro, açık bakiye, sipariş geçmişi ve
     zamanında teslimat oranı gibi bilgiler ayrı ayrı ekranlara dağılmıştı, tek
@@ -1185,6 +1597,7 @@ class TestMusteri360:
             (6000.0,),        # toplam tahsilat
             (3, 2500.0, "2026-08-20"),  # siparis sayisi, ort tutar, son siparis
             (2, 0),           # degerlendirilen, gec sayisi
+            (150.0,),         # puan bakiyesi
         ]
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
@@ -1193,6 +1606,7 @@ class TestMusteri360:
         veri = yanit.json()
         assert veri["AcikBakiye"] == 4000.0
         assert veri["ZamanindaTeslimatOrani"] == 100.0
+        assert veri["PuanBakiyesi"] == 150.0
 
     def test_hic_degerlendirilen_siparis_yoksa_teslimat_orani_none_doner(self, client, monkeypatch):
         conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
@@ -1202,12 +1616,14 @@ class TestMusteri360:
             (0.0,),
             (0, 0.0, None),
             (0, 0),
+            None,             # puan bakiyesi yok
         ]
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
         yanit = client.get("/musteri-360/1")
         assert yanit.status_code == 200
         assert yanit.json()["ZamanindaTeslimatOrani"] is None
+        assert yanit.json()["PuanBakiyesi"] == 0.0
 
     def test_yetkisiz_istekte_401_doner(self):
         yetkisiz_client = TestClient(main.app)

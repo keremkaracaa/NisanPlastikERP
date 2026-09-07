@@ -1496,6 +1496,7 @@ class StokKartiEkle(BaseModel):
     BirimFiyat: float = Field(ge=0)
     MinStokSeviyesi: float = Field(ge=0, default=0)
     Barkod: Optional[str] = None
+    UrunGrubu: Optional[str] = None
 
 class MasrafEkle(BaseModel):
     Kategori: str
@@ -1509,6 +1510,7 @@ class StokGuncelle(BaseModel):
     BirimFiyat: float = Field(ge=0)
     MinStokSeviyesi: float = Field(ge=0, default=0)
     Barkod: Optional[str] = None
+    UrunGrubu: Optional[str] = None
 
 class MusteriEkle(BaseModel):
     FirmaAdi: str
@@ -1565,6 +1567,7 @@ class AlisIrsaliyeKalem(BaseModel):
     StokKod: str
     StokAdi: str
     Miktar: float = Field(gt=0)
+    KaliteSonucu: Optional[str] = None  # KABUL | RED | SARTLI_KABUL - opsiyonel, Tedarikçi Skor Kartı için
 
 class AlisIrsaliyeKesRequest(BaseModel):
     TedarikciID: int
@@ -1572,6 +1575,7 @@ class AlisIrsaliyeKesRequest(BaseModel):
     Aciklama: Optional[str] = None
     Kalemler: list[AlisIrsaliyeKalem]
     DepoID: Optional[int] = None  # Belirtilmezse varsayılan (Merkez) depo kullanılır
+    SozVerilenTeslimTarihi: Optional[str] = None  # Tedarikçi Skor Kartı - zamanında teslimat ölçümü için
 
 class IrsaliyeKesRequest(BaseModel):
     MusteriID: int
@@ -2640,6 +2644,69 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _stok_ozet_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Stok özet migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _urun_alternatif_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Ürün alternatifi migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _musteri_puan_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Müşteri puan migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _tedarikci_skor_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Tedarikçi skor migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _demirbas_hareket_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Demirbaş hareket migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _proje_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Proje migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _kalite_toplanti_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Kalite toplantı migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -3080,6 +3147,125 @@ def _banka_mutabakat_migrationlari(cursor):
         )
     """, "BankaEkstreSatirlari tablosu")
 
+def _stok_ozet_migrationlari(cursor):
+    """Stok Ana Sayfa Özet Paneli + Ürün Grubu alanı için StokKartlari'na sütun eklemesi -
+    diğer yeni özellik migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_sutun_ekle(cursor, "StokKartlari", "UrunGrubu", "NVARCHAR(50) NULL")
+
+def _urun_alternatif_migrationlari(cursor):
+    """Ürün Alternatifi tablosu - bir hammadde bittiğinde önerilebilecek alternatif
+    ürünleri tutar, diğer yeni özellik migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='UrunAlternatifleri' and xtype='U')
+        CREATE TABLE UrunAlternatifleri (
+            AlternatifID INT IDENTITY(1,1) PRIMARY KEY,
+            StokKod VARCHAR(20) NOT NULL FOREIGN KEY REFERENCES StokKartlari(StokKod),
+            AlternatifStokKod VARCHAR(20) NOT NULL FOREIGN KEY REFERENCES StokKartlari(StokKod),
+            Aciklama NVARCHAR(300) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE(),
+            CONSTRAINT UQ_UrunAlternatif UNIQUE (StokKod, AlternatifStokKod)
+        )
+    """, "UrunAlternatifleri tablosu")
+
+def _musteri_puan_migrationlari(cursor):
+    """POS Sadakat/Puan Programı - müşteri puan bakiyesi + hareket geçmişi,
+    diğer yeni özellik migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='MusteriPuanlari' and xtype='U')
+        CREATE TABLE MusteriPuanlari (
+            MusteriID INT PRIMARY KEY FOREIGN KEY REFERENCES Musteriler(MusteriID),
+            Puan FLOAT NOT NULL DEFAULT 0
+        )
+    """, "MusteriPuanlari tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='MusteriPuanHareketleri' and xtype='U')
+        CREATE TABLE MusteriPuanHareketleri (
+            HareketID INT IDENTITY(1,1) PRIMARY KEY,
+            MusteriID INT NOT NULL FOREIGN KEY REFERENCES Musteriler(MusteriID),
+            Puan FLOAT NOT NULL,
+            Tur NVARCHAR(10) NOT NULL,
+            Aciklama NVARCHAR(300) NULL,
+            Tarih DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "MusteriPuanHareketleri tablosu")
+
+def _tedarikci_skor_migrationlari(cursor):
+    """Tedarikçi Skor Kartı - zamanında teslimat (SozVerilenTeslimTarihi) ve kalite
+    sonucu (KaliteSonucu) alanları, diğer yeni özellik migration'ları gibi kendi
+    başına, izole çağrılır. Doldurulmayan geçmiş kayıtlar skor hesabında atlanır,
+    kırılgan değildir."""
+    guvenli_sutun_ekle(cursor, "AlisIrsaliyeleri", "SozVerilenTeslimTarihi", "DATE NULL")
+    guvenli_sutun_ekle(cursor, "AlisIrsaliyeKalemleri", "KaliteSonucu", "NVARCHAR(20) NULL")
+
+def _demirbas_hareket_migrationlari(cursor):
+    """Varlık Hareketleri (Transfer/Lokasyon) - Demirbaslar'a Lokasyon alanı + geçmiş
+    transfer kayıtlarını tutan tablo, diğer yeni özellik migration'ları gibi kendi
+    başına, izole çağrılır. Mevcut 'Kategori' (serbest metin) alanına dokunulmaz."""
+    guvenli_sutun_ekle(cursor, "Demirbaslar", "Lokasyon", "NVARCHAR(100) NULL")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='DemirbasHareketleri' and xtype='U')
+        CREATE TABLE DemirbasHareketleri (
+            HareketID INT IDENTITY(1,1) PRIMARY KEY,
+            DemirbasID INT NOT NULL FOREIGN KEY REFERENCES Demirbaslar(DemirbasID),
+            EskiLokasyon NVARCHAR(100) NULL,
+            YeniLokasyon NVARCHAR(100) NOT NULL,
+            Tarih DATETIME NOT NULL DEFAULT GETDATE(),
+            KullaniciAdi NVARCHAR(50) NULL,
+            Aciklama NVARCHAR(300) NULL
+        )
+    """, "DemirbasHareketleri tablosu")
+
+def _proje_migrationlari(cursor):
+    """Proje / Görev / Zaman Planı modülü - sıfırdan yeni, diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Projeler' and xtype='U')
+        CREATE TABLE Projeler (
+            ProjeID INT IDENTITY(1,1) PRIMARY KEY,
+            ProjeAdi NVARCHAR(200) NOT NULL,
+            MusteriID INT NULL FOREIGN KEY REFERENCES Musteriler(MusteriID),
+            BaslangicTarihi DATE NULL,
+            BitisTarihi DATE NULL,
+            Butce FLOAT NOT NULL DEFAULT 0,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'Planlandı',
+            Aciklama NVARCHAR(500) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE(),
+            OlusturanKullanici NVARCHAR(50) NULL
+        )
+    """, "Projeler tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='ProjeGorevleri' and xtype='U')
+        CREATE TABLE ProjeGorevleri (
+            GorevID INT IDENTITY(1,1) PRIMARY KEY,
+            ProjeID INT NOT NULL FOREIGN KEY REFERENCES Projeler(ProjeID),
+            GorevAdi NVARCHAR(200) NOT NULL,
+            SorumluKullanici NVARCHAR(50) NULL,
+            BaslangicTarihi DATE NULL,
+            BitisTarihi DATE NULL,
+            TahminiSaat FLOAT NULL,
+            GercekSaat FLOAT NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'Yapılacak',
+            Oncelik NVARCHAR(10) NOT NULL DEFAULT 'Orta',
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "ProjeGorevleri tablosu")
+
+def _kalite_toplanti_migrationlari(cursor):
+    """Kalite Toplantısı Kaydı - bireysel kontrol/NCR kaydının ötesinde kolektif
+    toplantı/karar kaydı, diğer yeni özellik migration'ları gibi kendi başına,
+    izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='KaliteToplantilari' and xtype='U')
+        CREATE TABLE KaliteToplantilari (
+            ToplantiID INT IDENTITY(1,1) PRIMARY KEY,
+            Tarih DATETIME NOT NULL DEFAULT GETDATE(),
+            Katilimcilar NVARCHAR(300) NULL,
+            GundemVeKararlar NVARCHAR(MAX) NOT NULL,
+            IlgiliUygunsuzlukID INT NULL FOREIGN KEY REFERENCES UygunsuzlukKayitlari(UygunsuzlukID),
+            OlusturanKullanici NVARCHAR(50) NULL
+        )
+    """, "KaliteToplantilari tablosu")
+
 def butce_gerceklesen_hesapla(cursor, hesap_kodu: str, yil: int, ay: int) -> float:
     """Bir hesap kodunun belirli bir ay içindeki gerçekleşen tutarını HesapHareketleri'nden
     hesaplar. Gelir hesapları (6 ile başlayanlar, /kar-zarar-tablosu'ndaki (main.py ~3362)
@@ -3240,6 +3426,7 @@ class DemirbasRequest(BaseModel):
     Durumu: Optional[str] = "Aktif"
     Aciklama: Optional[str] = ""
     FaydaliOmurYil: Optional[int] = None
+    Lokasyon: Optional[str] = None
 @app.post("/demirbas-ekle")
 def demirbas_ekle(req: DemirbasRequest, current_user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
     if req.AlisTutari < 0:
@@ -3249,11 +3436,11 @@ def demirbas_ekle(req: DemirbasRequest, current_user: dict = Depends(yetki_kontr
     cursor = conn.cursor()
     try:
         tarih_str = req.AlisTarihi or datetime.datetime.now().strftime("%Y-%m-%d")
-        
+
         cursor.execute("""
-            INSERT INTO Demirbaslar (DemirbasAdi, Kategori, AlisTarihi, AlisTutari, SeriNo, Durumu, Aciklama, FaydaliOmurYil)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (req.DemirbasAdi, req.Kategori, tarih_str, req.AlisTutari, req.SeriNo, req.Durumu, req.Aciklama, req.FaydaliOmurYil))
+            INSERT INTO Demirbaslar (DemirbasAdi, Kategori, AlisTarihi, AlisTutari, SeriNo, Durumu, Aciklama, FaydaliOmurYil, Lokasyon)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (req.DemirbasAdi, req.Kategori, tarih_str, req.AlisTutari, req.SeriNo, req.Durumu, req.Aciklama, req.FaydaliOmurYil, req.Lokasyon))
         
         k_adi = current_user.get("sub", "admin") if isinstance(current_user, dict) else str(current_user)
         cursor.execute("""
@@ -3383,11 +3570,11 @@ def demirbaslari_getir(current_user: str = Depends(get_current_user)):
     cursor = conn.cursor()
     try:
         cursor.execute("""SELECT DemirbasID, DemirbasAdi, Kategori, AlisTarihi, AlisTutari, SeriNo, Durumu, Aciklama,
-                           FaydaliOmurYil, ISNULL(BirikmisAmortisman,0)
+                           FaydaliOmurYil, ISNULL(BirikmisAmortisman,0), Lokasyon
                            FROM Demirbaslar""")
         rows = cursor.fetchall()
         sonuc = []
-        for demirbas_id, ad, kategori, alis_tarihi, alis_tutari, seri_no, durumu, aciklama, faydali_omur, birikmis in rows:
+        for demirbas_id, ad, kategori, alis_tarihi, alis_tutari, seri_no, durumu, aciklama, faydali_omur, birikmis, lokasyon in rows:
             alis_tutari = float(alis_tutari) if alis_tutari else 0.0
             birikmis = float(birikmis) if birikmis else 0.0
             sonuc.append({
@@ -3402,10 +3589,247 @@ def demirbaslari_getir(current_user: str = Depends(get_current_user)):
                 "FaydaliOmurYil": faydali_omur,
                 "BirikmisAmortisman": birikmis,
                 "NetDeger": alis_tutari - birikmis,
+                "Lokasyon": lokasyon or "-",
             })
         return sonuc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Veritabanı hatası: {str(e)}")
+    finally:
+        conn.close()
+
+class DemirbasTransferRequest(BaseModel):
+    DemirbasID: int
+    YeniLokasyon: str
+    Aciklama: Optional[str] = None
+
+@app.post("/demirbas-transfer")
+def demirbas_transfer(veri: DemirbasTransferRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Lokasyon FROM Demirbaslar WHERE DemirbasID=?", (veri.DemirbasID,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Demirbaş bulunamadı.")
+        eski_lokasyon = row[0]
+
+        cursor.execute("UPDATE Demirbaslar SET Lokasyon=? WHERE DemirbasID=?", (veri.YeniLokasyon, veri.DemirbasID))
+        cursor.execute("""INSERT INTO DemirbasHareketleri (DemirbasID, EskiLokasyon, YeniLokasyon, KullaniciAdi, Aciklama)
+                           VALUES (?, ?, ?, ?, ?)""",
+                       (veri.DemirbasID, eski_lokasyon, veri.YeniLokasyon, user["username"], veri.Aciklama))
+        log_islem(cursor, f"Demirbaş #{veri.DemirbasID} transfer edildi: {eski_lokasyon or '-'} -> {veri.YeniLokasyon}", user["username"])
+        conn.commit()
+        return {"mesaj": "Demirbaş transfer edildi."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+class ProjeEkle(BaseModel):
+    ProjeAdi: str
+    MusteriID: Optional[int] = None
+    BaslangicTarihi: Optional[str] = None
+    BitisTarihi: Optional[str] = None
+    Butce: float = Field(ge=0, default=0)
+    Durum: str = "Planlandı"  # Planlandı | Devam Ediyor | Tamamlandı | İptal
+    Aciklama: Optional[str] = None
+
+class ProjeGuncelle(ProjeEkle):
+    ProjeID: int
+
+@app.post("/proje")
+def proje_ekle(veri: ProjeEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Üretim"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""INSERT INTO Projeler (ProjeAdi, MusteriID, BaslangicTarihi, BitisTarihi, Butce, Durum, Aciklama, OlusturanKullanici)
+                           OUTPUT inserted.ProjeID VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (veri.ProjeAdi, veri.MusteriID, veri.BaslangicTarihi, veri.BitisTarihi, veri.Butce,
+                        veri.Durum, veri.Aciklama, user["username"]))
+        proje_id = int(cursor.fetchone()[0])
+        log_islem(cursor, f"Proje oluşturuldu: {veri.ProjeAdi}", user["username"])
+        conn.commit()
+        return {"mesaj": "Proje oluşturuldu.", "ProjeID": proje_id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/proje")
+def proje_listesi(user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT p.ProjeID, p.ProjeAdi, p.MusteriID, m.FirmaAdi, p.BaslangicTarihi, p.BitisTarihi,
+                                  p.Butce, p.Durum, p.Aciklama
+                           FROM Projeler p LEFT JOIN Musteriler m ON m.MusteriID = p.MusteriID
+                           ORDER BY p.OlusturmaTarihi DESC""")
+        return {"Projeler": [{"ProjeID": r[0], "ProjeAdi": r[1], "MusteriID": r[2], "MusteriAdi": r[3] or "-",
+                               "BaslangicTarihi": str(r[4]) if r[4] else None, "BitisTarihi": str(r[5]) if r[5] else None,
+                               "Butce": float(r[6]), "Durum": r[7], "Aciklama": r[8] or ""} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.put("/proje")
+def proje_guncelle(veri: ProjeGuncelle, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Üretim"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""UPDATE Projeler SET ProjeAdi=?, MusteriID=?, BaslangicTarihi=?, BitisTarihi=?, Butce=?, Durum=?, Aciklama=?
+                           WHERE ProjeID=?""",
+                       (veri.ProjeAdi, veri.MusteriID, veri.BaslangicTarihi, veri.BitisTarihi, veri.Butce,
+                        veri.Durum, veri.Aciklama, veri.ProjeID))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Proje bulunamadı.")
+        log_islem(cursor, f"Proje güncellendi: #{veri.ProjeID}", user["username"])
+        conn.commit()
+        return {"mesaj": "Proje güncellendi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.delete("/proje/{proje_id}")
+def proje_sil(proje_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM ProjeGorevleri WHERE ProjeID=?", (proje_id,))
+        cursor.execute("DELETE FROM Projeler WHERE ProjeID=?", (proje_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Proje bulunamadı.")
+        log_islem(cursor, f"Proje silindi: #{proje_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Proje silindi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.get("/proje/{proje_id}/ozet")
+def proje_ozet(proje_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT ProjeAdi, Butce FROM Projeler WHERE ProjeID=?", (proje_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Proje bulunamadı.")
+        proje_adi, butce = row
+        cursor.execute("""SELECT COUNT(*), SUM(CASE WHEN Durum='Tamamlandı' THEN 1 ELSE 0 END), ISNULL(SUM(GercekSaat),0)
+                           FROM ProjeGorevleri WHERE ProjeID=?""", (proje_id,))
+        toplam_gorev, tamamlanan, toplam_saat = cursor.fetchone()
+        toplam_gorev = int(toplam_gorev or 0)
+        tamamlanan = int(tamamlanan or 0)
+        tamamlanma_yuzdesi = round(tamamlanan / toplam_gorev * 100, 1) if toplam_gorev else 0
+        return {"ProjeAdi": proje_adi, "Butce": float(butce), "ToplamGorevSayisi": toplam_gorev,
+                "TamamlananGorevSayisi": tamamlanan, "TamamlanmaYuzdesi": tamamlanma_yuzdesi,
+                "ToplamHarcananSaat": float(toplam_saat or 0)}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+class ProjeGorevEkle(BaseModel):
+    ProjeID: int
+    GorevAdi: str
+    SorumluKullanici: Optional[str] = None
+    BaslangicTarihi: Optional[str] = None
+    BitisTarihi: Optional[str] = None
+    TahminiSaat: Optional[float] = None
+    GercekSaat: Optional[float] = None
+    Durum: str = "Yapılacak"  # Yapılacak | Devam Ediyor | Tamamlandı
+    Oncelik: str = "Orta"  # Düşük | Orta | Yüksek
+
+class ProjeGorevGuncelle(ProjeGorevEkle):
+    GorevID: int
+
+@app.post("/proje-gorev")
+def proje_gorev_ekle(veri: ProjeGorevEkle, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 FROM Projeler WHERE ProjeID=?", (veri.ProjeID,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Proje bulunamadı.")
+        cursor.execute("""INSERT INTO ProjeGorevleri (ProjeID, GorevAdi, SorumluKullanici, BaslangicTarihi, BitisTarihi,
+                                                        TahminiSaat, GercekSaat, Durum, Oncelik)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (veri.ProjeID, veri.GorevAdi, veri.SorumluKullanici, veri.BaslangicTarihi, veri.BitisTarihi,
+                        veri.TahminiSaat, veri.GercekSaat, veri.Durum, veri.Oncelik))
+        log_islem(cursor, f"Proje görevi eklendi: {veri.GorevAdi} (Proje #{veri.ProjeID})", user["username"])
+        conn.commit()
+        return {"mesaj": "Görev eklendi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.get("/proje-gorev/{proje_id}")
+def proje_gorev_listesi(proje_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT GorevID, GorevAdi, SorumluKullanici, BaslangicTarihi, BitisTarihi, TahminiSaat,
+                                  GercekSaat, Durum, Oncelik
+                           FROM ProjeGorevleri WHERE ProjeID=? ORDER BY OlusturmaTarihi""", (proje_id,))
+        return {"Gorevler": [{"GorevID": r[0], "GorevAdi": r[1], "SorumluKullanici": r[2] or "-",
+                               "BaslangicTarihi": str(r[3]) if r[3] else None, "BitisTarihi": str(r[4]) if r[4] else None,
+                               "TahminiSaat": float(r[5]) if r[5] is not None else None,
+                               "GercekSaat": float(r[6]) if r[6] is not None else None,
+                               "Durum": r[7], "Oncelik": r[8]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.put("/proje-gorev")
+def proje_gorev_guncelle(veri: ProjeGorevGuncelle, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""UPDATE ProjeGorevleri SET GorevAdi=?, SorumluKullanici=?, BaslangicTarihi=?, BitisTarihi=?,
+                                                       TahminiSaat=?, GercekSaat=?, Durum=?, Oncelik=?
+                           WHERE GorevID=?""",
+                       (veri.GorevAdi, veri.SorumluKullanici, veri.BaslangicTarihi, veri.BitisTarihi,
+                        veri.TahminiSaat, veri.GercekSaat, veri.Durum, veri.Oncelik, veri.GorevID))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Görev bulunamadı.")
+        log_islem(cursor, f"Proje görevi güncellendi: #{veri.GorevID}", user["username"])
+        conn.commit()
+        return {"mesaj": "Görev güncellendi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.delete("/proje-gorev/{gorev_id}")
+def proje_gorev_sil(gorev_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM ProjeGorevleri WHERE GorevID=?", (gorev_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Görev bulunamadı.")
+        log_islem(cursor, f"Proje görevi silindi: #{gorev_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Görev silindi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.get("/demirbas-hareketleri/{demirbas_id}")
+def demirbas_hareketleri(demirbas_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT EskiLokasyon, YeniLokasyon, Tarih, KullaniciAdi, Aciklama
+                           FROM DemirbasHareketleri WHERE DemirbasID=? ORDER BY Tarih DESC""", (demirbas_id,))
+        return {"Hareketler": [{"EskiLokasyon": r[0] or "-", "YeniLokasyon": r[1], "Tarih": str(r[2])[:16],
+                                 "KullaniciAdi": r[3] or "-", "Aciklama": r[4] or ""} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -3736,11 +4160,134 @@ def musteri_360(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"
             "SonSiparisTarihi": str(son_siparis_tarihi)[:10] if son_siparis_tarihi else None,
             "ZamanindaTeslimatOrani": zamaninda_teslimat_orani, "DegerlendirilenSiparisSayisi": int(degerlendirilen or 0),
             "SonFaturalar": son_faturalar, "SonTahsilatlar": son_tahsilatlar,
+            "PuanBakiyesi": _musteri_puan_bakiyesi_getir(cursor, musteri_id),
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Veritabanı hatası: {str(e)}")
+    finally:
+        conn.close()
+
+def _musteri_puan_bakiyesi_getir(cursor, musteri_id: int) -> float:
+    cursor.execute("SELECT Puan FROM MusteriPuanlari WHERE MusteriID=?", (musteri_id,))
+    row = cursor.fetchone()
+    return float(row[0]) if row else 0.0
+
+class MusteriPuanKazandir(BaseModel):
+    MusteriID: int
+    TutarTL: float = Field(gt=0)
+
+@app.post("/musteri-puan-kazandir")
+def musteri_puan_kazandir(veri: MusteriPuanKazandir, user: dict = Depends(get_current_user)):
+    """Bir satış tamamlandığında tutarın SistemAyarlari'ndaki PuanKazanimOrani (satış
+    tutarının yüzdesi, varsayılan %1) kadarını müşteriye puan olarak yazar."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 FROM Musteriler WHERE MusteriID=?", (veri.MusteriID,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Müşteri bulunamadı.")
+
+        cursor.execute("SELECT AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari='PuanKazanimOrani'")
+        oran_satiri = cursor.fetchone()
+        try:
+            oran = float(oran_satiri[0]) if oran_satiri and oran_satiri[0] else 1.0
+        except ValueError:
+            oran = 1.0
+        kazanilan_puan = round(veri.TutarTL * (oran / 100.0), 2)
+        if kazanilan_puan <= 0:
+            return {"mesaj": "Kazanılan puan yok.", "KazanilanPuan": 0, "YeniBakiye": _musteri_puan_bakiyesi_getir(cursor, veri.MusteriID)}
+
+        cursor.execute("SELECT Puan FROM MusteriPuanlari WHERE MusteriID=?", (veri.MusteriID,))
+        mevcut = cursor.fetchone()
+        if mevcut:
+            cursor.execute("UPDATE MusteriPuanlari SET Puan = Puan + ? WHERE MusteriID=?", (kazanilan_puan, veri.MusteriID))
+        else:
+            cursor.execute("INSERT INTO MusteriPuanlari (MusteriID, Puan) VALUES (?, ?)", (veri.MusteriID, kazanilan_puan))
+        cursor.execute("INSERT INTO MusteriPuanHareketleri (MusteriID, Puan, Tur, Aciklama) VALUES (?, ?, 'KAZANIM', ?)",
+                       (veri.MusteriID, kazanilan_puan, f"{veri.TutarTL:,.2f} TL satıştan kazanım"))
+        log_islem(cursor, f"Müşteri #{veri.MusteriID} {kazanilan_puan} puan kazandı.", user["username"])
+        conn.commit()
+        return {"mesaj": "Puan kazandırıldı.", "KazanilanPuan": kazanilan_puan,
+                "YeniBakiye": _musteri_puan_bakiyesi_getir(cursor, veri.MusteriID)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/musteri-puan/{musteri_id}")
+def musteri_puan_getir(musteri_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        bakiye = _musteri_puan_bakiyesi_getir(cursor, musteri_id)
+        cursor.execute("""SELECT TOP 20 Puan, Tur, Aciklama, Tarih FROM MusteriPuanHareketleri
+                           WHERE MusteriID=? ORDER BY Tarih DESC""", (musteri_id,))
+        hareketler = [{"Puan": float(r[0]), "Tur": r[1], "Aciklama": r[2] or "", "Tarih": str(r[3])[:16]} for r in cursor.fetchall()]
+        return {"Bakiye": bakiye, "Hareketler": hareketler}
+    finally:
+        conn.close()
+
+def _tedarikci_skor_hesapla(cursor, tedarikci_id: int) -> dict:
+    """Zamanında teslimat oranı: SozVerilenTeslimTarihi girilmiş irsaliyeler arasında
+    fiili giriş tarihinin (Tarih) söz verilenin ötesine geçmediği oran. Kalite kabul
+    oranı: KaliteSonucu girilmiş kalemler arasında 'KABUL' oranı. İkisi de doldurulmamış
+    geçmiş kayıtlar/kalemler hesaba katılmaz (kırılgan olmasın diye) - hangileri
+    dolduruldu ise onlar üzerinden hesaplanır."""
+    cursor.execute("""
+        SELECT COUNT(*), SUM(CASE WHEN CAST(Tarih AS DATE) <= SozVerilenTeslimTarihi THEN 1 ELSE 0 END)
+        FROM AlisIrsaliyeleri WHERE TedarikciID=? AND SozVerilenTeslimTarihi IS NOT NULL
+    """, (tedarikci_id,))
+    degerlendirilen_teslimat, zamaninda = cursor.fetchone()
+    zamaninda_orani = round((zamaninda or 0) / degerlendirilen_teslimat * 100, 1) if degerlendirilen_teslimat else None
+
+    cursor.execute("""
+        SELECT COUNT(*), SUM(CASE WHEN k.KaliteSonucu='KABUL' THEN 1 ELSE 0 END)
+        FROM AlisIrsaliyeKalemleri k JOIN AlisIrsaliyeleri a ON a.AlisIrsaliyeID = k.AlisIrsaliyeID
+        WHERE a.TedarikciID=? AND k.KaliteSonucu IS NOT NULL
+    """, (tedarikci_id,))
+    degerlendirilen_kalite, kabul = cursor.fetchone()
+    kalite_orani = round((kabul or 0) / degerlendirilen_kalite * 100, 1) if degerlendirilen_kalite else None
+
+    oranlar = [o for o in (zamaninda_orani, kalite_orani) if o is not None]
+    genel_skor = round(sum(oranlar) / len(oranlar), 1) if oranlar else None
+    return {"ZamanindaTeslimatOrani": zamaninda_orani, "DegerlendirilenTeslimatSayisi": int(degerlendirilen_teslimat or 0),
+            "KaliteKabulOrani": kalite_orani, "DegerlendirilenKaliteKalemSayisi": int(degerlendirilen_kalite or 0),
+            "GenelSkor": genel_skor}
+
+@app.get("/tedarikci-skor-karti/{tedarikci_id}")
+def tedarikci_skor_karti(tedarikci_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma", "Depo"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT FirmaAdi FROM Tedarikciler WHERE TedarikciID=?", (tedarikci_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Tedarikçi bulunamadı.")
+        skor = _tedarikci_skor_hesapla(cursor, tedarikci_id)
+        return {"TedarikciID": tedarikci_id, "FirmaAdi": row[0], **skor}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.get("/tedarikci-skor-listesi")
+def tedarikci_skor_listesi(user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma", "Depo"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT TedarikciID, FirmaAdi FROM Tedarikciler")
+        tedarikciler = cursor.fetchall()
+        sonuc = []
+        for tedarikci_id, firma_adi in tedarikciler:
+            skor = _tedarikci_skor_hesapla(cursor, tedarikci_id)
+            sonuc.append({"TedarikciID": tedarikci_id, "FirmaAdi": firma_adi, **skor})
+        sonuc.sort(key=lambda x: (x["GenelSkor"] is None, -(x["GenelSkor"] or 0)))
+        return {"Tedarikciler": sonuc}
     finally:
         conn.close()
 
@@ -4984,13 +5531,13 @@ def stok_listesi_getir(user: dict = Depends(get_current_user)):
         cursor.execute("SELECT COL_LENGTH('StokKartlari', 'OrtalamaMaliyet')")
         maliyet_sutunu_var = cursor.fetchone()[0] is not None
         if maliyet_sutunu_var:
-            cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), ISNULL(OrtalamaMaliyet,0), Barkod, ISNULL(RezerveMiktar,0) FROM StokKartlari")
+            cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), ISNULL(OrtalamaMaliyet,0), Barkod, ISNULL(RezerveMiktar,0), UrunGrubu FROM StokKartlari")
         else:
-            cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), 0, Barkod, ISNULL(RezerveMiktar,0) FROM StokKartlari")
+            cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), 0, Barkod, ISNULL(RezerveMiktar,0), UrunGrubu FROM StokKartlari")
         return {"stoklar": [{"StokKod": s[0], "StokAdi": s[1], "Birim": s[2], "MevcutMiktar": float(s[3]) if s[3] is not None else 0,
                               "BirimFiyat": float(s[4]) if s[4] is not None else 0, "MinStokSeviyesi": float(s[5]) if s[5] is not None else 0,
                               "OrtalamaMaliyet": float(s[6]) if s[6] is not None else 0, "Barkod": s[7] or "",
-                              "RezerveMiktar": float(s[8]) if s[8] is not None else 0,
+                              "RezerveMiktar": float(s[8]) if s[8] is not None else 0, "UrunGrubu": s[9] or "",
                               "KullanilabilirMiktar": (float(s[3]) if s[3] is not None else 0) - (float(s[8]) if s[8] is not None else 0),
                               "KarMarji": kar_marji_hesapla(float(s[4]), float(s[6]))} for s in cursor.fetchall()]}
     finally:
@@ -5023,6 +5570,111 @@ def negatif_stoklar_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Depo
         """)
         return {"negatifler": [{"StokKod": s[0], "StokAdi": s[1], "Birim": s[2], "MevcutMiktar": float(s[3]),
                                  "RezerveMiktar": float(s[4])} for s in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/stok-ozet-panel")
+def stok_ozet_panel(user: dict = Depends(get_current_user)):
+    """Stok Ana Sayfa Özet Paneli - toplam değer/depo/ürün sayısı + ürün grubuna göre
+    stok değeri dağılımı (pasta grafik). UrunGrubu boş bırakılmış kartlar 'Diğer'
+    grubunda toplanır, kırılgan olmaz."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT ISNULL(SUM(MevcutMiktar*OrtalamaMaliyet),0), COUNT(*) FROM StokKartlari")
+        deger, urun_sayisi = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM Depolar WHERE AktifMi=1")
+        depo_satiri = cursor.fetchone()
+        depo_sayisi = int(depo_satiri[0]) if depo_satiri else 0
+
+        cursor.execute("""
+            SELECT ISNULL(NULLIF(LTRIM(RTRIM(UrunGrubu)), ''), 'Diğer') AS Grup, SUM(MevcutMiktar*OrtalamaMaliyet)
+            FROM StokKartlari GROUP BY ISNULL(NULLIF(LTRIM(RTRIM(UrunGrubu)), ''), 'Diğer')
+            HAVING SUM(MevcutMiktar*OrtalamaMaliyet) > 0
+            ORDER BY SUM(MevcutMiktar*OrtalamaMaliyet) DESC
+        """)
+        gruplar = cursor.fetchall()
+        grafik = None
+        if gruplar:
+            grafik = {"Tip": "pasta", "Baslik": "Ürün Grubuna Göre Stok Değeri",
+                      "Etiketler": [g[0] for g in gruplar], "Degerler": [round(float(g[1]), 2) for g in gruplar]}
+
+        return {
+            "Stats": [
+                {"Etiket": "Toplam Stok Değeri", "Deger": f"{float(deger):,.2f} TL"},
+                {"Etiket": "Toplam Depo", "Deger": str(depo_sayisi)},
+                {"Etiket": "Toplam Aktif Ürün", "Deger": str(int(urun_sayisi))},
+            ],
+            "Grafik": grafik,
+        }
+    finally:
+        conn.close()
+
+@app.get("/stok-yaslandirma")
+def stok_yaslandirma_raporu(esik_gun: int = 90, user: dict = Depends(get_current_user)):
+    """Ölü Stok raporu: mevcut miktarı pozitif olup son StokHareketleri kaydı esik_gun
+    gün veya daha eski olan (ya da hiç hareket görmemiş) stok kartları."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT sk.StokKod, sk.StokAdi, sk.Birim, sk.MevcutMiktar,
+                   sk.MevcutMiktar*ISNULL(sk.OrtalamaMaliyet,0) AS StokDegeri,
+                   son.SonHareketTarihi,
+                   CASE WHEN son.SonHareketTarihi IS NULL THEN NULL
+                        ELSE DATEDIFF(day, son.SonHareketTarihi, GETDATE()) END AS GunFarki
+            FROM StokKartlari sk
+            LEFT JOIN (SELECT StokKod, MAX(Tarih) AS SonHareketTarihi FROM StokHareketleri GROUP BY StokKod) son
+                ON son.StokKod = sk.StokKod
+            WHERE sk.MevcutMiktar > 0
+              AND (son.SonHareketTarihi IS NULL OR DATEDIFF(day, son.SonHareketTarihi, GETDATE()) >= ?)
+            ORDER BY CASE WHEN son.SonHareketTarihi IS NULL THEN 1 ELSE 0 END DESC, GunFarki DESC
+        """, (esik_gun,))
+        return {"OluStoklar": [{"StokKod": s[0], "StokAdi": s[1], "Birim": s[2], "MevcutMiktar": float(s[3]),
+                                 "StokDegeri": float(s[4]) if s[4] is not None else 0,
+                                 "SonHareketTarihi": s[5].strftime("%d.%m.%Y") if s[5] else None,
+                                 "GunFarki": int(s[6]) if s[6] is not None else None} for s in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/stok-ongoru")
+def stok_ongoru_raporu(user: dict = Depends(get_current_user)):
+    """Öngörülen Stok Miktarı: mevcut miktar - açık satış rezervasyonu (RezerveMiktar,
+    zaten tutulan bir alan) - açık üretim emirlerinin hammadde ihtiyacı (reçete
+    bileşenleri üzerinden, MRP'nin _mrp_hesapla'sındaki aynı sorgu deseni) + açık/
+    onaylı satınalma taleplerinin bekleyen miktarı. Tek seviyeli bir yaklaşıklıktır
+    (MRP'deki gibi çok seviyeli reçete patlatması yapılmaz), salt okunur rapordur."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT rb.HammaddeKodu, SUM((e.PlanlananMiktar - ISNULL(e.GerceklesenMiktar,0)) * rb.Miktar * (1 + ISNULL(rb.FireOrani,0)/100.0))
+            FROM UretimEmirleri e
+            JOIN UretimReceteleri r ON e.ReceteID = r.ReceteID
+            JOIN ReceteBilesenleri rb ON rb.ReceteID = r.ReceteID
+            WHERE e.Durum <> 'Tamamlandı'
+            GROUP BY rb.HammaddeKodu
+        """)
+        uretim_ihtiyaci = {row[0]: float(row[1] or 0) for row in cursor.fetchall()}
+
+        cursor.execute("SELECT StokKod, ISNULL(SUM(Miktar),0) FROM SatinAlmaTalepleri WHERE Durum='Onaylandı' GROUP BY StokKod")
+        bekleyen_satinalma = {row[0]: float(row[1] or 0) for row in cursor.fetchall()}
+
+        cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, ISNULL(RezerveMiktar,0) FROM StokKartlari")
+        sonuc = []
+        for stok_kod, stok_adi, birim, mevcut, rezerve in cursor.fetchall():
+            mevcut = float(mevcut or 0)
+            rezerve = float(rezerve or 0)
+            uretim_tuketimi = uretim_ihtiyaci.get(stok_kod, 0.0)
+            gelecek_alis = bekleyen_satinalma.get(stok_kod, 0.0)
+            ongoru = mevcut - rezerve - uretim_tuketimi + gelecek_alis
+            if rezerve == 0 and uretim_tuketimi == 0 and gelecek_alis == 0:
+                continue
+            sonuc.append({"StokKod": stok_kod, "StokAdi": stok_adi, "Birim": birim, "MevcutMiktar": mevcut,
+                           "RezerveMiktar": rezerve, "AcikUretimTuketimi": round(uretim_tuketimi, 4),
+                           "BekleyenSatinalma": gelecek_alis, "OngorulenMiktar": round(ongoru, 4)})
+        sonuc.sort(key=lambda x: x["OngorulenMiktar"])
+        return {"Ongoru": sonuc}
     finally:
         conn.close()
 
@@ -5188,8 +5840,8 @@ def stok_ekle(stok: StokKartiEkle, user: dict = Depends(yetki_kontrol(["Yönetic
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO StokKartlari (StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, MinStokSeviyesi, Barkod) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                       (stok.StokKod, stok.StokAdi, stok.Birim, stok.MevcutMiktar, stok.BirimFiyat, stok.MinStokSeviyesi, stok.Barkod))
+        cursor.execute("INSERT INTO StokKartlari (StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, MinStokSeviyesi, Barkod, UrunGrubu) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                       (stok.StokKod, stok.StokAdi, stok.Birim, stok.MevcutMiktar, stok.BirimFiyat, stok.MinStokSeviyesi, stok.Barkod, stok.UrunGrubu))
         cursor.execute("INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Aciklama) VALUES (?, 'GİRİŞ', ?, 'Yeni Stok Kartı Açıldı')",
                        (stok.StokKod, stok.MevcutMiktar))
         log_islem(cursor, f"Stok kartı eklendi: {stok.StokKod} - {stok.StokAdi}", user["username"])
@@ -5238,8 +5890,8 @@ def stok_guncelle(stok: StokGuncelle, user: dict = Depends(yetki_kontrol(["Yöne
     try:
         cursor.execute("SELECT StokAdi, Birim, BirimFiyat, MinStokSeviyesi FROM StokKartlari WHERE StokKod=?", (stok.StokKod,))
         eski = cursor.fetchone()
-        cursor.execute("UPDATE StokKartlari SET StokAdi=?, Birim=?, BirimFiyat=?, MinStokSeviyesi=?, Barkod=? WHERE StokKod=?",
-                       (stok.StokAdi, stok.Birim, stok.BirimFiyat, stok.MinStokSeviyesi, stok.Barkod, stok.StokKod))
+        cursor.execute("UPDATE StokKartlari SET StokAdi=?, Birim=?, BirimFiyat=?, MinStokSeviyesi=?, Barkod=?, UrunGrubu=? WHERE StokKod=?",
+                       (stok.StokAdi, stok.Birim, stok.BirimFiyat, stok.MinStokSeviyesi, stok.Barkod, stok.UrunGrubu, stok.StokKod))
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="Stok kartı bulunamadı.")
         if eski:
@@ -5413,6 +6065,66 @@ def stok_sil(stok_kod: str, user: dict = Depends(yetki_kontrol(["Yönetici", "De
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=f"Silinemedi: {e}")
+    finally:
+        conn.close()
+
+class UrunAlternatifEkle(BaseModel):
+    StokKod: str
+    AlternatifStokKod: str
+    Aciklama: Optional[str] = None
+
+@app.post("/urun-alternatif")
+def urun_alternatif_ekle(veri: UrunAlternatifEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "Üretim", "Depo"]))):
+    if veri.StokKod == veri.AlternatifStokKod:
+        raise HTTPException(status_code=400, detail="Bir ürün kendisinin alternatifi olamaz.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        for kod in (veri.StokKod, veri.AlternatifStokKod):
+            cursor.execute("SELECT 1 FROM StokKartlari WHERE StokKod=?", (kod,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail=f"'{kod}' stok kartı bulunamadı.")
+        cursor.execute("INSERT INTO UrunAlternatifleri (StokKod, AlternatifStokKod, Aciklama) VALUES (?, ?, ?)",
+                       (veri.StokKod, veri.AlternatifStokKod, veri.Aciklama))
+        log_islem(cursor, f"Ürün alternatifi eklendi: {veri.StokKod} -> {veri.AlternatifStokKod}", user["username"])
+        conn.commit()
+        return {"mesaj": "Alternatif ürün eklendi."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Zaten eklenmiş olabilir: {e}")
+    finally:
+        conn.close()
+
+@app.get("/urun-alternatif/{stok_kod}")
+def urun_alternatif_listesi(stok_kod: str, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT a.AlternatifID, a.AlternatifStokKod, sk.StokAdi, sk.MevcutMiktar, sk.Birim, a.Aciklama
+            FROM UrunAlternatifleri a JOIN StokKartlari sk ON sk.StokKod = a.AlternatifStokKod
+            WHERE a.StokKod = ?
+        """, (stok_kod,))
+        return {"Alternatifler": [{"AlternatifID": r[0], "AlternatifStokKod": r[1], "StokAdi": r[2],
+                                    "MevcutMiktar": float(r[3]), "Birim": r[4], "Aciklama": r[5] or ""} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.delete("/urun-alternatif/{alternatif_id}")
+def urun_alternatif_sil(alternatif_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Üretim", "Depo"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM UrunAlternatifleri WHERE AlternatifID=?", (alternatif_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Kayıt bulunamadı.")
+        log_islem(cursor, f"Ürün alternatifi silindi: #{alternatif_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Alternatif kaldırıldı."}
+    except HTTPException:
+        raise
     finally:
         conn.close()
 
@@ -6505,6 +7217,26 @@ def firsat_listesi_getir(user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
+_SATIS_HUNISI_ASAMALARI = ["İlk Görüşme", "Teklif", "Müzakere", "Kazanıldı", "Kaybedildi"]
+
+@app.get("/satis-hunisi")
+def satis_hunisi_getir(user: dict = Depends(get_current_user)):
+    """Satış Hunisi: SatisFirsatlari'nda sabit 5 aşamaya (init_firsatlar'daki dropdown ile
+    aynı) göre fırsat sayısı + tahmini tutar toplamı. Veri olmayan aşamalar da 0 olarak
+    döner, ki huni sırası bozulmasın."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Asama, COUNT(*), ISNULL(SUM(TahminiTutar),0) FROM SatisFirsatlari GROUP BY Asama")
+        veri_map = {row[0]: (int(row[1]), float(row[2])) for row in cursor.fetchall()}
+        asamalar = []
+        for asama in _SATIS_HUNISI_ASAMALARI:
+            sayi, tutar = veri_map.get(asama, (0, 0.0))
+            asamalar.append({"Asama": asama, "Sayi": sayi, "TahminiTutar": round(tutar, 2)})
+        return {"Asamalar": asamalar}
+    finally:
+        conn.close()
+
 class FirsatAsamaGuncelleRequest(BaseModel):
     Asama: str  # İlk Görüşme | Teklif | Müzakere | Kazanıldı | Kaybedildi
 
@@ -6887,6 +7619,226 @@ def cari_bakiye_hesapla(musteri_id: int, user: dict = Depends(get_current_user))
         toplam_tahsilat = float(cursor.fetchone()[0])
         bakiye = toplam_borc - toplam_tahsilat
         return {"MusteriID": musteri_id, "ToplamBorc": toplam_borc, "ToplamTahsilat": toplam_tahsilat, "NetBakiye": bakiye}
+    finally:
+        conn.close()
+
+def _son_6_ay_ciro_grafigi(cursor):
+    """dashboard-grafik-verisi'ndeki aylık ciro sorgusunun kısaltılmış (son 6 ay)
+    hali - modül özet ekranlarında birden fazla kategoride tekrar kullanılıyor."""
+    etiketler, degerler = [], []
+    simdi = datetime.datetime.now()
+    for i in range(5, -1, -1):
+        cursor.execute("""
+            SELECT ISNULL(SUM(ToplamTutar), 0) FROM Faturalar
+            WHERE Tarih >= DATEADD(month, DATEDIFF(month, 0, GETDATE()) - ?, 0)
+              AND Tarih < DATEADD(month, DATEDIFF(month, 0, GETDATE()) - ? + 1, 0)
+        """, (i, i))
+        ciro = float(cursor.fetchone()[0])
+        hedef_ay = simdi.month - i
+        hedef_yil = simdi.year
+        while hedef_ay <= 0:
+            hedef_ay += 12
+            hedef_yil -= 1
+        etiketler.append(f"{hedef_ay:02d}/{str(hedef_yil)[2:]}")
+        degerler.append(ciro)
+    return {"Tip": "cizgi", "Baslik": "Son 6 Ay Ciro", "Etiketler": etiketler, "Degerler": degerler}
+
+@app.get("/modul-ozet/{kategori_kodu}")
+def modul_ozet(kategori_kodu: str, user: dict = Depends(get_current_user)):
+    """Giriş paneli -> modül modu için her kategoriye özel gerçek istatistik ve
+    (bazılarında) grafik verisi döner. Ekran gruplaması (hangi sekme hangi alt
+    başlıkta) tamamen arayuz.py'de statik bir sözlükle yapılıyor, burada SADECE
+    sayılar hesaplanıyor."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        stats = []
+        grafik = None
+
+        if kategori_kodu == "genel":
+            cursor.execute("SELECT ISNULL(SUM(ToplamTutar),0) FROM Faturalar")
+            toplam_ciro = float(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM Siparisler WHERE Durum='Bekliyor'")
+            bekleyen_siparis = int(cursor.fetchone()[0])
+            cursor.execute("""SELECT COUNT(*) FROM StokKartlari
+                               WHERE MevcutMiktar < 0 OR (MevcutMiktar <= ISNULL(MinStokSeviyesi,0) AND ISNULL(MinStokSeviyesi,0) > 0)""")
+            kritik_stok = int(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Toplam Ciro", "Deger": f"{toplam_ciro:,.2f} TL"},
+                {"Etiket": "Bekleyen Sipariş", "Deger": str(bekleyen_siparis)},
+                {"Etiket": "Kritik Stok", "Deger": str(kritik_stok)},
+            ]
+            grafik = _son_6_ay_ciro_grafigi(cursor)
+
+        elif kategori_kodu == "uretim":
+            cursor.execute("SELECT COUNT(*) FROM UretimEmirleri WHERE Durum NOT IN ('Tamamlandı','İptal')")
+            aktif = int(cursor.fetchone()[0])
+            cursor.execute("""SELECT COUNT(*) FROM UretimEmirleri
+                               WHERE Durum='Tamamlandı' AND EmirTarihi >= DATEADD(month, DATEDIFF(month,0,GETDATE()), 0)""")
+            bu_ay_tamamlanan = int(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM UygunsuzlukKayitlari WHERE KapanisTarihi IS NULL")
+            acik_uygunsuzluk = int(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Aktif Üretim Emri", "Deger": str(aktif)},
+                {"Etiket": "Bu Ay Tamamlanan", "Deger": str(bu_ay_tamamlanan)},
+                {"Etiket": "Açık Uygunsuzluk", "Deger": str(acik_uygunsuzluk)},
+            ]
+            cursor.execute("""SELECT Durum, COUNT(*) FROM UretimEmirleri GROUP BY Durum""")
+            durum_satirlari = cursor.fetchall()
+            if durum_satirlari:
+                grafik = {"Tip": "pasta", "Baslik": "Üretim Emri Durumları",
+                          "Etiketler": [r[0] or "Belirsiz" for r in durum_satirlari],
+                          "Degerler": [float(r[1]) for r in durum_satirlari]}
+
+        elif kategori_kodu == "stok":
+            cursor.execute("""SELECT COUNT(*) FROM StokKartlari
+                               WHERE MevcutMiktar < 0 OR (MevcutMiktar <= ISNULL(MinStokSeviyesi,0) AND ISNULL(MinStokSeviyesi,0) > 0)""")
+            kritik = int(cursor.fetchone()[0])
+            cursor.execute("SELECT ISNULL(SUM(MevcutMiktar*OrtalamaMaliyet),0) FROM StokKartlari")
+            deger = float(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM StokKartlari WHERE MevcutMiktar < 0")
+            negatif = int(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Kritik Stok", "Deger": str(kritik)},
+                {"Etiket": "Toplam Stok Değeri", "Deger": f"{deger:,.2f} TL"},
+                {"Etiket": "Negatif Stok", "Deger": str(negatif)},
+            ]
+
+        elif kategori_kodu == "satinalma":
+            cursor.execute("SELECT COUNT(*) FROM SatinAlmaTalepleri WHERE Durum='Bekliyor'")
+            bekleyen_talep = int(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM TeklifTalepleri WHERE Durum='Bekliyor'")
+            acik_rfq = int(cursor.fetchone()[0])
+            cursor.execute("""SELECT ISNULL(SUM(ToplamTutar),0) FROM AlisFaturalari
+                               WHERE Tarih >= DATEADD(month, DATEDIFF(month,0,GETDATE()), 0)""")
+            bu_ay_alis = float(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Bekleyen Satınalma Talebi", "Deger": str(bekleyen_talep)},
+                {"Etiket": "Açık Teklif Talebi", "Deger": str(acik_rfq)},
+                {"Etiket": "Bu Ay Alış Toplamı", "Deger": f"{bu_ay_alis:,.2f} TL"},
+            ]
+
+        elif kategori_kodu == "urun_maliyet":
+            cursor.execute("""
+                SELECT ISNULL(SUM(fs.SatirToplami),0), ISNULL(SUM(fs.Miktar*ISNULL(s.OrtalamaMaliyet,0)),0)
+                FROM FaturaSatirlari fs LEFT JOIN StokKartlari s ON fs.StokKod = s.StokKod
+            """)
+            satis, maliyet = cursor.fetchone()
+            satis, maliyet = float(satis), float(maliyet)
+            ort_marj = ((satis - maliyet) / satis * 100) if satis > 0 else 0.0
+            cursor.execute("SELECT COUNT(*) FROM StokKartlari WHERE ISNULL(BirimFiyat,0) > 0 AND ISNULL(OrtalamaMaliyet,0) > 0 AND (BirimFiyat-OrtalamaMaliyet)/BirimFiyat < 0.10")
+            dusuk_marjli = int(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Ortalama Kâr Marjı", "Deger": f"%{ort_marj:.1f}"},
+                {"Etiket": "Düşük Marjlı Ürün (<%10)", "Deger": str(dusuk_marjli)},
+            ]
+
+        elif kategori_kodu == "satis_crm":
+            cursor.execute("SELECT COUNT(*) FROM Siparisler WHERE Durum='Bekliyor'")
+            bekleyen = int(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM SatisFirsatlari WHERE Asama NOT IN ('Kazanıldı','Kaybedildi')")
+            acik_firsat = int(cursor.fetchone()[0])
+            cursor.execute("""SELECT ISNULL(SUM(ToplamTutar),0) FROM Siparisler
+                               WHERE SiparisTarihi >= DATEADD(month, DATEDIFF(month,0,GETDATE()), 0)""")
+            bu_ay_siparis = float(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Bekleyen Sipariş", "Deger": str(bekleyen)},
+                {"Etiket": "Açık Satış Fırsatı", "Deger": str(acik_firsat)},
+                {"Etiket": "Bu Ay Sipariş Toplamı", "Deger": f"{bu_ay_siparis:,.2f} TL"},
+            ]
+            grafik = _son_6_ay_ciro_grafigi(cursor)
+
+        elif kategori_kodu == "finans":
+            cursor.execute("SELECT ISNULL(SUM(Bakiye),0) FROM BankaHesaplari")
+            toplam_bakiye = float(cursor.fetchone()[0])
+            cursor.execute("""SELECT COUNT(*) FROM TeminatMektuplari
+                               WHERE BitisTarihi IS NOT NULL AND DATEDIFF(day, GETDATE(), BitisTarihi) BETWEEN 0 AND 30""")
+            yaklasan_teminat = int(cursor.fetchone()[0])
+            cursor.execute("""SELECT COUNT(*) FROM KrediTaksitleri
+                               WHERE ISNULL(OdendiMi,0)=0 AND DATEDIFF(day, GETDATE(), VadeTarihi) BETWEEN 0 AND 30""")
+            yaklasan_taksit = int(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Toplam Banka Bakiyesi", "Deger": f"{toplam_bakiye:,.2f} TL"},
+                {"Etiket": "30 Gün İçinde Dolan Teminat", "Deger": str(yaklasan_teminat)},
+                {"Etiket": "30 Gün İçinde Vadesi Gelen Taksit", "Deger": str(yaklasan_taksit)},
+            ]
+
+        elif kategori_kodu == "muhasebe":
+            cursor.execute("SELECT ISNULL(SUM(Borc),0), ISNULL(SUM(Alacak),0) FROM HesapHareketleri")
+            borc, alacak = cursor.fetchone()
+            fark = float(borc) - float(alacak)
+            cursor.execute("SELECT ISNULL(SUM(ToplamTutar),0) FROM Faturalar")
+            toplam_fatura = float(cursor.fetchone()[0])
+            cursor.execute("SELECT ISNULL(SUM(Tutar),0) FROM Tahsilatlar")
+            toplam_tahsilat = float(cursor.fetchone()[0])
+            acik_bakiye = toplam_fatura - toplam_tahsilat
+            stats = [
+                {"Etiket": "Mizan Denge Farkı", "Deger": ("Dengede ✅" if abs(fark) < 0.01 else f"{fark:,.2f} TL")},
+                {"Etiket": "Toplam Açık Alacak", "Deger": f"{acik_bakiye:,.2f} TL"},
+            ]
+
+        elif kategori_kodu == "faturalar":
+            cursor.execute("""SELECT COUNT(*), ISNULL(SUM(ToplamTutar),0) FROM Faturalar
+                               WHERE Tarih >= DATEADD(month, DATEDIFF(month,0,GETDATE()), 0)""")
+            adet, tutar = cursor.fetchone()
+            stats = [
+                {"Etiket": "Bu Ay Kesilen Fatura", "Deger": str(int(adet))},
+                {"Etiket": "Bu Ay Fatura Toplamı", "Deger": f"{float(tutar):,.2f} TL"},
+            ]
+
+        elif kategori_kodu == "ik":
+            cursor.execute("SELECT COUNT(*) FROM Personeller WHERE Durum='Aktif'")
+            aktif_personel = int(cursor.fetchone()[0])
+            stats = [{"Etiket": "Aktif Personel", "Deger": str(aktif_personel)}]
+
+        elif kategori_kodu == "ortak":
+            cursor.execute("SELECT COUNT(*) FROM OnayBekleyenIslemler WHERE Durum='Bekliyor'")
+            bekleyen_onay = int(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM ImzaTalepleri WHERE Durum='BEKLIYOR'")
+            bekleyen_imza = int(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Bekleyen Onay", "Deger": str(bekleyen_onay)},
+                {"Etiket": "Bekleyen İmza Talebi", "Deger": str(bekleyen_imza)},
+            ]
+
+        elif kategori_kodu == "sistem":
+            cursor.execute("SELECT COUNT(*) FROM AlarmGecmisi WHERE OkunduMu=0")
+            okunmamis = int(cursor.fetchone()[0])
+            son_yedek_metni = "Hiç alınmamış"
+            try:
+                if os.path.isdir(YEDEK_KLASORU):
+                    bak_dosyalari = [f for f in os.listdir(YEDEK_KLASORU) if f.lower().endswith(".bak")]
+                    if bak_dosyalari:
+                        en_yeni = max(bak_dosyalari, key=lambda f: os.path.getmtime(os.path.join(YEDEK_KLASORU, f)))
+                        son_yedek_metni = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(YEDEK_KLASORU, en_yeni))).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                pass
+            stats = [
+                {"Etiket": "Okunmamış Alarm", "Deger": str(okunmamis)},
+                {"Etiket": "Son Yedek", "Deger": son_yedek_metni},
+            ]
+
+        elif kategori_kodu == "proje":
+            cursor.execute("SELECT COUNT(*) FROM Projeler WHERE Durum NOT IN ('Tamamlandı','İptal')")
+            aktif_proje = int(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM ProjeGorevleri WHERE Durum <> 'Tamamlandı'")
+            acik_gorev = int(cursor.fetchone()[0])
+            cursor.execute("SELECT ISNULL(SUM(Butce),0) FROM Projeler WHERE Durum NOT IN ('Tamamlandı','İptal')")
+            toplam_butce = float(cursor.fetchone()[0])
+            stats = [
+                {"Etiket": "Aktif Proje", "Deger": str(aktif_proje)},
+                {"Etiket": "Açık Görev", "Deger": str(acik_gorev)},
+                {"Etiket": "Aktif Proje Bütçesi", "Deger": f"{toplam_butce:,.2f} TL"},
+            ]
+
+        else:
+            raise HTTPException(status_code=404, detail=f"Bilinmeyen kategori kodu: {kategori_kodu}")
+
+        return {"Stats": stats, "Grafik": grafik}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Veritabanı hatası: {str(e)}")
     finally:
         conn.close()
 
@@ -7555,14 +8507,14 @@ def alis_irsaliyesi_kes(req: AlisIrsaliyeKesRequest, user: dict = Depends(yetki_
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT INTO AlisIrsaliyeleri (TedarikciID, BelgeNo, Aciklama, KullaniciAdi)
-            OUTPUT inserted.AlisIrsaliyeID VALUES (?, ?, ?, ?)
-        """, (req.TedarikciID, req.BelgeNo, req.Aciklama, user["username"]))
+            INSERT INTO AlisIrsaliyeleri (TedarikciID, BelgeNo, Aciklama, KullaniciAdi, SozVerilenTeslimTarihi)
+            OUTPUT inserted.AlisIrsaliyeID VALUES (?, ?, ?, ?, ?)
+        """, (req.TedarikciID, req.BelgeNo, req.Aciklama, user["username"], req.SozVerilenTeslimTarihi))
         alis_irsaliye_id = int(cursor.fetchone()[0])
 
         for kalem in req.Kalemler:
-            cursor.execute("INSERT INTO AlisIrsaliyeKalemleri (AlisIrsaliyeID, StokKod, StokAdi, Miktar) VALUES (?, ?, ?, ?)",
-                           (alis_irsaliye_id, kalem.StokKod, kalem.StokAdi, kalem.Miktar))
+            cursor.execute("INSERT INTO AlisIrsaliyeKalemleri (AlisIrsaliyeID, StokKod, StokAdi, Miktar, KaliteSonucu) VALUES (?, ?, ?, ?, ?)",
+                           (alis_irsaliye_id, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.KaliteSonucu))
             cursor.execute("UPDATE StokKartlari SET MevcutMiktar = MevcutMiktar + ? WHERE StokKod = ?",
                            (kalem.Miktar, kalem.StokKod))
             depo_stok_guncelle(cursor, kalem.StokKod, (req.DepoID or varsayilan_depo_id(cursor)), kalem.Miktar)
@@ -8695,6 +9647,41 @@ def uygunsuzluk_listesi(durum: Optional[str] = None, user: dict = Depends(get_cu
         return {"uygunsuzluklar": [{"UygunsuzlukID": r[0], "LotID": r[1], "HataKodu": r[2], "HataAciklama": r[3] or "",
                                      "Siddet": r[4], "Durum": r[5], "AcanKullanici": r[6], "AcilisTarihi": str(r[7])[:16],
                                      "KapanisTarihi": str(r[8])[:16] if r[8] else None} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+class KaliteToplantiEkle(BaseModel):
+    Katilimcilar: Optional[str] = None
+    GundemVeKararlar: str
+    IlgiliUygunsuzlukID: Optional[int] = None
+
+@app.post("/kalite-toplanti")
+def kalite_toplanti_ekle(veri: KaliteToplantiEkle, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""INSERT INTO KaliteToplantilari (Katilimcilar, GundemVeKararlar, IlgiliUygunsuzlukID, OlusturanKullanici)
+                           VALUES (?, ?, ?, ?)""",
+                       (veri.Katilimcilar, veri.GundemVeKararlar, veri.IlgiliUygunsuzlukID, user["username"]))
+        log_islem(cursor, "Kalite toplantısı kaydedildi.", user["username"])
+        conn.commit()
+        return {"mesaj": "Kalite toplantısı kaydedildi."}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/kalite-toplanti")
+def kalite_toplanti_listesi(user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT ToplantiID, Tarih, Katilimcilar, GundemVeKararlar, IlgiliUygunsuzlukID, OlusturanKullanici
+                           FROM KaliteToplantilari ORDER BY Tarih DESC""")
+        return {"Toplantilar": [{"ToplantiID": r[0], "Tarih": str(r[1])[:16], "Katilimcilar": r[2] or "-",
+                                  "GundemVeKararlar": r[3], "IlgiliUygunsuzlukID": r[4],
+                                  "OlusturanKullanici": r[5] or "-"} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
