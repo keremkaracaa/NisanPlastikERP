@@ -1496,6 +1496,35 @@ class TestWhatsappTestGonder:
         assert yanit.status_code in (401, 403)
 
 
+class TestHaftalikRaporManuelGonder:
+    """otomatik_rapor_gonder zaten her Cuma 17:00'de otomatik çalışıyordu ama hiçbir
+    arayüz ekranı/manuel test ucu yoktu - kullanıcı çalışıp çalışmadığını göremiyordu.
+    Artık sonuç döndürüyor ve /haftalik-rapor-simdi-gonder ile elle tetiklenebiliyor."""
+
+    def test_eposta_ayari_yoksa_basarisiz_sonuc_doner(self, monkeypatch):
+        monkeypatch.setattr(main, "eposta_ayarlarini_getir", lambda: None)
+        sonuc = main.otomatik_rapor_gonder()
+        assert sonuc["basarili"] is False
+
+    def test_manuel_gonder_ucu_basarili_sonucu_doner(self, client, monkeypatch):
+        monkeypatch.setattr(main, "otomatik_rapor_gonder",
+                             lambda: {"basarili": True, "Alici": "patron@example.com", "FaturaSayisi": 58, "ToplamCiro": 125000.0})
+        yanit = client.post("/haftalik-rapor-simdi-gonder")
+        assert yanit.status_code == 200
+        assert yanit.json()["Alici"] == "patron@example.com"
+
+    def test_manuel_gonder_basarisizsa_400_doner(self, client, monkeypatch):
+        monkeypatch.setattr(main, "otomatik_rapor_gonder",
+                             lambda: {"basarili": False, "hata": "E-posta ayarları yapılandırılmamış."})
+        yanit = client.post("/haftalik-rapor-simdi-gonder")
+        assert yanit.status_code == 400
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/haftalik-rapor-simdi-gonder")
+        assert yanit.status_code in (401, 403)
+
+
 class TestOtomatikYedekleme:
     """Otomatik veritabanı yedeklemesi önceden hiç yoktu - /veritabani-yedekle
     sadece elle tıklanınca çalışıyordu. Artık her gece otomatik çalışan ve eski

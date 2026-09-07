@@ -3158,6 +3158,15 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(wa_satiri2, text="📤 Test Mesajı Gönder", fg_color="#25D366", hover_color="#128C7E",
                       command=self.whatsapp_test_gonder_islem).pack(side="left")
 
+        rapor_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=8)
+        rapor_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(rapor_cerceve, text="📊 Haftalık Yönetici Raporu", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(rapor_cerceve, text="Her Cuma saat 17:00'de toplam ciro, fatura sayısı ve kritik stok özetini yukarıdaki e-posta ayarlarındaki alıcıya otomatik gönderir. "
+                     "SMTP ayarları (üstteki 'E-posta Ayarları' kartı) doldurulmamışsa gönderilmez.",
+                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+        ctk.CTkButton(rapor_cerceve, text="📤 Şimdi Gönder (Test)", fg_color="#0d9488", hover_color="#0f766e",
+                      command=self.haftalik_rapor_simdi_gonder_islem).pack(anchor="w", padx=10, pady=(0, 10))
+
         self._eposta_ayarlarini_yukle()
         self._efatura_ayarlarini_yukle()
         self._yedek_ayarlarini_yukle()
@@ -3260,6 +3269,18 @@ class MainApp(ctk.CTkToplevel):
             res = requests.post(f"{API}/whatsapp-test-gonder", headers=self.req_headers(), timeout=15)
             if res.status_code == 200:
                 messagebox.showinfo("Başarılı", "Test mesajı gönderildi.")
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def haftalik_rapor_simdi_gonder_islem(self):
+        try:
+            res = requests.post(f"{API}/haftalik-rapor-simdi-gonder", headers=self.req_headers(), timeout=20)
+            if res.status_code == 200:
+                sonuc = res.json()
+                messagebox.showinfo("Başarılı", f"Rapor {sonuc.get('Alici')} adresine gönderildi.\n"
+                                     f"Fatura Sayısı: {sonuc.get('FaturaSayisi')}, Toplam Ciro: {sonuc.get('ToplamCiro', 0):,.2f} TL")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:

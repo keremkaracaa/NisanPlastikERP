@@ -264,10 +264,14 @@ def whatsapp_mesaj_gonder(mesaj: str, ayarlar: dict = None) -> dict:
         return {"basarili": False, "hata": str(e)}
 
 def otomatik_rapor_gonder():
+    """Haftalık ciro/kritik stok özetini e-posta ile gönderir - zaten her Cuma
+    17:00'de otomatik çalışıyordu ama hiçbir arayüz ekranı olmadığından kullanıcı
+    çalışıp çalışmadığını göremiyor, elle test edemiyordu. Artık sonuç döner
+    (arayüzdeki manuel 'Şimdi Gönder' butonu bu sonucu gösterir)."""
     ayar = eposta_ayarlarini_getir()
     if not ayar:
         print(">>> Otomatik rapor gönderilemedi: E-posta ayarları henüz yapılandırılmamış (Sistem Ayarları'ndan girin).")
-        return
+        return {"basarili": False, "hata": "E-posta ayarları yapılandırılmamış. Bildirim Ayarları'ndan SMTP bilgilerini girin."}
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -326,9 +330,11 @@ def otomatik_rapor_gonder():
         server.login(ayar["gonderen"], ayar["sifre"])
         server.send_message(msg)
         server.quit()
-        print("✅ Otomatik rapor başarıyla gönderildi!")
+        print(">>> Otomatik rapor başarıyla gönderildi!")
+        return {"basarili": True, "Alici": ayar["alici"], "FaturaSayisi": fatura_sayisi, "ToplamCiro": toplam_ciro}
     except Exception as e:
-        print(f"❌ Otomatik rapor hatası: {e}")
+        print(f">>> Otomatik rapor hatası: {e}")
+        return {"basarili": False, "hata": str(e)}
 
 # Arka Plan Zamanlayıcısını Başlat - Raporu her Cuma saat 17:00'de gönderir
 scheduler = BackgroundScheduler()
@@ -4809,6 +4815,16 @@ def whatsapp_test_gonder(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
     if sonuc["basarili"]:
         return {"mesaj": "Test mesajı gönderildi."}
     raise HTTPException(status_code=400, detail=f"Gönderilemedi: {sonuc['hata']}")
+
+@app.post("/haftalik-rapor-simdi-gonder")
+def haftalik_rapor_simdi_gonder(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    """Zaten her Cuma 17:00'de otomatik çalışan haftalık rapor e-postasını (main.py:266
+    otomatik_rapor_gonder) hemen, manuel olarak tetikler - kullanıcı SMTP ayarlarının
+    doğru çalıştığını beklemeden test edebilsin diye."""
+    sonuc = otomatik_rapor_gonder()
+    if sonuc and sonuc.get("basarili"):
+        return sonuc
+    raise HTTPException(status_code=400, detail=(sonuc or {}).get("hata", "Rapor gönderilemedi."))
 
 @app.get("/depolar")
 def depolari_getir(user: dict = Depends(get_current_user)):
