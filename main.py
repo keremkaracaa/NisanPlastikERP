@@ -10320,53 +10320,6 @@ def alis_faturalari_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muha
     finally:
         conn.close()
 
-def fifo_stok_degeri_hesapla(cursor, stok_kod: str):
-    """FIFO yöntemiyle bir stok kaleminin GÜNCEL kalan değerini hesaplar - mevcut
-    OrtalamaMaliyet (ağırlıklı ortalama) mantığına DOKUNMAZ, sadece karşılaştırma
-    raporu için. Girdi katmanları AlisFaturaSatirlari'ndan (tarih sırasıyla),
-    toplam çıkış StokHareketleri'nden alınır. NOT: üretimle oluşan mamul girişleri
-    bu hesaba dahil değildir (sadece satın alınan hammadde/ticari mal için anlamlı)."""
-    cursor.execute("SELECT ISNULL(SUM(Miktar),0) FROM StokHareketleri WHERE StokKod=? AND IslemTuru='ÇIKIŞ'", (stok_kod,))
-    kalan_cikis = float(cursor.fetchone()[0])
-    cursor.execute("""SELECT s.Miktar, s.BirimFiyat FROM AlisFaturaSatirlari s
-                       JOIN AlisFaturalari f ON s.AlisFaturaID = f.AlisFaturaID
-                       WHERE s.StokKod=? ORDER BY f.Tarih ASC""", (stok_kod,))
-    fifo_miktar, fifo_deger = 0.0, 0.0
-    for miktar, fiyat in cursor.fetchall():
-        miktar = float(miktar)
-        if kalan_cikis >= miktar:
-            kalan_cikis -= miktar
-            continue
-        kalan_bu_katmanda = miktar - kalan_cikis
-        kalan_cikis = 0
-        fifo_miktar += kalan_bu_katmanda
-        fifo_deger += kalan_bu_katmanda * float(fiyat)
-    return fifo_miktar, fifo_deger
-
-@app.get("/fifo-maliyet-raporu")
-def fifo_maliyet_raporu(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
-    """Her stok kalemi için FIFO ile hesaplanan değeri, mevcut ağırlıklı ortalama
-    maliyet değeriyle (MevcutMiktar * OrtalamaMaliyet) karşılaştırır. Sadece satın
-    alınan (üretilmemiş) kalemler için FIFO değeri anlamlıdır - hiç alış faturası
-    satırı olmayan (yalnızca üretimle oluşan) kalemlerde FifoDegeri 0 döner."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT StokKod, StokAdi, MevcutMiktar, ISNULL(OrtalamaMaliyet,0) FROM StokKartlari")
-        stoklar = cursor.fetchall()
-        rapor = []
-        for stok_kod, stok_adi, mevcut_miktar, ortalama_maliyet in stoklar:
-            fifo_miktar, fifo_deger = fifo_stok_degeri_hesapla(cursor, stok_kod)
-            ortalama_deger = float(mevcut_miktar or 0) * float(ortalama_maliyet or 0)
-            rapor.append({
-                "StokKod": stok_kod, "StokAdi": stok_adi, "MevcutMiktar": float(mevcut_miktar or 0),
-                "OrtalamaMaliyetDegeri": ortalama_deger, "FifoMiktar": fifo_miktar, "FifoDegeri": fifo_deger,
-                "Fark": fifo_deger - ortalama_deger,
-            })
-        return {"rapor": rapor}
-    finally:
-        conn.close()
-
 @app.post("/personel-ekle")
 def personel_ekle(veri: PersonelEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları"]))):
     conn = get_db_connection()

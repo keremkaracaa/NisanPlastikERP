@@ -3626,8 +3626,6 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkLabel(ust, text="📊 Mali Tablolar", font=("Arial", 18, "bold"), text_color="#f97316").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#2563eb", hover_color="#1d4ed8",
                       command=self.mali_tablolari_yukle).pack(side="right")
-        ctk.CTkButton(ust, text="📐 FIFO Maliyet Raporu", fg_color="#7c3aed", hover_color="#6d28d9",
-                      command=self.fifo_maliyet_raporu_penceresi).pack(side="right", padx=(0, 8))
         ctk.CTkLabel(self.tab_mali_tablolar, text="Not: Bu tablolar Yevmiye kayıtlarından otomatik üretilir, resmi beyan için mali müşavirinizin onayından geçmelidir.",
                      font=("Arial", 10), text_color="#f59e0b", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
 
@@ -3666,38 +3664,6 @@ class MainApp(ctk.CTkToplevel):
                       command=self.enflasyon_duzeltmesi_hesapla_islem).pack(side="left")
         self.enf_sonuc_alani = ctk.CTkScrollableFrame(enf_cerceve, fg_color="transparent", height=200)
         self.enf_sonuc_alani.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-
-    def fifo_maliyet_raporu_penceresi(self):
-        win = ctk.CTkToplevel(self)
-        win.title("FIFO Maliyet Raporu")
-        win.geometry("900x560")
-        win.configure(fg_color=gecerli_renk(RENK_TABAN))
-        win.transient(self)
-        win.lift()
-        win.focus_force()
-        win.grab_set()
-
-        ctk.CTkLabel(win, text="📐 FIFO Maliyet Raporu (Karşılaştırma Amaçlı)", font=("Arial", 16, "bold"), text_color="#7c3aed").pack(anchor="w", padx=20, pady=(20, 5))
-        ctk.CTkLabel(win, text="⚠️ Bu rapor mevcut Ağırlıklı Ortalama maliyet yöntemini DEĞİŞTİRMEZ, sadece FIFO ile karşılaştırma sunar. "
-                     "Sadece satın alınan (üretilmemiş) kalemler için FIFO değeri anlamlıdır.",
-                     font=("Arial", 10), text_color="#f59e0b", wraplength=850, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
-
-        fifo_cerceve, fifo_tree = tablo_olustur(
-            win, ["Stok Kod", "Stok Adı", "Mevcut Miktar", "Ort. Maliyet Değeri", "FIFO Değeri", "Fark"],
-            [90, 200, 100, 140, 140, 120], height=18)
-        fifo_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-
-        try:
-            res = requests.get(f"{API}/fifo-maliyet-raporu", headers=self.req_headers(), timeout=15)
-            if res.status_code == 200:
-                for satir in res.json().get("rapor", []):
-                    fifo_tree.insert("", "end", values=(
-                        satir["StokKod"], satir["StokAdi"], f"{satir['MevcutMiktar']:g}",
-                        f"{satir['OrtalamaMaliyetDegeri']:,.2f}", f"{satir['FifoDegeri']:,.2f}", f"{satir['Fark']:,.2f}"))
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def enflasyon_duzeltmesi_hesapla_islem(self):
         for w in self.enf_sonuc_alani.winfo_children():
