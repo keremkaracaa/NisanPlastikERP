@@ -13,6 +13,7 @@ import secrets
 import json
 import time
 import io
+import csv
 import requests
 from datetime import datetime, timedelta
 from datetime import date
@@ -2624,6 +2625,15 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _banka_mutabakat_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Banka mutabakat migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -3045,6 +3055,24 @@ def _amortisman_migrationlari(cursor):
         IF NOT EXISTS (SELECT 1 FROM HesapPlani WHERE HesapKodu='257')
         INSERT INTO HesapPlani (HesapKodu, HesapAdi, Bakiye) VALUES ('257', 'Birikmiş Amortismanlar', 0)
     """, "257 Birikmiş Amortismanlar hesabı")
+
+def _banka_mutabakat_migrationlari(cursor):
+    """Banka Mutabakatı (ekstre içe aktarma + eşleştirme) için tablo/alan eklemesi -
+    diğer yeni özellik migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_sutun_ekle(cursor, "BankaHareketleri", "Mutabik", "BIT NOT NULL DEFAULT 0")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='BankaEkstreSatirlari' and xtype='U')
+        CREATE TABLE BankaEkstreSatirlari (
+            EkstreSatirID INT IDENTITY(1,1) PRIMARY KEY,
+            HesapID INT NOT NULL FOREIGN KEY REFERENCES BankaHesaplari(HesapID),
+            Tarih DATE NOT NULL,
+            Tutar FLOAT NOT NULL,
+            Aciklama NVARCHAR(500) NULL,
+            EslesenHareketID INT NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'BEKLIYOR',
+            YuklemeTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "BankaEkstreSatirlari tablosu")
 
 def butce_gerceklesen_hesapla(cursor, hesap_kodu: str, yil: int, ay: int) -> float:
     """Bir hesap kodunun belirli bir ay içindeki gerçekleşen tutarını HesapHareketleri'nden
@@ -9334,6 +9362,112 @@ def banka_hareket_ekle(veri: BankaHareketiEkle, user: dict = Depends(yetki_kontr
         log_islem(cursor, f"Banka Hareketi: {veri.IslemTuru} - {veri.Tutar} TL", user["username"])
         conn.commit()
         return {"mesaj": "Banka hareketi işlendi."}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.post("/banka-ekstresi-yukle")
+def banka_ekstresi_yukle(hesap_id: int = Form(...), dosya: UploadFile = File(...),
+                          user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    """Banka ekstresini basit bir CSV şablonuyla (sütunlar: Tarih,Tutar,Aciklama - başlık
+    satırı zorunlu) içeri aktarır. KAPSAM: gerçek bankaların export formatı (MT940, farklı
+    CSV düzenleri) bankaya göre değişir - bu genel/basit bir şablondur, gerçek kullanımda
+    bankanın export dosyası bu 3 sütuna uyacak şekilde düzenlenmelidir."""
+    try:
+        icerik = dosya.file.read().decode("utf-8-sig")
+        okuyucu = csv.DictReader(io.StringIO(icerik))
+        satirlar = list(okuyucu)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV okunamadı: {e}")
+    if not satirlar:
+        raise HTTPException(status_code=400, detail="Dosyada satır bulunamadı.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 FROM BankaHesaplari WHERE HesapID=?", (hesap_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Banka hesabı bulunamadı.")
+        eklenen = 0
+        for satir in satirlar:
+            try:
+                tarih = satir["Tarih"].strip()
+                tutar = float(satir["Tutar"].strip().replace(",", "."))
+                aciklama = (satir.get("Aciklama") or "").strip()
+            except (KeyError, ValueError):
+                continue
+            cursor.execute("""INSERT INTO BankaEkstreSatirlari (HesapID, Tarih, Tutar, Aciklama) VALUES (?, ?, ?, ?)""",
+                           (hesap_id, tarih, tutar, aciklama))
+            eklenen += 1
+        log_islem(cursor, f"Banka ekstresi yüklendi: {dosya.filename} ({eklenen} satır)", user["username"])
+        conn.commit()
+        return {"mesaj": f"{eklenen} ekstre satırı yüklendi.", "Yuklenen": eklenen, "Toplam": len(satirlar)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/banka-mutabakat-onerileri/{hesap_id}")
+def banka_mutabakat_onerileri(hesap_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    """BEKLIYOR durumundaki her ekstre satırı için, aynı hesapta henüz mutabık olmayan
+    ve tutarı birebir eşleşen, tarihi ±3 gün içinde olan bir BankaHareketleri satırı
+    varsa 'öneri' olarak eşleştirir - kesin eşleştirme kullanıcının onayına bırakılır."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT EkstreSatirID, Tarih, Tutar, Aciklama FROM BankaEkstreSatirlari
+                           WHERE HesapID=? AND Durum='BEKLIYOR' ORDER BY Tarih""", (hesap_id,))
+        ekstre_satirlari = cursor.fetchall()
+        oneriler = []
+        for ekstre_id, tarih, tutar, aciklama in ekstre_satirlari:
+            cursor.execute("""SELECT TOP 1 HareketID, Tarih, Tutar, Aciklama FROM BankaHareketleri
+                               WHERE HesapID=? AND ISNULL(Mutabik,0)=0 AND Tutar=?
+                                 AND ABS(DATEDIFF(day, Tarih, ?)) <= 3
+                               ORDER BY ABS(DATEDIFF(day, Tarih, ?))""", (hesap_id, tutar, tarih, tarih))
+            hareket = cursor.fetchone()
+            oneriler.append({
+                "EkstreSatirID": ekstre_id, "EkstreTarih": str(tarih), "EkstreTutar": float(tutar), "EkstreAciklama": aciklama or "",
+                "OnerilenHareketID": hareket[0] if hareket else None,
+                "OnerilenTarih": str(hareket[1])[:16] if hareket else None,
+                "OnerilenTutar": float(hareket[2]) if hareket else None,
+                "OnerilenAciklama": hareket[3] if hareket else None,
+            })
+        return {"oneriler": oneriler}
+    finally:
+        conn.close()
+
+class BankaMutabakatOnaylaRequest(BaseModel):
+    HareketID: int
+
+@app.put("/banka-mutabakat-onayla/{ekstre_satir_id}")
+def banka_mutabakat_onayla(ekstre_satir_id: int, veri: BankaMutabakatOnaylaRequest,
+                            user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT Durum FROM BankaEkstreSatirlari WHERE EkstreSatirID=?", (ekstre_satir_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Ekstre satırı bulunamadı.")
+        if row[0] != "BEKLIYOR":
+            raise HTTPException(status_code=400, detail=f"Bu satır zaten '{row[0]}' durumunda.")
+        cursor.execute("SELECT 1 FROM BankaHareketleri WHERE HareketID=?", (veri.HareketID,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Eşleştirilecek banka hareketi bulunamadı.")
+
+        cursor.execute("UPDATE BankaEkstreSatirlari SET Durum='ESLESTI', EslesenHareketID=? WHERE EkstreSatirID=?",
+                       (veri.HareketID, ekstre_satir_id))
+        cursor.execute("UPDATE BankaHareketleri SET Mutabik=1 WHERE HareketID=?", (veri.HareketID,))
+        log_islem(cursor, f"Banka mutabakatı onaylandı: Ekstre #{ekstre_satir_id} <-> Hareket #{veri.HareketID}", user["username"])
+        conn.commit()
+        return {"mesaj": "Mutabakat onaylandı."}
+    except HTTPException:
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))

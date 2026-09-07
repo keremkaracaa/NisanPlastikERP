@@ -17,6 +17,7 @@ doğru JSON'a dönüştürdüğünü, (3) hatalı girdilerde doğru HTTP kodunu 
 hızlıca ve DB bağımlılığı olmadan doğrulamaktır.
 """
 import os
+import io
 import pytest
 from unittest.mock import MagicMock
 from fastapi.testclient import TestClient
@@ -1669,6 +1670,83 @@ class TestKurFarkiOtomatikGuncelKur:
     def test_yetkisiz_istekte_401_doner(self):
         yetkisiz_client = TestClient(main.app)
         yanit = yetkisiz_client.post("/kur-farki-fisi-ekle", json={"ParaBirimi": "USD", "DovizTutari": 1000, "EskiKur": 33.0})
+        assert yanit.status_code in (401, 403)
+
+
+class TestBankaMutabakati:
+    """Banka Mutabakatı önceden hiç yoktu - ekstre CSV içe aktarma, tutar+tarih
+    bazlı otomatik eşleştirme önerisi ve manuel onaylama sıfırdan eklendi."""
+
+    def _sahte_csv_dosyasi(self):
+        icerik = "Tarih,Tutar,Aciklama\n2026-09-01,1500.00,Musteri Odemesi\n2026-09-02,-300.50,Kira\n"
+        return io.BytesIO(icerik.encode("utf-8"))
+
+    def test_csv_yukleme_satirlari_dogru_parse_eder(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/banka-ekstresi-yukle", data={"hesap_id": 1},
+                             files={"dosya": ("ekstre.csv", self._sahte_csv_dosyasi(), "text/csv")})
+        assert yanit.status_code == 200
+        assert yanit.json()["Yuklenen"] == 2
+        insert_cagrilari = [c for c in cursor.execute.call_args_list if "INSERT INTO BankaEkstreSatirlari" in c.args[0]]
+        assert len(insert_cagrilari) == 2
+
+    def test_hesap_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/banka-ekstresi-yukle", data={"hesap_id": 999},
+                             files={"dosya": ("ekstre.csv", self._sahte_csv_dosyasi(), "text/csv")})
+        assert yanit.status_code == 404
+
+    def test_oneri_tutar_ve_tarih_eslesirse_onerilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchall.side_effect = [
+            [(5, "2026-09-01", 1500.0, "Musteri Odemesi")],  # BEKLIYOR ekstre satırları
+        ]
+        cursor.fetchone.return_value = (42, "2026-09-02 10:00:00", 1500.0, "Havale")  # eşleşen hareket
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/banka-mutabakat-onerileri/1")
+        assert yanit.status_code == 200
+        oneri = yanit.json()["oneriler"][0]
+        assert oneri["OnerilenHareketID"] == 42
+
+    def test_eslesme_yoksa_oneri_bos_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        cursor.fetchall.side_effect = [
+            [(5, "2026-09-01", 1500.0, "Musteri Odemesi")],
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/banka-mutabakat-onerileri/1")
+        assert yanit.status_code == 200
+        assert yanit.json()["oneriler"][0]["OnerilenHareketID"] is None
+
+    def test_onayla_hem_ekstre_hem_hareketi_gunceller(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("BEKLIYOR",), (1,)]  # ekstre durumu, hareket var mi
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/banka-mutabakat-onayla/5", json={"HareketID": 42})
+        assert yanit.status_code == 200
+        eslesme_cagrisi = [c for c in cursor.execute.call_args_list if "BankaEkstreSatirlari SET Durum='ESLESTI'" in c.args[0]]
+        mutabik_cagrisi = [c for c in cursor.execute.call_args_list if "BankaHareketleri SET Mutabik=1" in c.args[0]]
+        assert len(eslesme_cagrisi) == 1
+        assert len(mutabik_cagrisi) == 1
+
+    def test_zaten_eslesmis_satiri_tekrar_onaylamak_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("ESLESTI",))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/banka-mutabakat-onayla/5", json={"HareketID": 42})
+        assert yanit.status_code == 400
+
+    def test_yukleme_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/banka-ekstresi-yukle", data={"hesap_id": 1},
+                                      files={"dosya": ("ekstre.csv", self._sahte_csv_dosyasi(), "text/csv")})
         assert yanit.status_code in (401, 403)
 
 

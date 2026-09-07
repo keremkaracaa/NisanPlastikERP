@@ -5665,6 +5665,8 @@ class MainApp(ctk.CTkToplevel):
 
         hb_cerceve, self.banka_tree = tablo_olustur(banka_sol, ["ID", "Banka", "Şube", "IBAN", "Bakiye"], [40, 120, 100, 200, 100], height=4)
         hb_cerceve.pack(fill="both", expand=True, padx=10, pady=5)
+        ctk.CTkButton(banka_sol, text="🏦 Banka Mutabakatı", fg_color="#0891b2", hover_color="#0e7490",
+                      command=self.banka_mutabakat_penceresi_ac).pack(fill="x", padx=10, pady=(0, 10))
 
         banka_sag = ctk.CTkFrame(ust_frame, fg_color=RENK_KART, corner_radius=8)
         banka_sag.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
@@ -5743,6 +5745,102 @@ class MainApp(ctk.CTkToplevel):
         c_cerceve.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.finans_verilerini_yukle()
+
+    def banka_mutabakat_penceresi_ac(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Banka Mutabakatı")
+        win.geometry("820x560")
+        win.configure(fg_color=gecerli_renk(RENK_TABAN))
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+
+        ust = ctk.CTkFrame(win, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(20, 10))
+        ctk.CTkLabel(ust, text="🏦 Banka Mutabakatı", font=("Arial", 16, "bold"), text_color="#0891b2").pack(side="left")
+
+        secim_satiri = ctk.CTkFrame(win, fg_color="transparent")
+        secim_satiri.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(secim_satiri, text="Hesap ID:").pack(side="left", padx=(0, 5))
+        bm_hesap_entry = ctk.CTkEntry(secim_satiri, width=80)
+        bm_hesap_entry.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(secim_satiri, text="📤 Ekstre CSV Yükle (Tarih,Tutar,Aciklama)", fg_color="#7c3aed", hover_color="#6d28d9",
+                      command=lambda: self._banka_ekstre_csv_yukle(bm_hesap_entry)).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(secim_satiri, text="🔄 Öneri Getir", fg_color="#2563eb", hover_color="#1d4ed8",
+                      command=lambda: self._banka_mutabakat_onerileri_yukle(bm_hesap_entry)).pack(side="left")
+
+        oneri_cerceve, self.bm_oneri_tree = tablo_olustur(
+            win, ["Ekstre ID", "Ekstre Tarih", "Ekstre Tutar", "Ekstre Açıklama", "Önerilen Hareket", "Hareket Tarih", "Hareket Tutar"],
+            [70, 100, 100, 180, 100, 130, 100], height=14)
+        oneri_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+
+        ctk.CTkButton(win, text="✅ Seçili Öneriyi Onayla", fg_color="#16a34a", hover_color="#15803d",
+                      command=self._banka_mutabakat_onayla_islem).pack(anchor="w", padx=20, pady=(0, 20))
+
+    def _banka_ekstre_csv_yukle(self, hesap_entry):
+        try:
+            hesap_id = int(hesap_entry.get())
+        except ValueError:
+            messagebox.showwarning("Eksik Bilgi", "Geçerli bir Hesap ID girin.")
+            return
+        yol = filedialog.askopenfilename(title="Banka Ekstresi CSV Dosyasını Seçin", filetypes=[("CSV", "*.csv"), ("Tüm Dosyalar", "*.*")])
+        if not yol:
+            return
+        try:
+            with open(yol, "rb") as f:
+                dosyalar = {"dosya": (os.path.basename(yol), f, "text/csv")}
+                res = requests.post(f"{API}/banka-ekstresi-yukle", files=dosyalar, data={"hesap_id": hesap_id},
+                                     headers=self.req_headers(), timeout=20)
+            if res.status_code == 200:
+                messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+                self._banka_mutabakat_onerileri_yukle(hesap_entry)
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def _banka_mutabakat_onerileri_yukle(self, hesap_entry):
+        try:
+            hesap_id = int(hesap_entry.get())
+        except ValueError:
+            messagebox.showwarning("Eksik Bilgi", "Geçerli bir Hesap ID girin.")
+            return
+        for i in self.bm_oneri_tree.get_children():
+            self.bm_oneri_tree.delete(i)
+        try:
+            res = requests.get(f"{API}/banka-mutabakat-onerileri/{hesap_id}", headers=self.req_headers(), timeout=10)
+            if res.status_code != 200:
+                self.api_hata_goster(res)
+                return
+            for oneri in res.json().get("oneriler", []):
+                self.bm_oneri_tree.insert("", "end", iid=str(oneri["EkstreSatirID"]), values=(
+                    oneri["EkstreSatirID"], oneri["EkstreTarih"], f"{oneri['EkstreTutar']:,.2f}", oneri["EkstreAciklama"],
+                    oneri["OnerilenHareketID"] or "—", oneri["OnerilenTarih"] or "—",
+                    f"{oneri['OnerilenTutar']:,.2f}" if oneri["OnerilenTutar"] is not None else "—"))
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def _banka_mutabakat_onayla_islem(self):
+        secili = self.bm_oneri_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen listeden bir öneri seçin.")
+            return
+        degerler = self.bm_oneri_tree.item(secili[0], "values")
+        hareket_id = degerler[4]
+        if hareket_id in ("—", None, ""):
+            messagebox.showwarning("Öneri Yok", "Bu ekstre satırı için önerilen bir hareket bulunamadı, elle eşleştirme desteklenmiyor.")
+            return
+        try:
+            res = requests.put(f"{API}/banka-mutabakat-onayla/{secili[0]}", json={"HareketID": int(hareket_id)},
+                                headers=self.req_headers(), timeout=10)
+            if res.status_code == 200:
+                self.bm_oneri_tree.delete(secili[0])
+                messagebox.showinfo("Başarılı", "Mutabakat onaylandı.")
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def pos_penceresi_ac(self):
         win = ctk.CTkToplevel(self)
