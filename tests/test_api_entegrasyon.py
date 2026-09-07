@@ -1165,6 +1165,56 @@ class TestElektronikImza:
         assert "i.KullaniciAdi=?" in cagri.args[0]
 
 
+class TestMusteri360:
+    """Müşteri 360° önceden hiç yoktu - ciro, açık bakiye, sipariş geçmişi ve
+    zamanında teslimat oranı gibi bilgiler ayrı ayrı ekranlara dağılmıştı, tek
+    bir özet uçta toplandı."""
+
+    def test_musteri_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/musteri-360/999")
+        assert yanit.status_code == 404
+
+    def test_acik_bakiye_ciro_eksi_tahsilat_olarak_hesaplanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        cursor.fetchone.side_effect = [
+            ("ABC Plastik", "Ahmet", "0555", "abc@example.com", 5000.0),  # musteri
+            (10000.0, 4),    # toplam ciro, fatura sayisi
+            (6000.0,),        # toplam tahsilat
+            (3, 2500.0, "2026-08-20"),  # siparis sayisi, ort tutar, son siparis
+            (2, 0),           # degerlendirilen, gec sayisi
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/musteri-360/1")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["AcikBakiye"] == 4000.0
+        assert veri["ZamanindaTeslimatOrani"] == 100.0
+
+    def test_hic_degerlendirilen_siparis_yoksa_teslimat_orani_none_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        cursor.fetchone.side_effect = [
+            ("ABC Plastik", "Ahmet", "0555", "abc@example.com", 0.0),
+            (0.0, 0),
+            (0.0,),
+            (0, 0.0, None),
+            (0, 0),
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/musteri-360/1")
+        assert yanit.status_code == 200
+        assert yanit.json()["ZamanindaTeslimatOrani"] is None
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/musteri-360/1")
+        assert yanit.status_code in (401, 403)
+
+
 class TestGuvenliDosyaAdi:
     """Güvenlik denetiminde bulundu: dosya yükleme uçları dosya.filename'i hiç
     sanitize etmeden diske yazıyordu - '../../evil.exe' gibi bir ad hedef klasörün

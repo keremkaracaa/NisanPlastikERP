@@ -1150,10 +1150,18 @@ class MainApp(ctk.CTkToplevel):
 
         # 1. Cari Ekstre Butonu
         ctk.CTkButton(
-            ust_frame, text="📋 Cari Ekstre", 
+            ust_frame, text="📋 Cari Ekstre",
             fg_color="#8b5cf6", hover_color="#7c3aed", text_color="white",
             font=("Arial", 12, "bold"), height=35,
             command=self.cari_ekstre_penceresi_ac
+        ).pack(side="right", padx=(0, 10))
+
+        # Müşteri 360° Özet Butonu
+        ctk.CTkButton(
+            ust_frame, text="🎯 Müşteri 360°",
+            fg_color="#f97316", hover_color="#c2410c", text_color="white",
+            font=("Arial", 12, "bold"), height=35,
+            command=self.musteri_360_penceresi_ac
         ).pack(side="right", padx=(0, 10))
 
         # Tedarikçi Ekstresi Butonu
@@ -1520,11 +1528,100 @@ class MainApp(ctk.CTkToplevel):
         ).pack(side="left", padx=10, pady=12)
 
         ctk.CTkButton(
-            top_frame, text="🔍 Ekstre Getir", 
+            top_frame, text="🔍 Ekstre Getir",
             fg_color="#8b5cf6", hover_color="#7c3aed", text_color="white",
             font=("Arial", 11, "bold"), height=32,
             command=ekstre_getir
         ).pack(side="left", padx=5, pady=12)
+
+    def musteri_360_penceresi_ac(self):
+        win = ctk.CTkToplevel(self)
+        win.title("🎯 Müşteri 360°")
+        win.geometry("820x680")
+        win.configure(fg_color=gecerli_renk(RENK_TABAN))
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+
+        ust = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=10)
+        ust.pack(fill="x", padx=20, pady=(20, 10))
+        ctk.CTkLabel(ust, text="Müşteri ID:", font=("Arial", 11, "bold")).pack(side="left", padx=(15, 5), pady=12)
+        m360_id_entry = ctk.CTkEntry(ust, width=90)
+        m360_id_entry.pack(side="left", padx=(0, 8), pady=12)
+        ctk.CTkButton(ust, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(m360_id_entry)).pack(side="left", padx=(0, 8), pady=12)
+        ctk.CTkButton(ust, text="Getir", fg_color="#f97316", hover_color="#c2410c",
+                      command=lambda: self._musteri_360_yukle(m360_id_entry, icerik)).pack(side="left", pady=12)
+
+        icerik = ctk.CTkScrollableFrame(win, fg_color=RENK_KART, corner_radius=10)
+        icerik.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        ctk.CTkLabel(icerik, text="Bir müşteri seçip 'Getir'e basın.", text_color=RENK_METIN_SOLUK).pack(pady=20)
+
+    def _musteri_360_yukle(self, id_entry, icerik):
+        try:
+            musteri_id = int(id_entry.get())
+        except ValueError:
+            messagebox.showwarning("Eksik Bilgi", "Geçerli bir Müşteri ID girin.")
+            return
+        for w in icerik.winfo_children():
+            w.destroy()
+        try:
+            res = requests.get(f"{API}/musteri-360/{musteri_id}", headers=self.req_headers(), timeout=10)
+            if res.status_code != 200:
+                self.api_hata_goster(res)
+                return
+            d = res.json()
+            mus = d["Musteri"]
+
+            baslik_fr = ctk.CTkFrame(icerik, fg_color="transparent")
+            baslik_fr.pack(fill="x", padx=10, pady=(10, 15))
+            ctk.CTkLabel(baslik_fr, text=f"🏢 {mus['FirmaAdi']}", font=("Arial", 18, "bold"), text_color="#f97316").pack(anchor="w")
+            ctk.CTkLabel(baslik_fr, text=f"Yetkili: {mus.get('YetkiliKisi') or '-'}  |  Tel: {mus.get('Telefon') or '-'}  |  E-posta: {mus.get('EPosta') or '-'}",
+                         font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(2, 0))
+
+            kart_alani = ctk.CTkFrame(icerik, fg_color="transparent")
+            kart_alani.pack(fill="x", padx=10, pady=(0, 15))
+            gec_teslim_metni = f"%{d['ZamanindaTeslimatOrani']:.0f}" if d["ZamanindaTeslimatOrani"] is not None else "Veri yok"
+            kpi_tanim = [
+                ("💰 Toplam Ciro", f"{d['ToplamCiro']:,.2f} TL", "#22c55e"),
+                ("📄 Fatura Sayısı", str(d["FaturaSayisi"]), "#38bdf8"),
+                ("⚖️ Açık Bakiye", f"{d['AcikBakiye']:,.2f} TL", "#ef4444" if d["AcikBakiye"] > 0 else "#22c55e"),
+                ("📦 Sipariş Sayısı", str(d["SiparisSayisi"]), "#a78bfa"),
+                ("📊 Ort. Sipariş Tutarı", f"{d['OrtalamaSiparisTutari']:,.2f} TL", "#f97316"),
+                ("🕐 Son Sipariş", d["SonSiparisTarihi"] or "Hiç sipariş yok", "#f97316"),
+                ("✅ Zamanında Teslimat", gec_teslim_metni, "#22c55e"),
+            ]
+            for i, (baslik, deger, renk) in enumerate(kpi_tanim):
+                satir, sutun = divmod(i, 3)
+                kart = ctk.CTkFrame(kart_alani, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=8, border_width=2, border_color=renk)
+                kart.grid(row=satir, column=sutun, padx=6, pady=6, sticky="nsew")
+                kart_alani.grid_columnconfigure(sutun, weight=1)
+                ctk.CTkLabel(kart, text=baslik, font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(pady=(10, 2), padx=10)
+                ctk.CTkLabel(kart, text=deger, font=("Arial", 14, "bold"), text_color=renk).pack(pady=(0, 10), padx=10)
+
+            if d["RiskLimiti"] and d["AcikBakiye"] > d["RiskLimiti"]:
+                ctk.CTkLabel(icerik, text=f"⚠️ Açık bakiye risk limitini ({d['RiskLimiti']:,.2f} TL) aşıyor!",
+                             font=("Arial", 11, "bold"), text_color="#ef4444").pack(anchor="w", padx=10, pady=(0, 10))
+
+            ctk.CTkLabel(icerik, text="📄 Son 5 Fatura", font=("Arial", 13, "bold"), text_color="#10b981").pack(anchor="w", padx=10, pady=(5, 5))
+            if not d["SonFaturalar"]:
+                ctk.CTkLabel(icerik, text="Fatura kaydı yok.", text_color="gray").pack(anchor="w", padx=20, pady=(0, 10))
+            for f in d["SonFaturalar"]:
+                fr = ctk.CTkFrame(icerik, fg_color=gecerli_renk(RENK_TABAN))
+                fr.pack(fill="x", padx=10, pady=2)
+                ctk.CTkLabel(fr, text=f"Fatura #{f['FaturaID']}  ({f['Tarih']})", font=("Arial", 11)).pack(side="left", padx=10, pady=6)
+                ctk.CTkLabel(fr, text=f"{f['ToplamTutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#10b981").pack(side="right", padx=10)
+
+            ctk.CTkLabel(icerik, text="💰 Son 5 Tahsilat", font=("Arial", 13, "bold"), text_color="#3b82f6").pack(anchor="w", padx=10, pady=(15, 5))
+            if not d["SonTahsilatlar"]:
+                ctk.CTkLabel(icerik, text="Tahsilat kaydı yok.", text_color="gray").pack(anchor="w", padx=20, pady=(0, 10))
+            for t in d["SonTahsilatlar"]:
+                fr = ctk.CTkFrame(icerik, fg_color=gecerli_renk(RENK_TABAN))
+                fr.pack(fill="x", padx=10, pady=2)
+                ctk.CTkLabel(fr, text=f"#{t['TahsilatID']} ({t['OdemeTuru']})  ({t['Tarih']})", font=("Arial", 11)).pack(side="left", padx=10, pady=6)
+                ctk.CTkLabel(fr, text=f"{t['Tutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#3b82f6").pack(side="right", padx=10)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def mizan_raporu_ac(self):
         win = ctk.CTkToplevel(self)

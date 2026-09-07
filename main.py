@@ -3687,6 +3687,63 @@ def cari_ekstre(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"
     finally:
         conn.close()
 
+@app.get("/musteri-360/{musteri_id}")
+def musteri_360(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış"]))):
+    """Bir müşteriyle ilgili tüm önemli bilgiyi (ciro, açık bakiye, sipariş geçmişi,
+    zamanında teslimat oranı, son fatura/tahsilatlar) tek ekranda toplar - önceden bu
+    bilgiler Yaşlandırma Raporu, Cari Ekstre, Sipariş listesi gibi ayrı ekranlara
+    dağılmıştı."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT FirmaAdi, YetkiliKisi, Telefon, EPosta, ISNULL(RiskLimiti,0)
+                           FROM Musteriler WHERE MusteriID=?""", (musteri_id,))
+        mus = cursor.fetchone()
+        if not mus:
+            raise HTTPException(status_code=404, detail="Müşteri bulunamadı.")
+        firma_adi, yetkili, telefon, eposta, risk_limiti = mus
+
+        cursor.execute("SELECT ISNULL(SUM(ToplamTutar),0), COUNT(*) FROM Faturalar WHERE MusteriID=?", (musteri_id,))
+        toplam_ciro, fatura_sayisi = cursor.fetchone()
+        toplam_ciro = float(toplam_ciro)
+        cursor.execute("SELECT ISNULL(SUM(Tutar),0) FROM Tahsilatlar WHERE MusteriID=?", (musteri_id,))
+        toplam_tahsilat = float(cursor.fetchone()[0])
+        acik_bakiye = toplam_ciro - toplam_tahsilat
+
+        cursor.execute("""SELECT COUNT(*), ISNULL(AVG(ToplamTutar),0), MAX(SiparisTarihi)
+                           FROM Siparisler WHERE MusteriID=?""", (musteri_id,))
+        siparis_sayisi, ort_siparis_tutari, son_siparis_tarihi = cursor.fetchone()
+
+        cursor.execute("""SELECT COUNT(*), SUM(CASE WHEN GercekTeslimTarihi > SozVerilenTeslimTarihi THEN 1 ELSE 0 END)
+                           FROM Siparisler WHERE MusteriID=? AND SozVerilenTeslimTarihi IS NOT NULL AND GercekTeslimTarihi IS NOT NULL""",
+                       (musteri_id,))
+        degerlendirilen, gec_sayisi = cursor.fetchone()
+        zamaninda_teslimat_orani = None
+        if degerlendirilen:
+            zamaninda_teslimat_orani = round((1 - (gec_sayisi or 0) / degerlendirilen) * 100, 1)
+
+        cursor.execute("SELECT TOP 5 FaturaID, ToplamTutar, Tarih FROM Faturalar WHERE MusteriID=? ORDER BY Tarih DESC", (musteri_id,))
+        son_faturalar = [{"FaturaID": r[0], "ToplamTutar": float(r[1] or 0), "Tarih": str(r[2])[:10]} for r in cursor.fetchall()]
+
+        cursor.execute("SELECT TOP 5 TahsilatID, Tutar, OdemeTuru, Tarih FROM Tahsilatlar WHERE MusteriID=? ORDER BY Tarih DESC", (musteri_id,))
+        son_tahsilatlar = [{"TahsilatID": r[0], "Tutar": float(r[1] or 0), "OdemeTuru": r[2] or "Nakit", "Tarih": str(r[3])[:10]} for r in cursor.fetchall()]
+
+        return {
+            "Musteri": {"MusteriID": musteri_id, "FirmaAdi": firma_adi, "YetkiliKisi": yetkili, "Telefon": telefon,
+                        "EPosta": eposta, "RiskLimiti": float(risk_limiti or 0)},
+            "ToplamCiro": toplam_ciro, "FaturaSayisi": int(fatura_sayisi or 0), "AcikBakiye": acik_bakiye,
+            "SiparisSayisi": int(siparis_sayisi or 0), "OrtalamaSiparisTutari": float(ort_siparis_tutari or 0),
+            "SonSiparisTarihi": str(son_siparis_tarihi)[:10] if son_siparis_tarihi else None,
+            "ZamanindaTeslimatOrani": zamaninda_teslimat_orani, "DegerlendirilenSiparisSayisi": int(degerlendirilen or 0),
+            "SonFaturalar": son_faturalar, "SonTahsilatlar": son_tahsilatlar,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Veritabanı hatası: {str(e)}")
+    finally:
+        conn.close()
+
 @app.get("/tedarikciler")
 def tedarikcileri_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış", "Depo"]))):
     conn = get_db_connection()
