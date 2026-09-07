@@ -4477,33 +4477,44 @@ class KurFarkiEkleRequest(BaseModel):
     ParaBirimi: str
     DovizTutari: float = Field(gt=0)
     EskiKur: float = Field(gt=0)
-    YeniKur: float = Field(gt=0)
+    YeniKur: Optional[float] = None
     Aciklama: Optional[str] = None
+
+@app.get("/guncel-kur/{para_birimi}")
+def guncel_kur_getir_endpoint(para_birimi: str, user: dict = Depends(get_current_user)):
+    kur = guncel_kur_getir().get(para_birimi.upper())
+    if not kur:
+        raise HTTPException(status_code=404, detail=f"'{para_birimi}' için güncel kur bulunamadı.")
+    return {"ParaBirimi": para_birimi.upper(), "Kur": kur}
 
 @app.post("/kur-farki-fisi-ekle")
 def kur_farki_fisi_ekle(veri: KurFarkiEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
     """Elde tutulan döviz varlığının (örn. döviz kasası/hesabı) değerleme tarihindeki
     kur farkını hesaplayıp Yevmiye'ye işler - kur yükselmişse kur farkı geliri,
-    düşmüşse kur farkı gideri olarak kaydedilir."""
+    düşmüşse kur farkı gideri olarak kaydedilir. YeniKur verilmezse TCMB'den
+    (guncel_kur_getir) otomatik çekilir - kullanıcının kuru elle aramasına gerek kalmaz."""
+    yeni_kur = veri.YeniKur if veri.YeniKur else guncel_kur_getir().get(veri.ParaBirimi.upper())
+    if not yeni_kur:
+        raise HTTPException(status_code=400, detail=f"'{veri.ParaBirimi}' için güncel kur otomatik alınamadı, YeniKur'u elle girin.")
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        fark_tl = veri.DovizTutari * (veri.YeniKur - veri.EskiKur)
+        fark_tl = veri.DovizTutari * (yeni_kur - veri.EskiKur)
         yon = "Gelir" if fark_tl > 0 else "Gider"
         cursor.execute("""INSERT INTO KurFarkiFisleri (ParaBirimi, DovizTutari, EskiKur, YeniKur, FarkTutariTL, Yon, Aciklama, KullaniciAdi)
                            OUTPUT inserted.KurFarkiID VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                       (veri.ParaBirimi, veri.DovizTutari, veri.EskiKur, veri.YeniKur, abs(fark_tl), yon, veri.Aciklama, user["username"]))
+                       (veri.ParaBirimi, veri.DovizTutari, veri.EskiKur, yeni_kur, abs(fark_tl), yon, veri.Aciklama, user["username"]))
         kur_farki_id = int(cursor.fetchone()[0])
 
         if fark_tl > 0:
             yevmiye_satirlari = [("102", abs(fark_tl), 0, f"{veri.ParaBirimi} kur farkı değerlemesi"), ("646", 0, abs(fark_tl), "Kur Farkı Gelirleri")]
         else:
             yevmiye_satirlari = [("656", abs(fark_tl), 0, "Kur Farkı Giderleri"), ("102", 0, abs(fark_tl), f"{veri.ParaBirimi} kur farkı değerlemesi")]
-        yevmiye_fisi_olustur(cursor, f"Kur Farkı Fişi: {veri.ParaBirimi} ({veri.EskiKur} -> {veri.YeniKur})", "KurFarki", kur_farki_id, yevmiye_satirlari, user["username"])
+        yevmiye_fisi_olustur(cursor, f"Kur Farkı Fişi: {veri.ParaBirimi} ({veri.EskiKur} -> {yeni_kur})", "KurFarki", kur_farki_id, yevmiye_satirlari, user["username"])
 
         log_islem(cursor, f"Kur farkı fişi oluşturuldu: {veri.ParaBirimi} - {fark_tl:,.2f} TL ({yon})", user["username"])
         conn.commit()
-        return {"mesaj": f"Kur farkı fişi oluşturuldu ({yon}: {abs(fark_tl):,.2f} TL).", "KurFarkiID": kur_farki_id}
+        return {"mesaj": f"Kur farkı fişi oluşturuldu ({yon}: {abs(fark_tl):,.2f} TL).", "KurFarkiID": kur_farki_id, "KullanilanYeniKur": yeni_kur}
     finally:
         conn.close()
 

@@ -1627,6 +1627,51 @@ class TestTeslimTarihiYaklasiyorAlarmi:
         assert len(insert_cagrilari) == 0
 
 
+class TestKurFarkiOtomatikGuncelKur:
+    """/kur-farki-fisi-ekle önceden YeniKur'u zorunlu tutuyordu, kullanıcı TCMB
+    sitesine gidip kuru kendisi bulup yazıyordu. Artık YeniKur boş bırakılırsa
+    guncel_kur_getir() ile otomatik çekiliyor."""
+
+    def test_yeni_kur_verilmeyince_otomatik_cekilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "guncel_kur_getir", lambda: {"TL": 1.0, "USD": 34.50})
+
+        yanit = client.post("/kur-farki-fisi-ekle", json={"ParaBirimi": "USD", "DovizTutari": 1000, "EskiKur": 33.0})
+        assert yanit.status_code == 200
+        assert yanit.json()["KullanilanYeniKur"] == 34.50
+
+    def test_yeni_kur_verilirse_oncelik_ona_verilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "guncel_kur_getir", lambda: {"TL": 1.0, "USD": 34.50})
+
+        yanit = client.post("/kur-farki-fisi-ekle", json={"ParaBirimi": "USD", "DovizTutari": 1000, "EskiKur": 33.0, "YeniKur": 35.0})
+        assert yanit.status_code == 200
+        assert yanit.json()["KullanilanYeniKur"] == 35.0
+
+    def test_kur_hic_bulunamazsa_400_doner(self, client, monkeypatch):
+        monkeypatch.setattr(main, "guncel_kur_getir", lambda: {"TL": 1.0})
+        yanit = client.post("/kur-farki-fisi-ekle", json={"ParaBirimi": "XYZ", "DovizTutari": 1000, "EskiKur": 33.0})
+        assert yanit.status_code == 400
+
+    def test_guncel_kur_endpoint_calisir(self, client, monkeypatch):
+        monkeypatch.setattr(main, "guncel_kur_getir", lambda: {"TL": 1.0, "EUR": 37.20})
+        yanit = client.get("/guncel-kur/EUR")
+        assert yanit.status_code == 200
+        assert yanit.json()["Kur"] == 37.20
+
+    def test_guncel_kur_bulunamayan_para_birimi_404_doner(self, client, monkeypatch):
+        monkeypatch.setattr(main, "guncel_kur_getir", lambda: {"TL": 1.0})
+        yanit = client.get("/guncel-kur/XYZ")
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/kur-farki-fisi-ekle", json={"ParaBirimi": "USD", "DovizTutari": 1000, "EskiKur": 33.0})
+        assert yanit.status_code in (401, 403)
+
+
 class TestButceYonetimi:
     """Bütçe Yönetimi önceden hiç yoktu - Hesap Planı bazlı aylık hedef/gerçekleşen
     karşılaştırma için sıfırdan eklendi. Gerçekleşen, HesapHareketleri'nden hesaplanır;

@@ -4086,8 +4086,9 @@ class MainApp(ctk.CTkToplevel):
         self.kf_doviz_tutar.pack(side="left", padx=(0, 8))
         self.kf_eski_kur = ctk.CTkEntry(kf_form, placeholder_text="Eski Kur", width=90)
         self.kf_eski_kur.pack(side="left", padx=(0, 8))
-        self.kf_yeni_kur = ctk.CTkEntry(kf_form, placeholder_text="Yeni Kur", width=90)
-        self.kf_yeni_kur.pack(side="left", padx=(0, 8))
+        self.kf_yeni_kur = ctk.CTkEntry(kf_form, placeholder_text="Yeni Kur (boş = otomatik TCMB)", width=170)
+        self.kf_yeni_kur.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(kf_form, text="🔄", width=32, command=self.guncel_kur_cek_islem).pack(side="left", padx=(0, 8))
         self.kf_aciklama = ctk.CTkEntry(kf_form, placeholder_text="Açıklama", width=160)
         self.kf_aciklama.pack(side="left", padx=(0, 8))
         ctk.CTkButton(kf_form, text="+ Hesapla ve Kaydet", fg_color="#16a34a", hover_color="#15803d", command=self.kur_farki_ekle_islem).pack(side="left")
@@ -4133,10 +4134,22 @@ class MainApp(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def guncel_kur_cek_islem(self):
+        try:
+            res = requests.get(f"{API}/guncel-kur/{self.kf_pb.get()}", headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                self.kf_yeni_kur.delete(0, "end")
+                self.kf_yeni_kur.insert(0, f"{res.json()['Kur']:.4f}")
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
     def kur_farki_ekle_islem(self):
+        yeni_kur_metni = self.kf_yeni_kur.get().strip()
         try:
             data = {"ParaBirimi": self.kf_pb.get(), "DovizTutari": float(self.kf_doviz_tutar.get()),
-                    "EskiKur": float(self.kf_eski_kur.get()), "YeniKur": float(self.kf_yeni_kur.get()),
+                    "EskiKur": float(self.kf_eski_kur.get()), "YeniKur": float(yeni_kur_metni) if yeni_kur_metni else None,
                     "Aciklama": self.kf_aciklama.get().strip() or None}
         except ValueError:
             messagebox.showwarning("Hatalı Değer", "Döviz tutarı ve kurlar sayısal olmalıdır.")
