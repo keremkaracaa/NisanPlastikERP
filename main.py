@@ -193,6 +193,65 @@ def ubl_tr_fatura_xml_olustur(fatura_id: int, ettn: str, efatura_no: str, senary
 
     return kok
 
+def ubl_tr_irsaliye_xml_olustur(irsaliye_id: int, ettn: str, eirsaliye_no: str,
+                                 irsaliye_tarihi, musteri_bilgi: dict, kalemler: list) -> ET.Element:
+    """GİB'in beklediği UBL-TR 2.1 DespatchAdvice şemasına uygun ŞEKİLDE bir XML
+    ağacı üretir - ubl_tr_fatura_xml_olustur (main.py:109) ile AYNI kapsam sınırı
+    geçerlidir: bu İMZASIZ bir belgedir, gerçek GİB/entegratör iletimi entegratöre
+    özel efatura_entegrator_gonder benzeri bir fonksiyonun sorumluluğundadır."""
+    NS = {
+        "": "urn:oasis:names:specification:ubl:schema:xsd:DespatchAdvice-2",
+        "cac": "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
+        "cbc": "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
+    }
+    for prefix, uri in NS.items():
+        ET.register_namespace(prefix, uri)
+
+    def cbc(parent, tag, text):
+        el = ET.SubElement(parent, f"{{{NS['cbc']}}}{tag}")
+        el.text = "" if text is None else str(text)
+        return el
+
+    def cac(parent, tag):
+        return ET.SubElement(parent, f"{{{NS['cac']}}}{tag}")
+
+    kok = ET.Element(f"{{{NS['']}}}DespatchAdvice")
+    cbc(kok, "UBLVersionID", "2.1")
+    cbc(kok, "CustomizationID", "TR1.2")
+    cbc(kok, "ProfileID", "TEMELIRSALIYE")
+    cbc(kok, "ID", eirsaliye_no)
+    cbc(kok, "UUID", ettn)
+    cbc(kok, "IssueDate", irsaliye_tarihi.strftime("%Y-%m-%d") if hasattr(irsaliye_tarihi, "strftime") else str(irsaliye_tarihi)[:10])
+    cbc(kok, "DespatchAdviceTypeCode", "SEVK")
+
+    tedarikci = cac(kok, "DespatchSupplierParty")
+    tedarikci_parti = cac(tedarikci, "Party")
+    tedarikci_isim = cac(tedarikci_parti, "PartyName")
+    cbc(tedarikci_isim, "Name", "NISAN PLASTIK A.S.")
+
+    musteri = cac(kok, "DeliveryCustomerParty")
+    musteri_parti = cac(musteri, "Party")
+    musteri_isim = cac(musteri_parti, "PartyName")
+    cbc(musteri_isim, "Name", musteri_bilgi.get("FirmaAdi") or "")
+    musteri_adres = cac(musteri_parti, "PostalAddress")
+    cbc(musteri_adres, "StreetName", musteri_bilgi.get("Adres") or "")
+    cbc(musteri_adres, "CitySubdivisionName", musteri_bilgi.get("Ilce") or "")
+    cbc(musteri_adres, "CityName", musteri_bilgi.get("Il") or "")
+    musteri_vkn_id = cac(musteri_parti, "PartyIdentification")
+    vkn_id_el = ET.SubElement(musteri_vkn_id, f"{{{NS['cbc']}}}ID")
+    vkn_id_el.set("schemeID", musteri_bilgi.get("VergiKimlikTipi") or "VKN")
+    vkn_id_el.text = musteri_bilgi.get("VergiNo") or ""
+
+    for idx, k in enumerate(kalemler, start=1):
+        satir = cac(kok, "DespatchLine")
+        cbc(satir, "ID", str(idx))
+        miktar_el = cbc(satir, "DeliveredQuantity", k["Miktar"])
+        miktar_el.set("unitCode", "C62")
+        satir_urun = cac(satir, "Item")
+        cbc(satir_urun, "Name", k["StokAdi"])
+
+    return kok
+
 def efatura_entegrator_gonder(xml_yolu: str, ayarlar: dict) -> dict:
     """Üretilen UBL-TR XML dosyasını yapılandırılmış özel entegratör API'sine
     gönderir. KAPSAM: Bu bir İSKELET'tir - gerçek entegratörün (örn. Uyumsoft,
@@ -1577,6 +1636,11 @@ class AlisIrsaliyeKesRequest(BaseModel):
     DepoID: Optional[int] = None  # Belirtilmezse varsayılan (Merkez) depo kullanılır
     SozVerilenTeslimTarihi: Optional[str] = None  # Tedarikçi Skor Kartı - zamanında teslimat ölçümü için
 
+class IrsaliyeKalem(BaseModel):
+    StokKod: Optional[str] = None
+    StokAdi: str
+    Miktar: float = Field(gt=0)
+
 class IrsaliyeKesRequest(BaseModel):
     MusteriID: int
     Plaka: str
@@ -1585,6 +1649,7 @@ class IrsaliyeKesRequest(BaseModel):
     FaturaID: Optional[int] = None
     IrsaliyeTuru: str = "Toptan Satış İrsaliyesi"
     SiparisID: Optional[int] = None
+    Kalemler: list[IrsaliyeKalem] = []
 
 class SiparisEkleRequest(BaseModel):
     MusteriID: int
@@ -2707,6 +2772,60 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _eirsaliye_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> e-İrsaliye migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _musteri_sikayet_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Müşteri şikayet migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _alan_bazli_yetki_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Alan bazlı yetki migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _arac_filo_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Araç filo migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _numune_siparis_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Numune sipariş migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _yasal_takvim_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Yasal takvim migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -3265,6 +3384,133 @@ def _kalite_toplanti_migrationlari(cursor):
             OlusturanKullanici NVARCHAR(50) NULL
         )
     """, "KaliteToplantilari tablosu")
+
+def _eirsaliye_migrationlari(cursor):
+    """e-İrsaliye altyapısı - Satış İrsaliyesi'ne (Irsaliyeler) kalem satırları
+    (AlisIrsaliyeKalemleri şemasının aynısı, sadece stok hareketi TETİKLEMEZ - bkz.
+    irsaliye_kes docstring'i) ve e-Fatura'daki (main.py, _efatura_migrationlari)
+    ile birebir aynı e-belge durum sütunları eklenir. Diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='IrsaliyeKalemleri' and xtype='U')
+        CREATE TABLE IrsaliyeKalemleri (
+            KalemID INT IDENTITY(1,1) PRIMARY KEY,
+            IrsaliyeID INT NOT NULL FOREIGN KEY REFERENCES Irsaliyeler(IrsaliyeID),
+            StokKod VARCHAR(20) NULL,
+            StokAdi NVARCHAR(200) NOT NULL,
+            Miktar FLOAT NOT NULL
+        )
+    """, "IrsaliyeKalemleri tablosu")
+    guvenli_sutun_ekle(cursor, "Irsaliyeler", "EIrsaliyeUUID", "NVARCHAR(50) NULL")
+    guvenli_sutun_ekle(cursor, "Irsaliyeler", "EIrsaliyeNo", "NVARCHAR(20) NULL")
+    guvenli_sutun_ekle(cursor, "Irsaliyeler", "EIrsaliyeDurum", "NVARCHAR(20) NOT NULL DEFAULT 'TASLAK'")
+    guvenli_sutun_ekle(cursor, "Irsaliyeler", "EIrsaliyeXmlYolu", "NVARCHAR(300) NULL")
+    guvenli_sutun_ekle(cursor, "Irsaliyeler", "EIrsaliyeHataMesaji", "NVARCHAR(500) NULL")
+    guvenli_sutun_ekle(cursor, "Irsaliyeler", "EIrsaliyeGonderimTarihi", "DATETIME NULL")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='EIrsaliyeSayaci' and xtype='U')
+        CREATE TABLE EIrsaliyeSayaci (
+            SeriKodu NVARCHAR(10) PRIMARY KEY,
+            SonSira INT NOT NULL DEFAULT 0
+        )
+    """, "EIrsaliyeSayaci tablosu")
+
+def _musteri_sikayet_migrationlari(cursor):
+    """Müşteri Şikayet/Talep Yönetimi - Kalite Kontrol'deki UygunsuzlukKayitlari
+    (NCR) aç/kapa desenini taklit eder. Diğer yeni özellik migration'ları gibi
+    kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='MusteriSikayetleri' and xtype='U')
+        CREATE TABLE MusteriSikayetleri (
+            SikayetID INT IDENTITY(1,1) PRIMARY KEY,
+            MusteriID INT NOT NULL FOREIGN KEY REFERENCES Musteriler(MusteriID),
+            Konu NVARCHAR(200) NOT NULL,
+            Aciklama NVARCHAR(1000) NULL,
+            Oncelik NVARCHAR(10) NOT NULL DEFAULT 'Orta',
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'Açık',
+            Cozum NVARCHAR(1000) NULL,
+            OlusturanKullanici NVARCHAR(50) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE(),
+            KapanisTarihi DATETIME NULL
+        )
+    """, "MusteriSikayetleri tablosu")
+
+def _alan_bazli_yetki_migrationlari(cursor):
+    """Alan Bazlı Yetkilendirme - kullanıcının sadece kendi girdiği Satış Fırsatı/
+    Aktivite kayıtlarını görmesini sağlayan bayrak. Kapsam bilinçli olarak dar
+    tutuldu (bkz. plan): Siparişler/Teklifler/Müşteriler'de oluşturan-kullanıcı
+    sütunu olmadığından bu filtreye dahil edilmedi. Diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_sutun_ekle(cursor, "Kullanicilar", "SadeceKendiKayitlariGorsun", "BIT NOT NULL DEFAULT 0")
+
+def _arac_filo_migrationlari(cursor):
+    """Araç/Filo Yönetimi - şirket araçları (sevkiyat kamyonu vb.) master kaydı +
+    bakım/servis geçmişi. Diğer yeni özellik migration'ları gibi kendi başına,
+    izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='Araclar' and xtype='U')
+        CREATE TABLE Araclar (
+            AracID INT IDENTITY(1,1) PRIMARY KEY,
+            Plaka NVARCHAR(20) NOT NULL UNIQUE,
+            Marka NVARCHAR(50) NULL,
+            Model NVARCHAR(50) NULL,
+            MuayeneTarihi DATE NULL,
+            SigortaBitisTarihi DATE NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'Aktif',
+            Aciklama NVARCHAR(300) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "Araclar tablosu")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='AracBakimGecmisi' and xtype='U')
+        CREATE TABLE AracBakimGecmisi (
+            BakimID INT IDENTITY(1,1) PRIMARY KEY,
+            AracID INT NOT NULL FOREIGN KEY REFERENCES Araclar(AracID),
+            Tarih DATE NOT NULL,
+            Aciklama NVARCHAR(300) NOT NULL,
+            Tutar FLOAT NOT NULL DEFAULT 0,
+            OlusturanKullanici NVARCHAR(50) NULL
+        )
+    """, "AracBakimGecmisi tablosu")
+
+def _numune_siparis_migrationlari(cursor):
+    """Numune/Deneme Siparişi Takibi - normal sipariş akışından ayrı, müşteri/ürün
+    denemesi amaçlı sevkiyatların 'gerçek siparişe dönüştü mü' takibi. Diğer yeni
+    özellik migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='NumuneSiparisleri' and xtype='U')
+        CREATE TABLE NumuneSiparisleri (
+            NumuneID INT IDENTITY(1,1) PRIMARY KEY,
+            MusteriID INT NOT NULL FOREIGN KEY REFERENCES Musteriler(MusteriID),
+            StokKod VARCHAR(20) NULL,
+            StokAdi NVARCHAR(200) NOT NULL,
+            Miktar FLOAT NOT NULL,
+            GonderimTarihi DATE NOT NULL DEFAULT GETDATE(),
+            Durum NVARCHAR(30) NOT NULL DEFAULT 'Gönderildi',
+            SonucSiparisID INT NULL FOREIGN KEY REFERENCES Siparisler(SiparisID),
+            Aciklama NVARCHAR(300) NULL,
+            OlusturanKullanici NVARCHAR(50) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "NumuneSiparisleri tablosu")
+
+def _yasal_takvim_migrationlari(cursor):
+    """Vergi/SGK Bildirim Takvimi - KDV/Muhtasar/SGK gibi yasal son tarihlerin
+    manuel kaydı + yaklaşan tarih uyarısı. Diğer yeni özellik migration'ları
+    gibi kendi başına, izole çağrılır."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='YasalTakvimKayitlari' and xtype='U')
+        CREATE TABLE YasalTakvimKayitlari (
+            KayitID INT IDENTITY(1,1) PRIMARY KEY,
+            BeyanTuru NVARCHAR(50) NOT NULL,
+            SonTarih DATE NOT NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'Bekliyor',
+            Aciklama NVARCHAR(300) NULL,
+            TamamlanmaTarihi DATETIME NULL,
+            OlusturanKullanici NVARCHAR(50) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE()
+        )
+    """, "YasalTakvimKayitlari tablosu")
 
 def butce_gerceklesen_hesapla(cursor, hesap_kodu: str, yil: int, ay: int) -> float:
     """Bir hesap kodunun belirli bir ay içindeki gerçekleşen tutarını HesapHareketleri'nden
@@ -4111,6 +4357,54 @@ def cari_ekstre(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"
     finally:
         conn.close()
 
+def _musteri_360_veri_getir(cursor, musteri_id: int) -> dict:
+    """musteri_360 (main.py) ve musteri_360_pdf'in (Müşteri Görünümü özet PDF'i)
+    ORTAK kullandığı veri toplama mantığı - iki yerde ayrı ayrı yazılıp zamanla
+    birbirinden sapmasını önlemek için buraya çıkarıldı (_efatura_xml_olustur_ic
+    ile aynı desen)."""
+    cursor.execute("""SELECT FirmaAdi, YetkiliKisi, Telefon, EPosta, ISNULL(RiskLimiti,0)
+                       FROM Musteriler WHERE MusteriID=?""", (musteri_id,))
+    mus = cursor.fetchone()
+    if not mus:
+        raise HTTPException(status_code=404, detail="Müşteri bulunamadı.")
+    firma_adi, yetkili, telefon, eposta, risk_limiti = mus
+
+    cursor.execute("SELECT ISNULL(SUM(ToplamTutar),0), COUNT(*) FROM Faturalar WHERE MusteriID=?", (musteri_id,))
+    toplam_ciro, fatura_sayisi = cursor.fetchone()
+    toplam_ciro = float(toplam_ciro)
+    cursor.execute("SELECT ISNULL(SUM(Tutar),0) FROM Tahsilatlar WHERE MusteriID=?", (musteri_id,))
+    toplam_tahsilat = float(cursor.fetchone()[0])
+    acik_bakiye = toplam_ciro - toplam_tahsilat
+
+    cursor.execute("""SELECT COUNT(*), ISNULL(AVG(ToplamTutar),0), MAX(SiparisTarihi)
+                       FROM Siparisler WHERE MusteriID=?""", (musteri_id,))
+    siparis_sayisi, ort_siparis_tutari, son_siparis_tarihi = cursor.fetchone()
+
+    cursor.execute("""SELECT COUNT(*), SUM(CASE WHEN GercekTeslimTarihi > SozVerilenTeslimTarihi THEN 1 ELSE 0 END)
+                       FROM Siparisler WHERE MusteriID=? AND SozVerilenTeslimTarihi IS NOT NULL AND GercekTeslimTarihi IS NOT NULL""",
+                   (musteri_id,))
+    degerlendirilen, gec_sayisi = cursor.fetchone()
+    zamaninda_teslimat_orani = None
+    if degerlendirilen:
+        zamaninda_teslimat_orani = round((1 - (gec_sayisi or 0) / degerlendirilen) * 100, 1)
+
+    cursor.execute("SELECT TOP 5 FaturaID, ToplamTutar, Tarih FROM Faturalar WHERE MusteriID=? ORDER BY Tarih DESC", (musteri_id,))
+    son_faturalar = [{"FaturaID": r[0], "ToplamTutar": float(r[1] or 0), "Tarih": str(r[2])[:10]} for r in cursor.fetchall()]
+
+    cursor.execute("SELECT TOP 5 TahsilatID, Tutar, OdemeTuru, Tarih FROM Tahsilatlar WHERE MusteriID=? ORDER BY Tarih DESC", (musteri_id,))
+    son_tahsilatlar = [{"TahsilatID": r[0], "Tutar": float(r[1] or 0), "OdemeTuru": r[2] or "Nakit", "Tarih": str(r[3])[:10]} for r in cursor.fetchall()]
+
+    return {
+        "Musteri": {"MusteriID": musteri_id, "FirmaAdi": firma_adi, "YetkiliKisi": yetkili, "Telefon": telefon,
+                    "EPosta": eposta, "RiskLimiti": float(risk_limiti or 0)},
+        "ToplamCiro": toplam_ciro, "FaturaSayisi": int(fatura_sayisi or 0), "AcikBakiye": acik_bakiye,
+        "SiparisSayisi": int(siparis_sayisi or 0), "OrtalamaSiparisTutari": float(ort_siparis_tutari or 0),
+        "SonSiparisTarihi": str(son_siparis_tarihi)[:10] if son_siparis_tarihi else None,
+        "ZamanindaTeslimatOrani": zamaninda_teslimat_orani, "DegerlendirilenSiparisSayisi": int(degerlendirilen or 0),
+        "SonFaturalar": son_faturalar, "SonTahsilatlar": son_tahsilatlar,
+        "PuanBakiyesi": _musteri_puan_bakiyesi_getir(cursor, musteri_id),
+    }
+
 @app.get("/musteri-360/{musteri_id}")
 def musteri_360(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış"]))):
     """Bir müşteriyle ilgili tüm önemli bilgiyi (ciro, açık bakiye, sipariş geçmişi,
@@ -4120,48 +4414,7 @@ def musteri_360(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("""SELECT FirmaAdi, YetkiliKisi, Telefon, EPosta, ISNULL(RiskLimiti,0)
-                           FROM Musteriler WHERE MusteriID=?""", (musteri_id,))
-        mus = cursor.fetchone()
-        if not mus:
-            raise HTTPException(status_code=404, detail="Müşteri bulunamadı.")
-        firma_adi, yetkili, telefon, eposta, risk_limiti = mus
-
-        cursor.execute("SELECT ISNULL(SUM(ToplamTutar),0), COUNT(*) FROM Faturalar WHERE MusteriID=?", (musteri_id,))
-        toplam_ciro, fatura_sayisi = cursor.fetchone()
-        toplam_ciro = float(toplam_ciro)
-        cursor.execute("SELECT ISNULL(SUM(Tutar),0) FROM Tahsilatlar WHERE MusteriID=?", (musteri_id,))
-        toplam_tahsilat = float(cursor.fetchone()[0])
-        acik_bakiye = toplam_ciro - toplam_tahsilat
-
-        cursor.execute("""SELECT COUNT(*), ISNULL(AVG(ToplamTutar),0), MAX(SiparisTarihi)
-                           FROM Siparisler WHERE MusteriID=?""", (musteri_id,))
-        siparis_sayisi, ort_siparis_tutari, son_siparis_tarihi = cursor.fetchone()
-
-        cursor.execute("""SELECT COUNT(*), SUM(CASE WHEN GercekTeslimTarihi > SozVerilenTeslimTarihi THEN 1 ELSE 0 END)
-                           FROM Siparisler WHERE MusteriID=? AND SozVerilenTeslimTarihi IS NOT NULL AND GercekTeslimTarihi IS NOT NULL""",
-                       (musteri_id,))
-        degerlendirilen, gec_sayisi = cursor.fetchone()
-        zamaninda_teslimat_orani = None
-        if degerlendirilen:
-            zamaninda_teslimat_orani = round((1 - (gec_sayisi or 0) / degerlendirilen) * 100, 1)
-
-        cursor.execute("SELECT TOP 5 FaturaID, ToplamTutar, Tarih FROM Faturalar WHERE MusteriID=? ORDER BY Tarih DESC", (musteri_id,))
-        son_faturalar = [{"FaturaID": r[0], "ToplamTutar": float(r[1] or 0), "Tarih": str(r[2])[:10]} for r in cursor.fetchall()]
-
-        cursor.execute("SELECT TOP 5 TahsilatID, Tutar, OdemeTuru, Tarih FROM Tahsilatlar WHERE MusteriID=? ORDER BY Tarih DESC", (musteri_id,))
-        son_tahsilatlar = [{"TahsilatID": r[0], "Tutar": float(r[1] or 0), "OdemeTuru": r[2] or "Nakit", "Tarih": str(r[3])[:10]} for r in cursor.fetchall()]
-
-        return {
-            "Musteri": {"MusteriID": musteri_id, "FirmaAdi": firma_adi, "YetkiliKisi": yetkili, "Telefon": telefon,
-                        "EPosta": eposta, "RiskLimiti": float(risk_limiti or 0)},
-            "ToplamCiro": toplam_ciro, "FaturaSayisi": int(fatura_sayisi or 0), "AcikBakiye": acik_bakiye,
-            "SiparisSayisi": int(siparis_sayisi or 0), "OrtalamaSiparisTutari": float(ort_siparis_tutari or 0),
-            "SonSiparisTarihi": str(son_siparis_tarihi)[:10] if son_siparis_tarihi else None,
-            "ZamanindaTeslimatOrani": zamaninda_teslimat_orani, "DegerlendirilenSiparisSayisi": int(degerlendirilen or 0),
-            "SonFaturalar": son_faturalar, "SonTahsilatlar": son_tahsilatlar,
-            "PuanBakiyesi": _musteri_puan_bakiyesi_getir(cursor, musteri_id),
-        }
+        return _musteri_360_veri_getir(cursor, musteri_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -4521,8 +4774,33 @@ def kullanici_listesi(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT KullaniciID, KullaniciAdi, Rol FROM Kullanicilar")
-        return {"kullanicilar": [{"KullaniciID": r[0], "KullaniciAdi": r[1], "Rol": r[2] or "Yönetici"} for r in cursor.fetchall()]}
+        cursor.execute("SELECT KullaniciID, KullaniciAdi, Rol, ISNULL(SadeceKendiKayitlariGorsun,0) FROM Kullanicilar")
+        return {"kullanicilar": [{"KullaniciID": r[0], "KullaniciAdi": r[1], "Rol": r[2] or "Yönetici",
+                                   "SadeceKendiKayitlariGorsun": bool(r[3])} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+class KullaniciYetkiGuncelleRequest(BaseModel):
+    SadeceKendiKayitlariGorsun: bool
+
+@app.put("/kullanici-yetki-guncelle/{kullanici_id}")
+def kullanici_yetki_guncelle(kullanici_id: int, veri: KullaniciYetkiGuncelleRequest, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    """Alan Bazlı Yetkilendirme - kapsamı bilinçli olarak dar: SADECE bu bayrağı
+    değiştirir (rol değişikliği gibi geniş bir 'kullanıcı düzenle' endpoint'i
+    değil, bkz. plan). Yönetici/Master bu bayraktan zaten etkilenmez
+    (_sadece_kendi_kayitlarini_gorsun_mu, main.py)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE Kullanicilar SET SadeceKendiKayitlariGorsun=? WHERE KullaniciID=?",
+                       (veri.SadeceKendiKayitlariGorsun, kullanici_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Kullanıcı bulunamadı.")
+        log_islem(cursor, f"Kullanıcı #{kullanici_id} 'sadece kendi kayıtları' bayrağı: {veri.SadeceKendiKayitlariGorsun}", user["username"])
+        conn.commit()
+        return {"mesaj": "Yetki güncellendi."}
+    except HTTPException:
+        raise
     finally:
         conn.close()
 
@@ -7204,13 +7482,35 @@ def firsat_ekle(veri: SatisFirsatiEkleRequest, user: dict = Depends(yetki_kontro
     finally:
         conn.close()
 
+def _sadece_kendi_kayitlarini_gorsun_mu(cursor, user: dict) -> bool:
+    """Alan Bazlı Yetkilendirme: kullanıcının Kullanicilar.SadeceKendiKayitlariGorsun
+    bayrağı açık mı kontrol eder. Yönetici/Master bu filtreye HİÇBİR ZAMAN tabi
+    değildir (yetki_kontrol'ün main.py:736 civarındaki genel felsefesiyle tutarlı -
+    her zaman her şeyi görürler). Kapsam bilinçli olarak dar tutuldu: sadece
+    SatisFirsatlari/Aktiviteler'de uygulanır (bkz. _alan_bazli_yetki_migrationlari
+    docstring'i - Siparişler/Teklifler/Müşteriler'de oluşturan-kullanıcı sütunu yok)."""
+    if user["rol"] in ("Yönetici", "Master"):
+        return False
+    try:
+        cursor.execute("SELECT SadeceKendiKayitlariGorsun FROM Kullanicilar WHERE KullaniciAdi=?", (user["username"],))
+        row = cursor.fetchone()
+        return bool(row[0]) if row else False
+    except Exception:
+        return False
+
 @app.get("/firsat-listesi")
 def firsat_listesi_getir(user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("""SELECT f.FirsatID, m.FirmaAdi, f.FirsatAdi, f.TahminiTutar, f.Asama, f.TahminiKapanisTarihi, f.Aciklama, f.MusteriID
-                           FROM SatisFirsatlari f JOIN Musteriler m ON f.MusteriID = m.MusteriID ORDER BY f.OlusturmaTarihi DESC""")
+        sorgu = """SELECT f.FirsatID, m.FirmaAdi, f.FirsatAdi, f.TahminiTutar, f.Asama, f.TahminiKapanisTarihi, f.Aciklama, f.MusteriID
+                   FROM SatisFirsatlari f JOIN Musteriler m ON f.MusteriID = m.MusteriID"""
+        params = []
+        if _sadece_kendi_kayitlarini_gorsun_mu(cursor, user):
+            sorgu += " WHERE f.KullaniciAdi=?"
+            params.append(user["username"])
+        sorgu += " ORDER BY f.OlusturmaTarihi DESC"
+        cursor.execute(sorgu, params)
         return {"firsatlar": [{"FirsatID": r[0], "FirmaAdi": r[1], "FirsatAdi": r[2], "TahminiTutar": float(r[3]),
                                 "Asama": r[4], "TahminiKapanisTarihi": str(r[5]) if r[5] else "-", "Aciklama": r[6] or "",
                                 "MusteriID": r[7]} for r in cursor.fetchall()]}
@@ -7288,6 +7588,9 @@ def aktivite_listesi_getir(musteri_id: Optional[int] = None, firsat_id: Optional
         if firsat_id:
             kosullar.append("FirsatID = ?")
             params.append(firsat_id)
+        if _sadece_kendi_kayitlarini_gorsun_mu(cursor, user):
+            kosullar.append("KullaniciAdi = ?")
+            params.append(user["username"])
         if kosullar:
             sorgu += " WHERE " + " AND ".join(kosullar)
         sorgu += " ORDER BY Tarih DESC"
@@ -7306,6 +7609,75 @@ def aktivite_tamamla(aktivite_id: int, user: dict = Depends(get_current_user)):
         cursor.execute("UPDATE Aktiviteler SET TamamlandiMi=1 WHERE AktiviteID=?", (aktivite_id,))
         conn.commit()
         return {"mesaj": "Aktivite tamamlandı olarak işaretlendi."}
+    finally:
+        conn.close()
+
+class MusteriSikayetEkle(BaseModel):
+    MusteriID: int
+    Konu: str
+    Aciklama: Optional[str] = None
+    Oncelik: str = "Orta"  # Düşük | Orta | Yüksek
+
+@app.post("/musteri-sikayet")
+def musteri_sikayet_ekle(veri: MusteriSikayetEkle, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 FROM Musteriler WHERE MusteriID=?", (veri.MusteriID,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Müşteri bulunamadı.")
+        cursor.execute("""INSERT INTO MusteriSikayetleri (MusteriID, Konu, Aciklama, Oncelik, OlusturanKullanici)
+                           VALUES (?, ?, ?, ?, ?)""",
+                       (veri.MusteriID, veri.Konu, veri.Aciklama, veri.Oncelik, user["username"]))
+        log_islem(cursor, f"Müşteri şikayeti açıldı: {veri.Konu} (Müşteri #{veri.MusteriID})", user["username"])
+        conn.commit()
+        return {"mesaj": "Şikayet kaydedildi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.get("/musteri-sikayet")
+def musteri_sikayet_listesi(musteri_id: Optional[int] = None, durum: Optional[str] = None, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = """SELECT s.SikayetID, s.MusteriID, m.FirmaAdi, s.Konu, s.Aciklama, s.Oncelik, s.Durum, s.Cozum,
+                           s.OlusturanKullanici, s.OlusturmaTarihi, s.KapanisTarihi
+                    FROM MusteriSikayetleri s JOIN Musteriler m ON m.MusteriID = s.MusteriID WHERE 1=1"""
+        parametreler = []
+        if musteri_id:
+            sorgu += " AND s.MusteriID=?"
+            parametreler.append(musteri_id)
+        if durum:
+            sorgu += " AND s.Durum=?"
+            parametreler.append(durum)
+        sorgu += " ORDER BY s.OlusturmaTarihi DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"Sikayetler": [{"SikayetID": r[0], "MusteriID": r[1], "FirmaAdi": r[2], "Konu": r[3], "Aciklama": r[4] or "",
+                                 "Oncelik": r[5], "Durum": r[6], "Cozum": r[7] or "", "OlusturanKullanici": r[8] or "-",
+                                 "OlusturmaTarihi": str(r[9])[:16], "KapanisTarihi": str(r[10])[:16] if r[10] else None}
+                                for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+class MusteriSikayetKapat(BaseModel):
+    Cozum: str
+
+@app.put("/musteri-sikayet-kapat/{sikayet_id}")
+def musteri_sikayet_kapat(sikayet_id: int, veri: MusteriSikayetKapat, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE MusteriSikayetleri SET Durum='Kapalı', Cozum=?, KapanisTarihi=GETDATE() WHERE SikayetID=?",
+                       (veri.Cozum, sikayet_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Şikayet bulunamadı.")
+        log_islem(cursor, f"Müşteri şikayeti kapatıldı: #{sikayet_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Şikayet kapatıldı."}
+    except HTTPException:
+        raise
     finally:
         conn.close()
 
@@ -7741,10 +8113,13 @@ def modul_ozet(kategori_kodu: str, user: dict = Depends(get_current_user)):
             cursor.execute("""SELECT ISNULL(SUM(ToplamTutar),0) FROM Siparisler
                                WHERE SiparisTarihi >= DATEADD(month, DATEDIFF(month,0,GETDATE()), 0)""")
             bu_ay_siparis = float(cursor.fetchone()[0])
+            cursor.execute("SELECT COUNT(*) FROM MusteriSikayetleri WHERE Durum='Açık'")
+            acik_sikayet = int(cursor.fetchone()[0])
             stats = [
                 {"Etiket": "Bekleyen Sipariş", "Deger": str(bekleyen)},
                 {"Etiket": "Açık Satış Fırsatı", "Deger": str(acik_firsat)},
                 {"Etiket": "Bu Ay Sipariş Toplamı", "Deger": f"{bu_ay_siparis:,.2f} TL"},
+                {"Etiket": "Açık Şikayet", "Deger": str(acik_sikayet)},
             ]
             grafik = _son_6_ay_ciro_grafigi(cursor)
 
@@ -8405,6 +8780,78 @@ def siparis_listesi_getir(user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
+class NumuneSiparisEkle(BaseModel):
+    MusteriID: int
+    StokKod: Optional[str] = None
+    StokAdi: str
+    Miktar: float = Field(gt=0)
+    GonderimTarihi: Optional[str] = None
+    Aciklama: Optional[str] = None
+
+@app.post("/numune-siparis")
+def numune_siparis_ekle(veri: NumuneSiparisEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 FROM Musteriler WHERE MusteriID=?", (veri.MusteriID,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Müşteri bulunamadı.")
+        cursor.execute("""INSERT INTO NumuneSiparisleri (MusteriID, StokKod, StokAdi, Miktar, GonderimTarihi, Aciklama, OlusturanKullanici)
+                           VALUES (?, ?, ?, ?, ISNULL(?, CAST(GETDATE() AS DATE)), ?, ?)""",
+                       (veri.MusteriID, veri.StokKod, veri.StokAdi, veri.Miktar, veri.GonderimTarihi, veri.Aciklama, user["username"]))
+        log_islem(cursor, f"Numune siparişi kaydedildi: {veri.StokAdi} -> Müşteri #{veri.MusteriID}", user["username"])
+        conn.commit()
+        return {"mesaj": "Numune siparişi kaydedildi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.get("/numune-siparis")
+def numune_siparis_listesi(durum: Optional[str] = None, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = """SELECT n.NumuneID, n.MusteriID, m.FirmaAdi, n.StokKod, n.StokAdi, n.Miktar, n.GonderimTarihi,
+                          n.Durum, n.SonucSiparisID, n.Aciklama, n.OlusturanKullanici
+                   FROM NumuneSiparisleri n JOIN Musteriler m ON m.MusteriID = n.MusteriID WHERE 1=1"""
+        parametreler = []
+        if durum:
+            sorgu += " AND n.Durum=?"
+            parametreler.append(durum)
+        sorgu += " ORDER BY n.GonderimTarihi DESC"
+        cursor.execute(sorgu, parametreler)
+        return {"Numuneler": [{"NumuneID": r[0], "MusteriID": r[1], "FirmaAdi": r[2], "StokKod": r[3] or "-",
+                                "StokAdi": r[4], "Miktar": float(r[5]), "GonderimTarihi": str(r[6]),
+                                "Durum": r[7], "SonucSiparisID": r[8], "Aciklama": r[9] or "",
+                                "OlusturanKullanici": r[10] or "-"} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+class NumuneSiparisSonuclandir(BaseModel):
+    Durum: str  # Değerlendiriliyor | Siparişe Dönüştü | Reddedildi
+    SonucSiparisID: Optional[int] = None
+
+@app.put("/numune-siparis-sonuclandir/{numune_id}")
+def numune_siparis_sonuclandir(numune_id: int, veri: NumuneSiparisSonuclandir, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
+    gecerli_durumlar = {"Gönderildi", "Değerlendiriliyor", "Siparişe Dönüştü", "Reddedildi"}
+    if veri.Durum not in gecerli_durumlar:
+        raise HTTPException(status_code=400, detail="Geçersiz durum.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE NumuneSiparisleri SET Durum=?, SonucSiparisID=? WHERE NumuneID=?",
+                       (veri.Durum, veri.SonucSiparisID, numune_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Numune siparişi bulunamadı.")
+        log_islem(cursor, f"Numune siparişi #{numune_id} durumu güncellendi: {veri.Durum}", user["username"])
+        conn.commit()
+        return {"mesaj": "Durum güncellendi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
 @app.put("/siparis-durum-guncelle")
 def siparis_durum_guncelle(veri: SiparisDurumGuncelle, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Depo", "Üretim"]))):
     gecerli_durumlar = {"Bekliyor", "Onaylandı", "Kargoda", "Kısmi Teslim", "Tamamlandı", "İptal"}
@@ -8475,19 +8922,28 @@ def siparis_sil(siparis_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"
         conn.close()
 
 @app.post("/irsaliye-kes")
-def irsaliye_kes(req: IrsaliyeKesRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Satış"]))):
+def irsaliye_kes(req: IrsaliyeKesRequest, background_tasks: BackgroundTasks, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Satış"]))):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT INTO Irsaliyeler (MusteriID, Plaka, Sofor, Aciklama, FaturaID, IrsaliyeTuru, SiparisID) 
+            INSERT INTO Irsaliyeler (MusteriID, Plaka, Sofor, Aciklama, FaturaID, IrsaliyeTuru, SiparisID)
             OUTPUT inserted.IrsaliyeID VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (req.MusteriID, req.Plaka, req.Sofor, req.Aciklama, req.FaturaID, req.IrsaliyeTuru, req.SiparisID))
         irsaliye_id = int(cursor.fetchone()[0])
         if req.SiparisID:
             cursor.execute("UPDATE Siparisler SET Durum='Kargoda' WHERE SiparisID=?", (req.SiparisID,))
+        # NOT: Bu kalemler SADECE e-İrsaliye belgesi (UBL DespatchLine) üretmek için
+        # tutulur - Alış İrsaliyesi'nden farklı olarak stok hareketi TETİKLEMEZ,
+        # satış tarafında stok düşümü zaten fatura/sipariş aşamasında oluyor.
+        for kalem in req.Kalemler:
+            cursor.execute("INSERT INTO IrsaliyeKalemleri (IrsaliyeID, StokKod, StokAdi, Miktar) VALUES (?, ?, ?, ?)",
+                           (irsaliye_id, kalem.StokKod, kalem.StokAdi, kalem.Miktar))
         log_islem(cursor, f"İrsaliye kesildi: #{irsaliye_id}", user["username"])
         conn.commit()
+        # Sistem Ayarları'nda 'e-İrsaliye Otomatik Oluştur' açıksa, e-Fatura'daki
+        # (_efatura_otomatik_tetikle) ile birebir aynı desende arka planda tetiklenir.
+        background_tasks.add_task(_eirsaliye_otomatik_tetikle, irsaliye_id)
         return {"mesaj": f"İrsaliye kesildi. Plaka: {req.Plaka}", "IrsaliyeID": irsaliye_id}
     except Exception as e:
         conn.rollback()
@@ -8627,10 +9083,11 @@ def irsaliye_listesi_getir(user: dict = Depends(get_current_user)):
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT i.IrsaliyeID, m.FirmaAdi, i.Plaka, i.Sofor, i.Aciklama, i.Tarih, ISNULL(i.IrsaliyeTuru, 'Toptan Satış İrsaliyesi')
+            SELECT i.IrsaliyeID, m.FirmaAdi, i.Plaka, i.Sofor, i.Aciklama, i.Tarih, ISNULL(i.IrsaliyeTuru, 'Toptan Satış İrsaliyesi'), ISNULL(i.EIrsaliyeDurum, 'TASLAK')
             FROM Irsaliyeler i JOIN Musteriler m ON i.MusteriID = m.MusteriID ORDER BY i.IrsaliyeID DESC
         """)
-        return {"irsaliyeler": [{"IrsaliyeID": r[0], "FirmaAdi": r[1], "Plaka": r[2], "Sofor": r[3], "Aciklama": r[4], "Tarih": str(r[5]) if r[5] else "", "IrsaliyeTuru": r[6]} for r in cursor.fetchall()]}
+        return {"irsaliyeler": [{"IrsaliyeID": r[0], "FirmaAdi": r[1], "Plaka": r[2], "Sofor": r[3], "Aciklama": r[4], "Tarih": str(r[5]) if r[5] else "",
+                                  "IrsaliyeTuru": r[6], "EIrsaliyeDurum": r[7]} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -8648,6 +9105,81 @@ def fatura_listesi_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhas
         conn.close()
 
 
+
+@app.get("/musteri-360-pdf/{musteri_id}")
+def musteri_360_pdf(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış"]))):
+    """Müşteri Görünümü - müşteri aradığında/talep ettiğinde hızlıca üretilip
+    WhatsApp/e-posta ile paylaşılabilecek bir hesap özeti PDF'i. cari-ekstre-pdf'ten
+    (main.py:8941) FARKLI: o TÜM borç/alacak hareketlerinin dökümü, bu ise
+    Müşteri 360 ekranındaki (_musteri_360_veri_getir) özet KPI'ları + son 5
+    fatura/tahsilatı tek sayfada gösteren, müşteriye gönderilmeye uygun sade bir özet."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        veri = _musteri_360_veri_getir(cursor, musteri_id)
+        mus = veri["Musteri"]
+
+        pdf = FPDF()
+        pdf.add_page()
+        font = pdf_unicode_font_yukle(pdf)
+        pdf_filigran_ekle(pdf)
+        pdf_profesyonel_baslik(pdf, "MUSTERI HESAP OZETI", "-", datetime.date.today().strftime("%d.%m.%Y"),
+                                [f"Musteri: {mus['FirmaAdi']}", f"Yetkili: {mus.get('YetkiliKisi') or '-'}"], font)
+
+        pdf.set_font(font, "B", 11)
+        pdf.set_fill_color(*PDF_MARKA_RENGI)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(95, 9, "Toplam Ciro", 1, 0, "C", fill=True)
+        pdf.cell(95, 9, "Acik Bakiye", 1, 1, "C", fill=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font(font, "", 12)
+        pdf.cell(95, 10, f"{veri['ToplamCiro']:,.2f} TL", 1, 0, "C")
+        pdf.cell(95, 10, f"{veri['AcikBakiye']:,.2f} TL", 1, 1, "C")
+        pdf.set_font(font, "B", 11)
+        pdf.set_fill_color(*PDF_MARKA_RENGI)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(95, 9, "Siparis Sayisi", 1, 0, "C", fill=True)
+        pdf.cell(95, 9, "Zamaninda Teslimat", 1, 1, "C", fill=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font(font, "", 12)
+        zt = f"%{veri['ZamanindaTeslimatOrani']:.0f}" if veri["ZamanindaTeslimatOrani"] is not None else "Veri yok"
+        pdf.cell(95, 10, str(veri["SiparisSayisi"]), 1, 0, "C")
+        pdf.cell(95, 10, zt, 1, 1, "C")
+        pdf.ln(6)
+
+        pdf.set_font(font, "B", 12)
+        pdf.cell(0, 8, "Son Faturalar", 0, 1, "L")
+        if veri["SonFaturalar"]:
+            pdf_tablo_basligi(pdf, [("Fatura No", 60, "L"), ("Tarih", 60, "L"), ("Tutar", 70, "R")], font)
+            for idx, f in enumerate(veri["SonFaturalar"]):
+                pdf_tablo_satiri(pdf, [(f"FT-{f['FaturaID']}", 60, "L"), (f["Tarih"], 60, "L"),
+                                        (f"{f['ToplamTutar']:,.2f} TL", 70, "R")], idx, font)
+        else:
+            pdf.set_font(font, "", 10)
+            pdf.cell(0, 8, "Fatura kaydi yok.", 0, 1, "L")
+        pdf.ln(4)
+
+        pdf.set_font(font, "B", 12)
+        pdf.cell(0, 8, "Son Tahsilatlar", 0, 1, "L")
+        if veri["SonTahsilatlar"]:
+            pdf_tablo_basligi(pdf, [("Odeme Turu", 60, "L"), ("Tarih", 60, "L"), ("Tutar", 70, "R")], font)
+            for idx, t in enumerate(veri["SonTahsilatlar"]):
+                pdf_tablo_satiri(pdf, [(t["OdemeTuru"], 60, "L"), (t["Tarih"], 60, "L"),
+                                        (f"{t['Tutar']:,.2f} TL", 70, "R")], idx, font)
+        else:
+            pdf.set_font(font, "", 10)
+            pdf.cell(0, 8, "Tahsilat kaydi yok.", 0, 1, "L")
+
+        pdf_footer_ekle(pdf, font_ailesi=font)
+
+        os.makedirs("MusteriOzetleri", exist_ok=True)
+        pdf_yolu = os.path.join("MusteriOzetleri", f"Ozet_{musteri_id}_{datetime.date.today().isoformat()}.pdf")
+        pdf.output(pdf_yolu)
+        return FileResponse(pdf_yolu, media_type="application/pdf", filename=os.path.basename(pdf_yolu))
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
 
 @app.get("/cari-ekstre-pdf/{musteri_id}")
 def cari_ekstre_pdf(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış"]))):
@@ -9115,6 +9647,186 @@ def efatura_durum(fatura_id: int, user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="Fatura bulunamadı.")
         return {"EFaturaDurum": row[0] or "TASLAK", "EFaturaNo": row[1], "EFaturaUUID": row[2],
                 "EFaturaSenaryo": row[3], "EFaturaHataMesaji": row[4], "EFaturaGonderimTarihi": row[5]}
+    finally:
+        conn.close()
+
+def eirsaliye_ayarlarini_getir():
+    """e-İrsaliye ayarlarını okur - e-Fatura ile AYNI entegratör hesabı (URL/
+    Kullanıcı/ApiKey) üzerinden gönderileceği varsayılır (GİB entegratörleri
+    genelde tek hesapta hem e-Fatura hem e-İrsaliye sunar), sadece seri kodu
+    ayrıdır. efatura_ayarlarini_getir (main.py:66) ile aynı desen: hiç
+    ayarlanmamışsa None döner."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""SELECT AyarAnahtari, AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari IN
+                           ('EFaturaEntegratorURL', 'EFaturaKullaniciAdi', 'EFaturaApiKey', 'EIrsaliyeSeriKodu')""")
+        ayarlar = {r[0]: r[1] for r in cursor.fetchall()}
+        conn.close()
+        url = ayarlar.get("EFaturaEntegratorURL")
+        if not url:
+            return None
+        return {"url": url, "kullanici_adi": ayarlar.get("EFaturaKullaniciAdi") or "",
+                "api_key": ayarlar.get("EFaturaApiKey") or "", "seri_kodu": ayarlar.get("EIrsaliyeSeriKodu") or "NIS"}
+    except Exception:
+        return None
+
+def eirsaliye_sonraki_no_al(cursor, seri_kodu: str) -> str:
+    """efatura_sonraki_no_al (main.py:91) ile birebir aynı desen, ayrı bir sayaç
+    tablosu (EIrsaliyeSayaci) üzerinden."""
+    yil = datetime.datetime.now().year
+    seri = f"{seri_kodu}{yil}"
+    cursor.execute("SELECT SonSira FROM EIrsaliyeSayaci WHERE SeriKodu=?", (seri,))
+    row = cursor.fetchone()
+    if row is None:
+        cursor.execute("INSERT INTO EIrsaliyeSayaci (SeriKodu, SonSira) VALUES (?, 1)", (seri,))
+        sira = 1
+    else:
+        sira = int(row[0]) + 1
+        cursor.execute("UPDATE EIrsaliyeSayaci SET SonSira=? WHERE SeriKodu=?", (sira, seri))
+    return f"{seri}{sira:09d}"
+
+def _eirsaliye_xml_olustur_ic(cursor, irsaliye_id: int, kullanici: str) -> dict:
+    """e-İrsaliye XML üretiminin asıl mantığı - _efatura_xml_olustur_ic (main.py:8955)
+    ile AYNI desen: hem manuel endpoint hem otomatik tetikleme bunu çağırır,
+    commit/rollback çağıranın sorumluluğundadır."""
+    cursor.execute("""
+        SELECT i.IrsaliyeID, i.Tarih, m.FirmaAdi, m.Adres, m.VergiNo, m.VergiKimlikTipi, m.Il, m.Ilce
+        FROM Irsaliyeler i JOIN Musteriler m ON i.MusteriID = m.MusteriID WHERE i.IrsaliyeID=?
+    """, (irsaliye_id,))
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="İrsaliye bulunamadı.")
+    musteri_bilgi = {"FirmaAdi": row[2], "Adres": row[3], "VergiNo": row[4], "VergiKimlikTipi": row[5], "Il": row[6], "Ilce": row[7]}
+
+    cursor.execute("SELECT StokKod, StokAdi, Miktar FROM IrsaliyeKalemleri WHERE IrsaliyeID=?", (irsaliye_id,))
+    kalemler = [{"StokKod": s[0], "StokAdi": s[1], "Miktar": s[2]} for s in cursor.fetchall()]
+    if not kalemler:
+        raise HTTPException(status_code=400, detail="Bu irsaliyede hiç kalem yok - e-İrsaliye oluşturulamaz. İrsaliye kesilirken en az bir kalem girilmeli.")
+
+    ettn = str(uuid.uuid4())
+    ayarlar = eirsaliye_ayarlarini_getir()
+    seri_kodu = ayarlar["seri_kodu"] if ayarlar else "NIS"
+    eirsaliye_no = eirsaliye_sonraki_no_al(cursor, seri_kodu)
+
+    xml_agaci = ubl_tr_irsaliye_xml_olustur(irsaliye_id, ettn, eirsaliye_no, row[1], musteri_bilgi, kalemler)
+
+    os.makedirs(os.path.join("Irsaliyeler", "EIrsaliye"), exist_ok=True)
+    xml_yolu = os.path.join("Irsaliyeler", "EIrsaliye", f"{eirsaliye_no}.xml")
+    ET.ElementTree(xml_agaci).write(xml_yolu, encoding="utf-8", xml_declaration=True)
+
+    cursor.execute("""UPDATE Irsaliyeler SET EIrsaliyeUUID=?, EIrsaliyeNo=?, EIrsaliyeXmlYolu=?, EIrsaliyeDurum='OLUSTURULDU'
+                       WHERE IrsaliyeID=?""", (ettn, eirsaliye_no, xml_yolu, irsaliye_id))
+    log_islem(cursor, f"e-İrsaliye XML oluşturuldu: İrsaliye #{irsaliye_id} -> {eirsaliye_no}", kullanici)
+    return {"mesaj": "e-İrsaliye XML oluşturuldu.", "EIrsaliyeNo": eirsaliye_no, "EIrsaliyeUUID": ettn, "EIrsaliyeXmlYolu": xml_yolu}
+
+@app.post("/irsaliye/{irsaliye_id}/eirsaliye-olustur")
+def eirsaliye_olustur(irsaliye_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sonuc = _eirsaliye_xml_olustur_ic(cursor, irsaliye_id, user["username"])
+        conn.commit()
+        return sonuc
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+def _eirsaliye_otomatik_tetikle(irsaliye_id: int):
+    """irsaliye-kes'ten SONRA (BackgroundTasks ile) çağrılır - _efatura_otomatik_tetikle
+    (main.py:9180) ile AYNI desen. SistemAyarlari'nda 'EIrsaliyeOtomatikOlustur'
+    açık DEĞİLSE hiçbir şey yapmaz. Kalemsiz kesilen (Kalemler boş) irsaliyeler
+    için XML üretimi zaten 400 ile başarısız olur - bu durum SADECE loglanır,
+    irsaliye kesimi ETKİLENMEZ."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT AyarAnahtari, AyarDegeri FROM SistemAyarlari WHERE AyarAnahtari IN ('EIrsaliyeOtomatikOlustur', 'EIrsaliyeOtomatikGonder')")
+        ayar_satirlari = {r[0]: r[1] for r in cursor.fetchall()}
+        if ayar_satirlari.get("EIrsaliyeOtomatikOlustur") != "1":
+            return
+
+        sonuc = _eirsaliye_xml_olustur_ic(cursor, irsaliye_id, "Sistem (Otomatik)")
+        conn.commit()
+        print(f">>> İrsaliye #{irsaliye_id} için e-İrsaliye otomatik oluşturuldu: {sonuc['EIrsaliyeNo']}")
+
+        if ayar_satirlari.get("EIrsaliyeOtomatikGonder") == "1":
+            entegrator_ayarlari = eirsaliye_ayarlarini_getir()
+            if entegrator_ayarlari:
+                gonder_sonuc = efatura_entegrator_gonder(sonuc["EIrsaliyeXmlYolu"], entegrator_ayarlari)
+                if gonder_sonuc["basarili"]:
+                    cursor.execute("UPDATE Irsaliyeler SET EIrsaliyeDurum='GONDERILDI', EIrsaliyeGonderimTarihi=GETDATE() WHERE IrsaliyeID=?", (irsaliye_id,))
+                    print(f">>> İrsaliye #{irsaliye_id} e-İrsaliye'si entegratöre otomatik gönderildi.")
+                else:
+                    cursor.execute("UPDATE Irsaliyeler SET EIrsaliyeDurum='HATA', EIrsaliyeHataMesaji=? WHERE IrsaliyeID=?", (gonder_sonuc["hata"][:500], irsaliye_id))
+                    print(f">>> İrsaliye #{irsaliye_id} e-İrsaliye otomatik gönderim hatası: {gonder_sonuc['hata']}")
+                conn.commit()
+    except Exception as e:
+        print(f">>> İrsaliye #{irsaliye_id} için otomatik e-İrsaliye işlemi başarısız (irsaliye kesimi ETKİLENMEDİ): {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    finally:
+        if conn:
+            conn.close()
+
+@app.post("/irsaliye/{irsaliye_id}/eirsaliye-gonder")
+def eirsaliye_gonder(irsaliye_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT EIrsaliyeDurum, EIrsaliyeXmlYolu FROM Irsaliyeler WHERE IrsaliyeID=?", (irsaliye_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="İrsaliye bulunamadı.")
+        durum, xml_yolu = row[0], row[1]
+        if durum not in ("OLUSTURULDU", "HATA"):
+            raise HTTPException(status_code=400, detail="Önce e-İrsaliye XML'i oluşturulmalı (/eirsaliye-olustur).")
+
+        ayarlar = eirsaliye_ayarlarini_getir()
+        if not ayarlar:
+            raise HTTPException(status_code=400, detail="e-Fatura/e-İrsaliye entegratör ayarları yapılandırılmamış. Sistem Ayarları'ndan girin.")
+
+        sonuc = efatura_entegrator_gonder(xml_yolu, ayarlar)
+        if sonuc["basarili"]:
+            cursor.execute("UPDATE Irsaliyeler SET EIrsaliyeDurum='GONDERILDI', EIrsaliyeGonderimTarihi=GETDATE(), EIrsaliyeHataMesaji=NULL WHERE IrsaliyeID=?", (irsaliye_id,))
+            log_islem(cursor, f"e-İrsaliye entegratöre gönderildi: İrsaliye #{irsaliye_id}", user["username"])
+            conn.commit()
+            return {"mesaj": "e-İrsaliye entegratöre gönderildi.", "EIrsaliyeDurum": "GONDERILDI"}
+        else:
+            cursor.execute("UPDATE Irsaliyeler SET EIrsaliyeDurum='HATA', EIrsaliyeHataMesaji=? WHERE IrsaliyeID=?", (sonuc["hata"][:500], irsaliye_id))
+            log_islem(cursor, f"e-İrsaliye gönderim hatası: İrsaliye #{irsaliye_id} - {sonuc['hata']}", user["username"])
+            conn.commit()
+            return {"mesaj": "e-İrsaliye gönderimi başarısız oldu, durum kaydedildi.", "EIrsaliyeDurum": "HATA", "Hata": sonuc["hata"]}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/irsaliye/{irsaliye_id}/eirsaliye-durum")
+def eirsaliye_durum(irsaliye_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT EIrsaliyeDurum, EIrsaliyeNo, EIrsaliyeUUID, EIrsaliyeHataMesaji, EIrsaliyeGonderimTarihi, EIrsaliyeXmlYolu
+                           FROM Irsaliyeler WHERE IrsaliyeID=?""", (irsaliye_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="İrsaliye bulunamadı.")
+        return {"EIrsaliyeDurum": row[0] or "TASLAK", "EIrsaliyeNo": row[1], "EIrsaliyeUUID": row[2],
+                "EIrsaliyeHataMesaji": row[3], "EIrsaliyeGonderimTarihi": row[4], "EIrsaliyeXmlYolu": row[5]}
     finally:
         conn.close()
 
@@ -10091,6 +10803,120 @@ def makine_bakim_listesi(user: dict = Depends(get_current_user)):
         return {"bakimlar": [{"BakimID": r[0], "HatAdi": r[1], "BakimTuru": r[2], "BaslangicTarihi": str(r[3])[:16],
                                "BitisTarihi": str(r[4])[:16] if r[4] else "-", "Aciklama": r[5] or "", "Durum": r[6],
                                "KullaniciAdi": r[7]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+# --- ARAÇ / FİLO YÖNETİMİ ---
+class AracEkleRequest(BaseModel):
+    Plaka: str
+    Marka: Optional[str] = None
+    Model: Optional[str] = None
+    MuayeneTarihi: Optional[str] = None
+    SigortaBitisTarihi: Optional[str] = None
+    Durum: str = "Aktif"
+    Aciklama: Optional[str] = None
+
+class AracGuncelleRequest(AracEkleRequest):
+    AracID: int
+
+@app.post("/arac")
+def arac_ekle(veri: AracEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""INSERT INTO Araclar (Plaka, Marka, Model, MuayeneTarihi, SigortaBitisTarihi, Durum, Aciklama)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (veri.Plaka.strip().upper(), veri.Marka, veri.Model, veri.MuayeneTarihi,
+                        veri.SigortaBitisTarihi, veri.Durum, veri.Aciklama))
+        log_islem(cursor, f"Araç eklendi: {veri.Plaka}", user["username"])
+        conn.commit()
+        return {"mesaj": "Araç eklendi."}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Bu plaka zaten kayıtlı olabilir: {e}")
+    finally:
+        conn.close()
+
+@app.get("/arac")
+def arac_listesi(user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT AracID, Plaka, Marka, Model, MuayeneTarihi, SigortaBitisTarihi, Durum, Aciklama
+                           FROM Araclar ORDER BY Plaka""")
+        return {"Araclar": [{"AracID": r[0], "Plaka": r[1], "Marka": r[2] or "-", "Model": r[3] or "-",
+                              "MuayeneTarihi": str(r[4]) if r[4] else None, "SigortaBitisTarihi": str(r[5]) if r[5] else None,
+                              "Durum": r[6], "Aciklama": r[7] or ""} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.put("/arac")
+def arac_guncelle(veri: AracGuncelleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""UPDATE Araclar SET Plaka=?, Marka=?, Model=?, MuayeneTarihi=?, SigortaBitisTarihi=?, Durum=?, Aciklama=?
+                           WHERE AracID=?""",
+                       (veri.Plaka.strip().upper(), veri.Marka, veri.Model, veri.MuayeneTarihi,
+                        veri.SigortaBitisTarihi, veri.Durum, veri.Aciklama, veri.AracID))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Araç bulunamadı.")
+        log_islem(cursor, f"Araç güncellendi: #{veri.AracID}", user["username"])
+        conn.commit()
+        return {"mesaj": "Araç güncellendi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.delete("/arac/{arac_id}")
+def arac_sil(arac_id: int, user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM AracBakimGecmisi WHERE AracID=?", (arac_id,))
+        cursor.execute("DELETE FROM Araclar WHERE AracID=?", (arac_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Araç bulunamadı.")
+        log_islem(cursor, f"Araç silindi: #{arac_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Araç silindi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+class AracBakimEkleRequest(BaseModel):
+    AracID: int
+    Tarih: str
+    Aciklama: str
+    Tutar: float = Field(ge=0, default=0)
+
+@app.post("/arac-bakim")
+def arac_bakim_ekle(veri: AracBakimEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Depo", "Satış"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 FROM Araclar WHERE AracID=?", (veri.AracID,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Araç bulunamadı.")
+        cursor.execute("INSERT INTO AracBakimGecmisi (AracID, Tarih, Aciklama, Tutar, OlusturanKullanici) VALUES (?, ?, ?, ?, ?)",
+                       (veri.AracID, veri.Tarih, veri.Aciklama, veri.Tutar, user["username"]))
+        log_islem(cursor, f"Araç #{veri.AracID} için bakım kaydı eklendi.", user["username"])
+        conn.commit()
+        return {"mesaj": "Bakım kaydı eklendi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.get("/arac-bakim/{arac_id}")
+def arac_bakim_listesi(arac_id: int, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT BakimID, Tarih, Aciklama, Tutar FROM AracBakimGecmisi WHERE AracID=? ORDER BY Tarih DESC", (arac_id,))
+        return {"Bakimlar": [{"BakimID": r[0], "Tarih": str(r[1]), "Aciklama": r[2], "Tutar": float(r[3])} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -11666,6 +12492,72 @@ def disa_aktar_fatura(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe
 
 
 # --- AKILLI BİLDİRİMLER ---------------------------------------------
+class YasalTakvimEkle(BaseModel):
+    BeyanTuru: str
+    SonTarih: str
+    Aciklama: Optional[str] = None
+
+@app.post("/yasal-takvim")
+def yasal_takvim_ekle(veri: YasalTakvimEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO YasalTakvimKayitlari (BeyanTuru, SonTarih, Aciklama, OlusturanKullanici) VALUES (?, ?, ?, ?)",
+                       (veri.BeyanTuru, veri.SonTarih, veri.Aciklama, user["username"]))
+        log_islem(cursor, f"Yasal takvim kaydı eklendi: {veri.BeyanTuru} - {veri.SonTarih}", user["username"])
+        conn.commit()
+        return {"mesaj": "Yasal takvim kaydı eklendi."}
+    finally:
+        conn.close()
+
+@app.get("/yasal-takvim")
+def yasal_takvim_listesi(durum: Optional[str] = None, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sorgu = "SELECT KayitID, BeyanTuru, SonTarih, Durum, Aciklama, TamamlanmaTarihi FROM YasalTakvimKayitlari WHERE 1=1"
+        parametreler = []
+        if durum:
+            sorgu += " AND Durum=?"
+            parametreler.append(durum)
+        sorgu += " ORDER BY SonTarih"
+        cursor.execute(sorgu, parametreler)
+        return {"Kayitlar": [{"KayitID": r[0], "BeyanTuru": r[1], "SonTarih": str(r[2]), "Durum": r[3],
+                               "Aciklama": r[4] or "", "TamamlanmaTarihi": str(r[5])[:16] if r[5] else None} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.put("/yasal-takvim-tamamla/{kayit_id}")
+def yasal_takvim_tamamla(kayit_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE YasalTakvimKayitlari SET Durum='Tamamlandı', TamamlanmaTarihi=GETDATE() WHERE KayitID=?", (kayit_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Kayıt bulunamadı.")
+        log_islem(cursor, f"Yasal takvim kaydı tamamlandı: #{kayit_id}", user["username"])
+        conn.commit()
+        return {"mesaj": "Tamamlandı olarak işaretlendi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.delete("/yasal-takvim/{kayit_id}")
+def yasal_takvim_sil(kayit_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM YasalTakvimKayitlari WHERE KayitID=?", (kayit_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Kayıt bulunamadı.")
+        conn.commit()
+        return {"mesaj": "Kayıt silindi."}
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
 @app.get("/bildirimler")
 def bildirimler_getir(user: dict = Depends(get_current_user)):
     """Girişte/dashboard'da gösterilecek uyarıları tek çağrıda toplar:
@@ -11708,11 +12600,38 @@ def bildirimler_getir(user: dict = Depends(get_current_user)):
         except Exception:
             pass
 
+        yaklasan_arac_belgesi = []
+        try:
+            cursor.execute("""
+                SELECT Plaka, 'Muayene' AS Tur, MuayeneTarihi AS Tarih FROM Araclar
+                WHERE MuayeneTarihi IS NOT NULL AND MuayeneTarihi <= DATEADD(day, 30, CAST(GETDATE() AS DATE))
+                UNION ALL
+                SELECT Plaka, 'Sigorta', SigortaBitisTarihi FROM Araclar
+                WHERE SigortaBitisTarihi IS NOT NULL AND SigortaBitisTarihi <= DATEADD(day, 30, CAST(GETDATE() AS DATE))
+                ORDER BY Tarih
+            """)
+            yaklasan_arac_belgesi = [{"Plaka": r[0], "Tur": r[1], "Tarih": str(r[2])} for r in cursor.fetchall()]
+        except Exception:
+            pass
+
+        yaklasan_yasal_takvim = []
+        try:
+            cursor.execute("""
+                SELECT BeyanTuru, SonTarih FROM YasalTakvimKayitlari
+                WHERE Durum='Bekliyor' AND SonTarih <= DATEADD(day, 7, CAST(GETDATE() AS DATE))
+                ORDER BY SonTarih
+            """)
+            yaklasan_yasal_takvim = [{"BeyanTuru": r[0], "SonTarih": str(r[1])} for r in cursor.fetchall()]
+        except Exception:
+            pass
+
         return {
             "kritik_stok": kritik_stok,
             "yaklasan_evrak": yaklasan_evrak,
             "gecikmis_cari": gecikmis_cari,
-            "toplam": len(kritik_stok) + len(yaklasan_evrak) + len(gecikmis_cari),
+            "yaklasan_arac_belgesi": yaklasan_arac_belgesi,
+            "yaklasan_yasal_takvim": yaklasan_yasal_takvim,
+            "toplam": len(kritik_stok) + len(yaklasan_evrak) + len(gecikmis_cari) + len(yaklasan_arac_belgesi) + len(yaklasan_yasal_takvim),
         }
     finally:
         conn.close()

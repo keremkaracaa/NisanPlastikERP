@@ -1577,6 +1577,240 @@ class TestKaliteToplanti:
         assert yanit.status_code in (401, 403)
 
 
+class TestIrsaliyeKesKalemli:
+    """İrsaliye kesme - Kalemler opsiyonel alanı, e-İrsaliye üretebilmek için
+    IrsaliyeKalemleri tablosuna satır ekliyor. Boş bırakılırsa eski davranış
+    (kalemsiz irsaliye) aynen çalışmaya devam etmeli."""
+
+    def test_kalemli_irsaliye_kalem_satirlari_eklenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(5,), fetchall_sonucu=[])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/irsaliye-kes", json={
+            "MusteriID": 1, "Plaka": "34 ABC 123", "Sofor": "Ahmet", "Aciklama": "Sevk",
+            "Kalemler": [{"StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 10}]})
+        assert yanit.status_code == 200
+        kalem_insert = [c for c in cursor.execute.call_args_list if "INSERT INTO IrsaliyeKalemleri" in c.args[0]]
+        assert len(kalem_insert) == 1
+
+    def test_kalemsiz_irsaliye_eski_davranis_bozulmaz(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(5,), fetchall_sonucu=[])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/irsaliye-kes", json={"MusteriID": 1, "Plaka": "34 ABC 123", "Sofor": "Ahmet", "Aciklama": "Sevk"})
+        assert yanit.status_code == 200
+
+
+class TestEIrsaliyeOlusturEndpoint:
+    def test_eirsaliye_olustur_basarili(self, client, monkeypatch, tmp_path):
+        irsaliye_satiri = (1, "2026-09-01", "Test Firma", "Test Adres", "1234567890", "VKN", "İstanbul", "Kadıköy")
+        kalemler = [("PP-001", "Test Ürünü", 10.0)]
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=irsaliye_satiri)
+        cursor.fetchone.side_effect = [irsaliye_satiri, None]
+        cursor.fetchall.return_value = kalemler
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.chdir(tmp_path)
+
+        yanit = client.post("/irsaliye/1/eirsaliye-olustur")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["EIrsaliyeNo"].startswith("NIS")
+        assert os.path.exists(veri["EIrsaliyeXmlYolu"])
+
+    def test_kalemsiz_irsaliyede_400_doner(self, client, monkeypatch):
+        irsaliye_satiri = (1, "2026-09-01", "Test Firma", "Test Adres", "1234567890", "VKN", "İstanbul", "Kadıköy")
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=irsaliye_satiri, fetchall_sonucu=[])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/irsaliye/1/eirsaliye-olustur")
+        assert yanit.status_code == 400
+
+    def test_irsaliye_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/irsaliye/999/eirsaliye-olustur")
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/irsaliye/1/eirsaliye-olustur")
+        assert yanit.status_code in (401, 403)
+
+
+class TestEIrsaliyeGonderEndpoint:
+    def test_onceden_olusturulmamissa_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("TASLAK", None))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/irsaliye/1/eirsaliye-gonder")
+        assert yanit.status_code == 400
+
+    def test_entegrator_hatasi_soft_fail_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("OLUSTURULDU", "Irsaliyeler/EIrsaliye/NIS1.xml"))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "eirsaliye_ayarlarini_getir", lambda: {"url": "https://x", "kullanici_adi": "u", "api_key": "k", "seri_kodu": "NIS"})
+        monkeypatch.setattr(main, "efatura_entegrator_gonder", lambda xml_yolu, ayarlar: {"basarili": False, "hata": "Zaman aşımı"})
+
+        yanit = client.post("/irsaliye/1/eirsaliye-gonder")
+        assert yanit.status_code == 200
+        assert yanit.json()["EIrsaliyeDurum"] == "HATA"
+
+    def test_basarili_gonderim(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("OLUSTURULDU", "Irsaliyeler/EIrsaliye/NIS1.xml"))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "eirsaliye_ayarlarini_getir", lambda: {"url": "https://x", "kullanici_adi": "u", "api_key": "k", "seri_kodu": "NIS"})
+        monkeypatch.setattr(main, "efatura_entegrator_gonder", lambda xml_yolu, ayarlar: {"basarili": True})
+
+        yanit = client.post("/irsaliye/1/eirsaliye-gonder")
+        assert yanit.status_code == 200
+        assert yanit.json()["EIrsaliyeDurum"] == "GONDERILDI"
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/irsaliye/1/eirsaliye-gonder")
+        assert yanit.status_code in (401, 403)
+
+
+class TestEIrsaliyeOtomatikTetikle:
+    """_eirsaliye_otomatik_tetikle - _efatura_otomatik_tetikle testleriyle aynı desen."""
+
+    def test_ayar_kapaliyken_hicbir_sey_yapmaz(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[("EIrsaliyeOtomatikOlustur", "0")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        cagrildi = []
+        monkeypatch.setattr(main, "_eirsaliye_xml_olustur_ic", lambda *a, **k: cagrildi.append(1))
+
+        main._eirsaliye_otomatik_tetikle(1)
+        assert cagrildi == []
+
+    def test_hata_olsa_bile_exception_disari_sizmaz(self, monkeypatch):
+        monkeypatch.setattr(main, "get_db_connection", lambda: (_ for _ in ()).throw(Exception("DB çöktü")))
+        main._eirsaliye_otomatik_tetikle(1)
+
+
+class TestMusteriSikayet:
+    """Müşteri Şikayet/Talep Yönetimi - Kalite Kontrol'deki NCR aç/kapa desenini
+    taklit eder."""
+
+    def test_sikayet_musteri_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/musteri-sikayet", json={"MusteriID": 999, "Konu": "Test"})
+        assert yanit.status_code == 404
+
+    def test_sikayet_ekleme_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/musteri-sikayet", json={"MusteriID": 1, "Konu": "Geç Teslimat", "Oncelik": "Yüksek"})
+        assert yanit.status_code == 200
+
+    def test_sikayet_listesi_dogru_alanlari_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (1, 1, "ABC Plastik", "Geç Teslimat", "Sipariş 3 gün geç geldi", "Yüksek", "Açık", None, "master", "2026-09-01 10:00", None)
+        ])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/musteri-sikayet")
+        assert yanit.status_code == 200
+        sikayet = yanit.json()["Sikayetler"][0]
+        assert sikayet["Konu"] == "Geç Teslimat"
+        assert sikayet["Durum"] == "Açık"
+
+    def test_sikayet_kapatma_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/musteri-sikayet-kapat/999", json={"Cozum": "Çözüldü"})
+        assert yanit.status_code == 404
+
+    def test_sikayet_kapatma_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 1
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/musteri-sikayet-kapat/1", json={"Cozum": "Müşteriye telafi gönderildi."})
+        assert yanit.status_code == 200
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/musteri-sikayet")
+        assert yanit.status_code in (401, 403)
+
+
+class TestAlanBazliYetkilendirme:
+    """'Kullanıcı sadece kendi kayıtlarını görsün' filtresi - Yönetici/Master her
+    zaman muaf, sadece SatisFirsatlari/Aktiviteler'e uygulanır (bkz. plan)."""
+
+    def test_yonetici_bayrak_acik_olsa_bile_tum_kayitlari_gorur(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (1, "ABC Plastik", "Fırsat A", 1000.0, "Teklif", None, None, 1)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/firsat-listesi")
+        assert yanit.status_code == 200
+        assert len(yanit.json()["firsatlar"]) == 1
+        assert "WHERE" not in cursor.execute.call_args_list[-1].args[0]
+
+    def test_bayrak_acik_satis_rolu_sadece_kendi_kayitlarini_gorur(self, client, monkeypatch):
+        satis_kullanicisi = {"username": "satis1", "rol": "Satış"}
+        main.app.dependency_overrides[main.get_current_user] = lambda: satis_kullanicisi
+        try:
+            conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+            cursor.fetchone.return_value = (1,)  # SadeceKendiKayitlariGorsun=1
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+            yanit = client.get("/firsat-listesi")
+            assert yanit.status_code == 200
+            son_sorgu = cursor.execute.call_args_list[-1].args[0]
+            assert "WHERE f.KullaniciAdi=?" in son_sorgu
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_bayrak_kapaliysa_filtre_uygulanmaz(self, client, monkeypatch):
+        satis_kullanicisi = {"username": "satis1", "rol": "Satış"}
+        main.app.dependency_overrides[main.get_current_user] = lambda: satis_kullanicisi
+        try:
+            conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+            cursor.fetchone.return_value = (0,)  # SadeceKendiKayitlariGorsun=0
+            monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+            yanit = client.get("/aktivite-listesi")
+            assert yanit.status_code == 200
+            son_sorgu = cursor.execute.call_args_list[-1].args[0]
+            assert "WHERE" not in son_sorgu
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_kullanici_yetki_guncelle_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/kullanici-yetki-guncelle/999", json={"SadeceKendiKayitlariGorsun": True})
+        assert yanit.status_code == 404
+
+    def test_kullanici_yetki_guncelle_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 1
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/kullanici-yetki-guncelle/1", json={"SadeceKendiKayitlariGorsun": True})
+        assert yanit.status_code == 200
+
+    def test_yetkisiz_rolde_kullanici_yetki_guncelle_403_doner(self):
+        satis_client = TestClient(main.app)
+        satis_client.app.dependency_overrides[main.get_current_user] = lambda: {"username": "satis1", "rol": "Satış"}
+        try:
+            yanit = satis_client.put("/kullanici-yetki-guncelle/1", json={"SadeceKendiKayitlariGorsun": True})
+            assert yanit.status_code == 403
+        finally:
+            satis_client.app.dependency_overrides.clear()
+
+
 class TestMusteri360:
     """Müşteri 360° önceden hiç yoktu - ciro, açık bakiye, sipariş geçmişi ve
     zamanında teslimat oranı gibi bilgiler ayrı ayrı ekranlara dağılmıştı, tek
@@ -1628,6 +1862,156 @@ class TestMusteri360:
     def test_yetkisiz_istekte_401_doner(self):
         yetkisiz_client = TestClient(main.app)
         yanit = yetkisiz_client.get("/musteri-360/1")
+        assert yanit.status_code in (401, 403)
+
+
+class TestMusteri360Pdf:
+    """Müşteri Görünümü - Müşteri 360 verisini müşteriyle paylaşılabilir bir
+    özet PDF'e döken uç, _musteri_360_veri_getir ortak fonksiyonunu kullanır."""
+
+    def test_musteri_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/musteri-360-pdf/999")
+        assert yanit.status_code == 404
+
+    def test_pdf_basariyla_uretilir(self, client, monkeypatch, tmp_path):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        cursor.fetchone.side_effect = [
+            ("ABC Plastik", "Ahmet", "0555", "abc@example.com", 5000.0),
+            (10000.0, 4), (6000.0,), (3, 2500.0, "2026-08-20"), (2, 0), (150.0,),
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.chdir(tmp_path)
+
+        yanit = client.get("/musteri-360-pdf/1")
+        assert yanit.status_code == 200
+        assert yanit.headers["content-type"] == "application/pdf"
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/musteri-360-pdf/1")
+        assert yanit.status_code in (401, 403)
+
+
+class TestAracFilo:
+    """Araç/Filo Yönetimi - araç master kaydı + bakım geçmişi."""
+
+    def test_arac_ekleme_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/arac", json={"Plaka": "34 abc 123", "Marka": "Ford"})
+        assert yanit.status_code == 200
+
+    def test_arac_listesi_dogru_alanlari_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (1, "34ABC123", "Ford", "Transit", "2026-12-01", "2026-11-01", "Aktif", None)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/arac")
+        assert yanit.status_code == 200
+        arac = yanit.json()["Araclar"][0]
+        assert arac["Plaka"] == "34ABC123"
+
+    def test_arac_guncelleme_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/arac", json={"AracID": 999, "Plaka": "34ABC123"})
+        assert yanit.status_code == 404
+
+    def test_arac_bakim_ekleme_arac_yoksa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/arac-bakim", json={"AracID": 999, "Tarih": "2026-09-07", "Aciklama": "Yağ değişimi"})
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/arac")
+        assert yanit.status_code in (401, 403)
+
+
+class TestNumuneSiparis:
+    """Numune/Deneme Siparişi Takibi - normal sipariş akışından ayrı, dönüşüm
+    izleme (Gönderildi -> Değerlendiriliyor -> Siparişe Dönüştü/Reddedildi)."""
+
+    def test_musteri_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/numune-siparis", json={"MusteriID": 999, "StokAdi": "Test Ürünü", "Miktar": 5})
+        assert yanit.status_code == 404
+
+    def test_ekleme_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(1,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/numune-siparis", json={"MusteriID": 1, "StokAdi": "Test Ürünü", "Miktar": 5})
+        assert yanit.status_code == 200
+
+    def test_listeleme_dogru_alanlari_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[
+            (1, 1, "ABC Plastik", "PP-001", "Test Ürünü", 5.0, "2026-09-01", "Gönderildi", None, None, "master")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/numune-siparis")
+        assert yanit.status_code == 200
+        n = yanit.json()["Numuneler"][0]
+        assert n["Durum"] == "Gönderildi"
+
+    def test_gecersiz_durum_400_doner(self, client):
+        yanit = client.put("/numune-siparis-sonuclandir/1", json={"Durum": "Uydurma Durum"})
+        assert yanit.status_code == 400
+
+    def test_sonuclandirma_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/numune-siparis-sonuclandir/999", json={"Durum": "Siparişe Dönüştü", "SonucSiparisID": 5})
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/numune-siparis")
+        assert yanit.status_code in (401, 403)
+
+
+class TestYasalTakvim:
+    """Vergi/SGK Bildirim Takvimi - manuel kayıt + yaklaşan tarih uyarısı
+    (bildirimler endpoint'ine entegre, ayrıca test edilmiyor burada)."""
+
+    def test_ekleme_basarili(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/yasal-takvim", json={"BeyanTuru": "KDV", "SonTarih": "2026-10-26"})
+        assert yanit.status_code == 200
+
+    def test_listeleme_dogru_alanlari_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[(1, "KDV", "2026-10-26", "Bekliyor", None, None)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/yasal-takvim")
+        assert yanit.status_code == 200
+        assert yanit.json()["Kayitlar"][0]["BeyanTuru"] == "KDV"
+
+    def test_tamamlama_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.rowcount = 0
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/yasal-takvim-tamamla/999")
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/yasal-takvim")
         assert yanit.status_code in (401, 403)
 
 
