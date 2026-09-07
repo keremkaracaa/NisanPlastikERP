@@ -702,7 +702,7 @@ class FaturaMerkezi(ctk.CTkFrame):
             "musteri_id": getattr(self, "secili_musteri_id", None),
             "siparis_id": getattr(self, "secili_siparis_id", None),
             "belge_no": self.belge_no.get().strip() if hasattr(self, 'belge_no') else "",
-            "tarih": self.tarih.get().strip() if hasattr(self, 'tarih') else datetime.datetime.now().strftime("%d.%m.%Y"),
+            "tarih": self.tarih.get().strip() if hasattr(self, 'tarih') else datetime.now().strftime("%d.%m.%Y"),
             "kalemler": kalemler,
             "depo_id": secili_depo_id
         }
