@@ -1672,6 +1672,65 @@ class TestKurFarkiOtomatikGuncelKur:
         assert yanit.status_code in (401, 403)
 
 
+class TestAmortismanHesaplama:
+    """Sabit Kıymet Amortismanı önceden hiç yoktu - Demirbaşlar için doğrusal
+    (straight-line) amortisman gideri artık her ay otomatik hesaplanıp
+    Yevmiye'ye (770 Gider / 257 Birikmiş Amortisman) işleniyor."""
+
+    def test_aylik_gider_dogru_hesaplanir(self, monkeypatch):
+        # AlisTutari=12000, FaydaliOmurYil=5 -> aylik = 12000/(5*12) = 200
+        conn, cursor = sahte_cursor_olustur(
+            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 0.0, None)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        main.amortisman_hesapla_ve_isle()
+        guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Demirbaslar SET BirikmisAmortisman" in c.args[0]]
+        assert len(guncelleme) == 1
+        assert guncelleme[0].args[1][0] == 200.0
+
+    def test_tam_amorti_olunca_fazla_yazilmaz(self, monkeypatch):
+        # BirikmisAmortisman zaten 11900, aylik 200 olsa bile sadece kalan 100 yazilmali
+        conn, cursor = sahte_cursor_olustur(
+            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 11900.0, None)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        main.amortisman_hesapla_ve_isle()
+        guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Demirbaslar SET BirikmisAmortisman" in c.args[0]]
+        assert guncelleme[0].args[1][0] == 12000.0  # 11900 + 100 (kalan)
+
+    def test_ayni_ay_icinde_tekrar_islenmez(self, monkeypatch):
+        simdi = main.datetime.datetime.now()
+        conn, cursor = sahte_cursor_olustur(
+            fetchall_sonucu=[(1, "Test Makinesi", 12000.0, 5, 200.0, simdi)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        main.amortisman_hesapla_ve_isle()
+        guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Demirbaslar SET BirikmisAmortisman" in c.args[0]]
+        assert len(guncelleme) == 0
+
+    def test_faydali_omur_bossa_sorguda_hic_gelmez(self, monkeypatch):
+        # SQL WHERE zaten FaydaliOmurYil IS NOT NULL filtresi yapıyor - burada
+        # boş liste dönmesi durumunda hiçbir işlem yapılmadığını doğruluyoruz.
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        main.amortisman_hesapla_ve_isle()
+        guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Demirbaslar SET BirikmisAmortisman" in c.args[0]]
+        assert len(guncelleme) == 0
+
+    def test_manuel_tetikleme_ucu_calisir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/amortisman-hesapla-simdi")
+        assert yanit.status_code == 200
+
+    def test_manuel_tetikleme_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.post("/amortisman-hesapla-simdi")
+        assert yanit.status_code in (401, 403)
+
+
 class TestButceYonetimi:
     """Bütçe Yönetimi önceden hiç yoktu - Hesap Planı bazlı aylık hedef/gerçekleşen
     karşılaştırma için sıfırdan eklendi. Gerçekleşen, HesapHareketleri'nden hesaplanır;

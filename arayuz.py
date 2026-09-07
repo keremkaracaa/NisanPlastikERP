@@ -2951,12 +2951,20 @@ class MainApp(ctk.CTkToplevel):
         
         ctk.CTkLabel(frame, text="📋 Kayıtlı Demirbaşlar ve Sabit Kıymetler", font=("Arial", 18, "bold"), text_color="#0bc9cd").pack(pady=15, anchor="w", padx=20)
 
+        buton_satiri_db = ctk.CTkFrame(frame, fg_color="transparent")
+        buton_satiri_db.pack(anchor="w", padx=20, pady=(0, 10))
         ctk.CTkButton(
-            frame, text="🔄 Listeyi Yenile", 
-            fg_color="#0bc9cd", hover_color="#08a0a4", text_color="black", 
+            buton_satiri_db, text="🔄 Listeyi Yenile",
+            fg_color="#0bc9cd", hover_color="#08a0a4", text_color="black",
             font=("Arial", 11, "bold"), width=120, height=30,
             command=self.demirbaslari_tabloya_yukle
-        ).pack(anchor="w", padx=20, pady=(0, 10))
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            buton_satiri_db, text="📉 Amortismanı Şimdi Hesapla",
+            fg_color="#f97316", hover_color="#c2410c", text_color="white",
+            font=("Arial", 11, "bold"), height=30,
+            command=self.amortisman_hesapla_simdi_islem
+        ).pack(side="left")
 
         self.demirbas_liste_frame = ctk.CTkScrollableFrame(frame, fg_color=RENK_KART, corner_radius=12, border_width=1, border_color=RENK_IKINCIL)
         self.demirbas_liste_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -4345,7 +4353,7 @@ class MainApp(ctk.CTkToplevel):
         for widget in self.demirbas_liste_frame.winfo_children():
             widget.destroy()
 
-        basliklar = ["Demirbaş Adı", "Kategori", "Alış Tutarı", "Seri No", "Açıklama"]
+        basliklar = ["Demirbaş Adı", "Kategori", "Alış Tutarı", "Seri No", "Açıklama", "Faydalı Ömür", "Birikmiş Amortisman", "Net Değer"]
         for col_idx, baslik in enumerate(basliklar):
             lbl = ctk.CTkLabel(self.demirbas_liste_frame, text=baslik, font=("Arial", 12, "bold"), text_color="#0bc9cd")
             lbl.grid(row=0, column=col_idx, padx=15, pady=10, sticky="w")
@@ -4355,22 +4363,36 @@ class MainApp(ctk.CTkToplevel):
             if res.status_code == 200:
                 demirbaslar = res.json()
                 if not demirbaslar:
-                    ctk.CTkLabel(self.demirbas_liste_frame, text="Henüz kayıtlı demirbaş bulunamadı.", text_color=RENK_METIN_SOLUK).grid(row=1, column=0, columnspan=5, pady=20)
+                    ctk.CTkLabel(self.demirbas_liste_frame, text="Henüz kayıtlı demirbaş bulunamadı.", text_color=RENK_METIN_SOLUK).grid(row=1, column=0, columnspan=8, pady=20)
                 else:
                     for row_idx, item in enumerate(demirbaslar, start=1):
                         ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("DemirbasAdi", ""), font=("Arial", 11), text_color="white").grid(row=row_idx, column=0, padx=15, pady=8, sticky="w")
                         ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("Kategori", ""), font=("Arial", 11), text_color="white").grid(row=row_idx, column=1, padx=15, pady=8, sticky="w")
-                        
+
                         tutar = item.get("AlisTutari", 0)
                         tutar_str = f"{tutar:,.2f} TL" if isinstance(tutar, (int, float)) else f"{tutar} TL"
                         ctk.CTkLabel(self.demirbas_liste_frame, text=tutar_str, font=("Arial", 11), text_color="white").grid(row=row_idx, column=2, padx=15, pady=8, sticky="w")
-                        
+
                         ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("SeriNo", "-"), font=("Arial", 11), text_color="white").grid(row=row_idx, column=3, padx=15, pady=8, sticky="w")
                         ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("Aciklama", "-"), font=("Arial", 11), text_color="white").grid(row=row_idx, column=4, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=str(item.get("FaydaliOmurYil") or "-"), font=("Arial", 11), text_color="white").grid(row=row_idx, column=5, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=f"{item.get('BirikmisAmortisman', 0):,.2f} TL", font=("Arial", 11), text_color="white").grid(row=row_idx, column=6, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=f"{item.get('NetDeger', 0):,.2f} TL", font=("Arial", 11, "bold"), text_color="#22c55e").grid(row=row_idx, column=7, padx=15, pady=8, sticky="w")
             else:
                 self.api_hata_goster(res)
         except Exception as e:
             messagebox.showerror("Hata", f"Bağlantı hatası: {str(e)}")
+
+    def amortisman_hesapla_simdi_islem(self):
+        try:
+            res = requests.post(f"{API}/amortisman-hesapla-simdi", headers=self.req_headers(), timeout=20)
+            if res.status_code == 200:
+                messagebox.showinfo("Başarılı", "Amortisman hesaplaması çalıştırıldı.")
+                self.demirbaslari_tabloya_yukle()
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
     def musteri_secim_penceresi(self, hedef_id_entry, hedef_unvan_entry=None):
         top = ctk.CTkToplevel(self)
         top.title("Müşteri Seç")
@@ -5846,7 +5868,11 @@ class MainApp(ctk.CTkToplevel):
 
         ctk.CTkLabel(kart, text="Açıklama", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         ack_entry = ctk.CTkEntry(kart, placeholder_text="Örn: Üretim hattı 2 için alındı", width=320, height=35)
-        ack_entry.pack(padx=20, pady=(0, 20))
+        ack_entry.pack(padx=20, pady=(0, 10))
+
+        ctk.CTkLabel(kart, text="Faydalı Ömür (Yıl, opsiyonel - amortisman için)", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        omur_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 5", width=320, height=35)
+        omur_entry.pack(padx=20, pady=(0, 20))
 
         # Butonu önce oluşturuyoruz
         kaydet_btn = ctk.CTkButton(
@@ -5859,12 +5885,14 @@ class MainApp(ctk.CTkToplevel):
         def demirbas_kaydet():
             kaydet_btn.configure(state="disabled")
             try:
+                omur_metni = omur_entry.get().strip()
                 data = {
                     "DemirbasAdi": ad_entry.get().strip(),
                     "Kategori": kat_entry.get().strip() or "Genel",
                     "AlisTutari": float(tutar_entry.get().replace(",", ".")),
                     "SeriNo": seri_entry.get().strip(),
-                    "Aciklama": ack_entry.get().strip()
+                    "Aciklama": ack_entry.get().strip(),
+                    "FaydaliOmurYil": int(omur_metni) if omur_metni else None
                 }
                 
                 if not data["DemirbasAdi"]:

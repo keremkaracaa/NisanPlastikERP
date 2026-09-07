@@ -2615,6 +2615,15 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _amortisman_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Amortisman migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -3026,6 +3035,17 @@ def _butce_migrationlari(cursor):
         )
     """, "ButceHedefleri tablosu")
 
+def _amortisman_migrationlari(cursor):
+    """Sabit Kıymet Amortismanı için Demirbaslar'a alan eklemesi - diğer yeni özellik
+    migration'ları gibi kendi başına, izole çağrılır."""
+    guvenli_sutun_ekle(cursor, "Demirbaslar", "FaydaliOmurYil", "INT NULL")
+    guvenli_sutun_ekle(cursor, "Demirbaslar", "BirikmisAmortisman", "FLOAT NOT NULL DEFAULT 0")
+    guvenli_sutun_ekle(cursor, "Demirbaslar", "SonAmortismanTarihi", "DATE NULL")
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT 1 FROM HesapPlani WHERE HesapKodu='257')
+        INSERT INTO HesapPlani (HesapKodu, HesapAdi, Bakiye) VALUES ('257', 'Birikmiş Amortismanlar', 0)
+    """, "257 Birikmiş Amortismanlar hesabı")
+
 def butce_gerceklesen_hesapla(cursor, hesap_kodu: str, yil: int, ay: int) -> float:
     """Bir hesap kodunun belirli bir ay içindeki gerçekleşen tutarını HesapHareketleri'nden
     hesaplar. Gelir hesapları (6 ile başlayanlar, /kar-zarar-tablosu'ndaki (main.py ~3362)
@@ -3185,6 +3205,7 @@ class DemirbasRequest(BaseModel):
     SeriNo: Optional[str] = ""
     Durumu: Optional[str] = "Aktif"
     Aciklama: Optional[str] = ""
+    FaydaliOmurYil: Optional[int] = None
 @app.post("/demirbas-ekle")
 def demirbas_ekle(req: DemirbasRequest, current_user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
     if req.AlisTutari < 0:
@@ -3196,15 +3217,15 @@ def demirbas_ekle(req: DemirbasRequest, current_user: dict = Depends(yetki_kontr
         tarih_str = req.AlisTarihi or datetime.datetime.now().strftime("%Y-%m-%d")
         
         cursor.execute("""
-            INSERT INTO Demirbaslar (DemirbasAdi, Kategori, AlisTarihi, AlisTutari, SeriNo, Durumu, Aciklama)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (req.DemirbasAdi, req.Kategori, tarih_str, req.AlisTutari, req.SeriNo, req.Durumu, req.Aciklama))
+            INSERT INTO Demirbaslar (DemirbasAdi, Kategori, AlisTarihi, AlisTutari, SeriNo, Durumu, Aciklama, FaydaliOmurYil)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (req.DemirbasAdi, req.Kategori, tarih_str, req.AlisTutari, req.SeriNo, req.Durumu, req.Aciklama, req.FaydaliOmurYil))
         
         k_adi = current_user.get("sub", "admin") if isinstance(current_user, dict) else str(current_user)
         cursor.execute("""
             INSERT INTO IslemLoglari (KullaniciAdi, IslemTuru, Aciklama, Tarih)
             VALUES (?, 'Demirbaş Ekleme', ?, ?)
-        """, (k_adi, f"Yeni demirbaş eklendi: {req.DemirbasAdi} ({req.AlisTutari} TL)", datetime.utcnow()))
+        """, (k_adi, f"Yeni demirbaş eklendi: {req.DemirbasAdi} ({req.AlisTutari} TL)", datetime.datetime.utcnow()))
 
         conn.commit()
         return {"mesaj": "Demirbaş başarıyla kaydedildi."}
@@ -3327,19 +3348,26 @@ def demirbaslari_getir(current_user: str = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT * FROM Demirbaslar")
+        cursor.execute("""SELECT DemirbasID, DemirbasAdi, Kategori, AlisTarihi, AlisTutari, SeriNo, Durumu, Aciklama,
+                           FaydaliOmurYil, ISNULL(BirikmisAmortisman,0)
+                           FROM Demirbaslar""")
         rows = cursor.fetchall()
         sonuc = []
-        for r in rows:
+        for demirbas_id, ad, kategori, alis_tarihi, alis_tutari, seri_no, durumu, aciklama, faydali_omur, birikmis in rows:
+            alis_tutari = float(alis_tutari) if alis_tutari else 0.0
+            birikmis = float(birikmis) if birikmis else 0.0
             sonuc.append({
-                "ID": r[0],
-                "DemirbasAdi": r[1] if len(r) > 1 else "",
-                "Kategori": r[2] if len(r) > 2 else "",
-                "AlisTarihi": str(r[3]) if len(r) > 3 and r[3] else None,
-                "AlisTutari": float(r[4]) if len(r) > 4 and r[4] else 0.0,
-                "SeriNo": r[5] if len(r) > 5 else "-",
-                "Durumu": r[6] if len(r) > 6 else "-",
-                "Aciklama": r[7] if len(r) > 7 else "-"
+                "ID": demirbas_id,
+                "DemirbasAdi": ad or "",
+                "Kategori": kategori or "",
+                "AlisTarihi": str(alis_tarihi) if alis_tarihi else None,
+                "AlisTutari": alis_tutari,
+                "SeriNo": seri_no or "-",
+                "Durumu": durumu or "-",
+                "Aciklama": aciklama or "-",
+                "FaydaliOmurYil": faydali_omur,
+                "BirikmisAmortisman": birikmis,
+                "NetDeger": alis_tutari - birikmis,
             })
         return sonuc
     except Exception as e:
@@ -4670,6 +4698,48 @@ def otomatik_veritabani_yedekle():
 # tanımlanmış olduğu için scheduler'a burada, dosyanın en başında değil, kaydediliyor
 # - alarm_kurallarini_kontrol_et ile aynı desen).
 scheduler.add_job(otomatik_veritabani_yedekle, 'cron', hour=2, minute=0)
+
+def amortisman_hesapla_ve_isle():
+    """Her ay aktif demirbaşlar için doğrusal (straight-line) amortisman gideri
+    hesaplar ve Yevmiye'ye işler (770 Gider / 257 Birikmiş Amortisman). FaydaliOmurYil
+    girilmemiş demirbaşlar atlanır - amortisman süresi bilinmeden hesaplama yapılamaz."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT DemirbasID, DemirbasAdi, AlisTutari, FaydaliOmurYil, ISNULL(BirikmisAmortisman,0), SonAmortismanTarihi
+                           FROM Demirbaslar WHERE Durumu='Aktif' AND FaydaliOmurYil IS NOT NULL AND FaydaliOmurYil > 0""")
+        demirbaslar = cursor.fetchall()
+        simdi = datetime.datetime.now()
+        for demirbas_id, ad, alis_tutari, omur_yil, birikmis, son_tarih in demirbaslar:
+            if son_tarih and son_tarih.year == simdi.year and son_tarih.month == simdi.month:
+                continue  # bu ay zaten işlendi
+            alis_tutari = float(alis_tutari or 0)
+            birikmis = float(birikmis or 0)
+            aylik_gider = alis_tutari / (int(omur_yil) * 12)
+            if birikmis + aylik_gider > alis_tutari:
+                aylik_gider = alis_tutari - birikmis  # tam amorti olunca fazlasını yazma
+            if aylik_gider <= 0:
+                continue
+            yeni_birikmis = birikmis + aylik_gider
+            cursor.execute("UPDATE Demirbaslar SET BirikmisAmortisman=?, SonAmortismanTarihi=GETDATE() WHERE DemirbasID=?",
+                           (yeni_birikmis, demirbas_id))
+            yevmiye_fisi_olustur(cursor, f"Amortisman Gideri: {ad} ({simdi.month}/{simdi.year})", "Amortisman", demirbas_id, [
+                ("770", aylik_gider, 0, f"{ad} amortisman gideri"),
+                ("257", 0, aylik_gider, f"{ad} birikmiş amortisman"),
+            ], "Sistem")
+        conn.commit()
+        print(f">>> Amortisman hesaplaması tamamlandı ({len(demirbaslar)} demirbaş kontrol edildi).")
+    except Exception as e:
+        print(f">>> Amortisman hesaplama hatası: {e}")
+    finally:
+        conn.close()
+
+scheduler.add_job(amortisman_hesapla_ve_isle, 'cron', day=1, hour=3, minute=30)
+
+@app.post("/amortisman-hesapla-simdi")
+def amortisman_hesapla_simdi(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    amortisman_hesapla_ve_isle()
+    return {"mesaj": "Amortisman hesaplaması çalıştırıldı."}
 
 @app.get("/son-yedek-bilgisi")
 def son_yedek_bilgisi(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
