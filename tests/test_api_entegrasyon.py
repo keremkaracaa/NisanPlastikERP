@@ -1673,6 +1673,58 @@ class TestKurFarkiOtomatikGuncelKur:
         assert yanit.status_code in (401, 403)
 
 
+class TestFifoMaliyetRaporu:
+    """FIFO Maliyet Raporu önceden hiç yoktu - mevcut Ağırlıklı Ortalama maliyet
+    mantığına dokunmadan, salt-okunur bir karşılaştırma raporu olarak eklendi."""
+
+    def test_fifo_iki_katmanda_kismi_tuketim_dogru_hesaplanir(self, monkeypatch):
+        # Toplam cikis=120: ilk katman (100 birim @10) tamamen tuketilir (120-100=20
+        # kalan cikis ikinci katmana tasinir), ikinci katmandan (50 birim @12) 20
+        # birimi de tuketilip 30 birim kalir -> FIFO deger = 30*12 = 360
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(120.0,))
+        cursor.fetchall.return_value = [(100.0, 10.0), (50.0, 12.0)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        miktar, deger = main.fifo_stok_degeri_hesapla(cursor, "PP-001")
+        assert miktar == 30.0
+        assert deger == 360.0
+
+    def test_hic_cikis_olmayan_stokta_tum_katmanlar_sayilir(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(0.0,))
+        cursor.fetchall.return_value = [(100.0, 10.0), (50.0, 12.0)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        miktar, deger = main.fifo_stok_degeri_hesapla(cursor, "PP-001")
+        assert miktar == 150.0
+        assert deger == 100.0 * 10.0 + 50.0 * 12.0
+
+    def test_hic_giris_olmayan_stokta_sifir_doner(self, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(0.0,))
+        cursor.fetchall.return_value = []
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        miktar, deger = main.fifo_stok_degeri_hesapla(cursor, "PP-999")
+        assert miktar == 0.0
+        assert deger == 0.0
+
+    def test_rapor_fark_dogru_hesaplanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[("PP-001", "Polipropilen", 30.0, 11.0)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "fifo_stok_degeri_hesapla", lambda cursor, kod: (30.0, 240.0))
+
+        yanit = client.get("/fifo-maliyet-raporu")
+        assert yanit.status_code == 200
+        satir = yanit.json()["rapor"][0]
+        assert satir["OrtalamaMaliyetDegeri"] == 330.0  # 30*11
+        assert satir["FifoDegeri"] == 240.0
+        assert satir["Fark"] == -90.0
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/fifo-maliyet-raporu")
+        assert yanit.status_code in (401, 403)
+
+
 class TestBankaMutabakati:
     """Banka Mutabakatı önceden hiç yoktu - ekstre CSV içe aktarma, tutar+tarih
     bazlı otomatik eşleştirme önerisi ve manuel onaylama sıfırdan eklendi."""
