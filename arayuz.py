@@ -6913,6 +6913,11 @@ class MainApp(ctk.CTkToplevel):
                                          command=self.tema_degistir_ve_yenile)
         self.tema_buton.pack(side="right", padx=(6, 0), pady=11)
 
+        self.yardim_buton = ctk.CTkButton(top_menu_frame, text="❓", width=38, height=34, corner_radius=12,
+                                           fg_color=RENK_IKINCIL, hover_color=RENK_KENARLIK, font=("Arial", 15),
+                                           command=self.yardim_penceresi_ac)
+        self.yardim_buton.pack(side="right", padx=(6, 0), pady=11)
+
         self.search_box = ctk.CTkEntry(top_menu_frame, placeholder_text="🔍  Her yere git... (Örn: lot, fiyat listesi, sipariş, 1)",
                                         width=320, height=34, corner_radius=12, fg_color=RENK_TABAN, border_color=RENK_KENARLIK)
         self.search_box.pack(side="right", padx=(10, 0), pady=11)
@@ -7528,6 +7533,169 @@ class MainApp(ctk.CTkToplevel):
                    ("Veri Yönetimi", ["📤 Toplu İçe Aktarma"])],
         "PROJE YÖNETİMİ": [("Projeler", ["📁 Projeler", "✅ Proje Görevleri"])],
     }
+
+    # ❓ Yardım penceresinde gösterilen, her ekran için kısa açıklama - _MODUL_OZET_GRUPLARI
+    # ile AYNI ekran adlarını kullanır (yardim_penceresi_ac bu gruplamayı yeniden kullanır).
+    _YARDIM_ACIKLAMALARI = {
+        "🏠 Giriş": "Uygulamayı açtığında karşılayan ana ekran; modül kategorilerine hızlı erişim kartları ve günün özet bildirimlerini gösterir.",
+        "📊 Finans Özet": "Kişiselleştirilebilir KPI kartları (ciro, nakit, alacak vb.) ve grafiklerle genel durumu özetleyen ana gösterge paneli (dashboard).",
+        "📊 Dönem Karşılaştırma": "İki farklı tarih aralığının (örn. bu ay/geçen ay) satış-ciro rakamlarını yan yana karşılaştırır.",
+        "📅 Ana Takvim": "Sipariş teslim tarihleri, yasal beyanname son günleri gibi tüm önemli tarihleri tek takvimde toplar.",
+        "⚙️ Üretim & BOM": "Üretim reçetelerini (hangi mamul hangi hammaddelerden, ne oranda üretiliyor, işçilik maliyeti) tanımlar; üretim iş emri verip tamamlayarak stokları günceller.",
+        "🧾 Üretim Sipariş Fişi": "Kullanıcılar arasında devredilebilen, öncelik/notlar taşıyan hafif bir üretim emri/görev takip fişi.",
+        "📅 Üretim Planlama": "Açık üretim emirlerini/taleplerini zaman çizelgesinde planlamaya yardımcı olur.",
+        "🏷️ Lot Takibi": "Her üretimin aldığı benzersiz lot numarasını ve o lottan ne kadarının hâlâ stokta olduğunu izler.",
+        "✅ Kalite Kontrol": "Üretilen/gelen malzemelerin kalite sonucunu (kabul/red) kaydeder.",
+        "📊 Stok Özeti": "Tüm stok kartlarının genel durumunu (toplam değer, kritik seviyedekiler) özetler.",
+        "📦 Stok & Log": "Stok kartlarını ekleme/düzenleme ve tüm giriş-çıkış hareketlerinin günlüğünü gösterir.",
+        "🏭 Depolar": "Birden fazla depo tanımlayıp depo bazında stok miktarlarını ve transferleri yönetir.",
+        "🧮 Stok Sayımı": "Fiziksel sayım sonuçlarını sisteme girip fark (fazla/eksik) raporu çıkarır.",
+        "⏳ Stok Yaşlandırma": "Stoktaki ürünlerin ne kadar süredir elde durduğunu (yaşını) gösterir - durgun stok tespiti için.",
+        "🔮 Öngörülen Stok": "Geçmiş satış hızına bakarak bir ürünün ne zaman tükeneceğini tahmin eder.",
+        "📤 Konsinye Stok": "Mülkiyeti bizde kalıp müşteride/bayide bekleyen konsinye malları izler.",
+        "⚠️ Negatif Stoklar": "Miktarı sıfırın altına düşmüş (muhtemelen hatalı) stok kartlarını listeler.",
+        "📷 Hızlı Barkod İşlem": "Barkod okutarak hızlı stok giriş/çıkış işlemi yapar.",
+        "🛒 Satınalma & Alış": "Tedarikçiden mal/hizmet satın alma taleplerini ve siparişlerini yönetir.",
+        "📥 Alış İrsaliyesi": "Fatura gelmeden önce, malın fiilen teslim alındığı anda stok girişini kaydeder (mal kabul fişi).",
+        "📐 MRP Planlama": "Açık satış siparişlerinin ihtiyaç duyduğu hammaddeyi reçete üzerinden hesaplayıp otomatik satınalma önerisi çıkarır.",
+        "📋 Teklif Karşılaştırma": "Birden fazla tedarikçiden alınan teklifleri yan yana karşılaştırır.",
+        "⭐ Tedarikçi Skor Kartı": "Tedarikçilerin zamanında teslimat ve kalite kabul oranına göre performans puanını gösterir.",
+        "💲 Fiyatlandırma": "Ürün satış fiyatlarını belirleme/güncelleme ekranı.",
+        "💰 Fiyat Listeleri": "Farklı müşteri gruplarına özel fiyat listeleri tanımlar.",
+        "🧮 Fiyat Önerisi": "Girilen maliyet ve istenen kâr marjına göre önerilen satış fiyatını hesaplar.",
+        "📈 Satış Tahmini": "Geçmiş satış verisine dayanarak gelecek dönem satış tahmini üretir.",
+        "💹 Kâr Marjı Analizi": "Her ürünün toplam ciro/tahmini maliyet/kâr marjını ürün ORTALAMASI üzerinden gösterir.",
+        "💹 Sipariş Kâr Analizi": "Her siparişin kendi kâr/zararını ayrı ayrı gösterir (ürün ortalamasının aksine).",
+        "➕ Müşteri Ekle": "Yeni müşteri (cari) kaydı oluşturur.",
+        "🏢 Müşteri CRM": "Mevcut müşterileri listeler, düzenler, Müşteri 360° özetine ve ekstresine erişir.",
+        "📮 Müşteri Şikayetleri": "Müşteri şikayetlerini kaydedip çözüm sürecini takip eder.",
+        "🤝 Müşteri Anlaşmaları": "Bir müşteriyle yapılan özel iskonto anlaşmasını ve bitiş tarihini takip eder; fatura keserken otomatik iskonto önerir.",
+        "🎯 Müşteri Segmentasyonu": "Müşterileri ciro/sıklık gibi kriterlere göre gruplara ayırır.",
+        "📝 Teklif": "Müşteriye fiyat teklifi hazırlayıp PDF çıktısı alır.",
+        "🛒 Sipariş": "Onaylanmış müşteri siparişlerini oluşturur ve takip eder.",
+        "🧪 Numune Siparişleri": "Ücretsiz/numune gönderimlerini ayrı takip eder.",
+        "🎯 Satış Fırsatları": "Henüz teklife dönüşmemiş potansiyel satışları kaydeder.",
+        "🔻 Satış Hunisi": "Fırsatların hangi aşamada (görüşme/teklif/kapanış) olduğunu huni grafiğiyle gösterir.",
+        "🔄 Teklif Dönüşüm Analizi": "Tekliflerin ne kadarının siparişe döndüğünü genel ve müşteri bazında, grafiklerle gösterir.",
+        "🚚 İrsaliye": "Sevkiyat irsaliyesi keser, e-İrsaliye XML'i ve PDF çıktısı oluşturur.",
+        "🔗 Belge Zinciri": "Bir teklif/siparişten türeyen tüm irsaliye/fatura zincirini gösterir.",
+        "🔍 Sipariş-Fatura Tutarlılık": "Faturalanan tutarların bağlı olduğu siparişle tutarlı olup olmadığını kontrol eder.",
+        "🗄️ Kasa": "Nakit kasa giriş/çıkışlarını kaydeder.",
+        "💰 Tahsilat & Kasa": "Müşteriden gelen tahsilatları kasaya/bankaya işler.",
+        "🏦 Finans & Banka": "Banka hesaplarını ve hareketlerini yönetir.",
+        "💵 Nakit Akış Tahmini": "Açık fatura/alış vadelerine göre önümüzdeki dönemin nakit giriş-çıkış tahminini gösterir.",
+        "🏦 Krediler": "Alınan kredilerin taksit planını takip eder.",
+        "📜 Teminat Mektupları": "Verilen/alınan teminat mektuplarını ve vadelerini izler.",
+        "📚 Hesap Planı": "Muhasebe hesap kodlarını (Kasa, Alıcılar vb.) listeler.",
+        "📖 Yevmiye Defteri": "Tüm çift taraflı muhasebe kayıtlarının (yevmiye fişleri) günlüğü.",
+        "⚖️ Mizan": "Her hesabın toplam borç/alacak/bakiyesini gösteren temel mali rapor.",
+        "📊 Mali Tablolar": "Kâr-zarar ve bilanço gibi özet mali tabloları gösterir.",
+        "🧾 KDV Beyanname Taslağı": "Seçilen dönem için hesaplanan/indirilecek KDV farkını taslak olarak hesaplar (resmi beyanname değildir).",
+        "📋 Muhtasar Beyanname Taslağı": "Personel bordrolarından kesilen gelir/damga vergisi stopajını taslak olarak toplar.",
+        "💸 Masraflar": "Genel işletme giderlerini kaydeder.",
+        "📋 Demirbaşlar": "Sabit kıymetleri ve amortisman hesaplamalarını takip eder.",
+        "📦 Stok Değerleme": "Belirli bir tarihte stokun toplam parasal değerinin raporunu (anlık fotoğraf) alır.",
+        "📊 Bütçe": "Hesap bazında hedef bütçe girip gerçekleşenle karşılaştırır.",
+        "⏳ Yaşlandırma Raporu": "Müşteri alacaklarını vade yaşına (0-30/31-60... gün) göre gruplar.",
+        "🤝 Cari Mutabakat": "Bir müşteri/tedarikçiyle aranızdaki bakiyenin mutabakat belgesini oluşturur.",
+        "📋 Diğer Muhasebe Fişleri": "Standart akışların dışında kalan manuel yevmiye fişi girişleri.",
+        "📆 Yasal Takvim": "Vergi/SGK gibi yasal beyanname son tarihlerini hatırlatır.",
+        "🔒 Dönem Kilitleme": "Geçmiş bir ayı, şifre olmadan geri açılamayacak şekilde kilitleyip kayıtların değiştirilmesini engeller.",
+        "📆 Yıl Sonu Kapanışı": "Yıl sonunda gelir/gider hesaplarını sıfırlayıp net kâr/zararı bilanço hesabına devreden kapanış fişi atar.",
+        "📄 Fatura Kes": "Satış/alım faturası, irsaliye veya perakende satış kesmek için kullanılan ana evrak ekranı.",
+        "🧾 Faturalar": "Kesilmiş tüm faturaları listeler; iptal, PDF görüntüleme gibi işlemler buradan yapılır.",
+        "🌍 İhracat": "Yurt dışı satış faturalarını (döviz cinsinden) yönetir.",
+        "👥 Personel & İK": "Personel kartlarını (maaş, TC no, işe giriş tarihi vb.) yönetir, bordro hesaplar.",
+        "🏖️ Personel İzin Takibi": "İzin taleplerini oluşturup onaylar/reddeder.",
+        "✅ Onay Bekleyenler": "Belirli tutarın üzerindeki işlemler için tanımlı onay zincirinde sıradaki onayınızı bekleyen kayıtları gösterir.",
+        "✍️ Elektronik İmza": "Belgelerin dijital olarak imzalanmasını sağlar.",
+        "🏭 Tedarikçi": "Tedarikçi (alım yapılan firma) kayıtlarını yönetir.",
+        "💲 Tedarikçi Fiyat Karşılaştırma": "Bir ürünü geçmişte hangi tedarikçiden hangi fiyata aldığınızı karşılaştırır - en ucuz üstte.",
+        "💱 Döviz": "Güncel döviz kurlarını gösterir.",
+        "🚚 Araç/Filo": "Şirket araçlarının muayene/sigorta tarihlerini takip eder.",
+        "📁 Doküman Arşivi": "Sözleşme, ruhsat gibi genel belgeleri saklar.",
+        "🛒 Hızlı Satış (POS)": "Peşin/nakit satışları hızlıca kaydeder.",
+        "📧 Bildirim Ayarları": "Haftalık e-posta raporu ve e-Fatura/e-İrsaliye entegratör bağlantı ayarlarını yönetir.",
+        "🔔 Alarm Yönetimi": "Kritik stok, risk limiti aşımı, hammadde fiyat artışı gibi otomatik uyarı kurallarını tanımlar ve geçmişini gösterir.",
+        "📱 Mobil Erişim": "Uygulamaya mobil cihazlardan erişim ayarları.",
+        "🧾 Sistem Logları": "Kim ne zaman ne yaptı (işlem logu) ve hangi kaydın hangi alanı nasıl değişti (denetim izi) kayıtlarını gösterir.",
+        "🔒 Oturum Günlüğü": "Giriş/çıkış denemelerini ve IP adreslerini kaydeder.",
+        "👤 Kullanıcı Aktivite Özeti": "Kullanıcı bazında toplam ve kritik işlem sayısını özetler.",
+        "👤 Kullanıcı Yönetimi": "Personel için sisteme giriş yapabilecek kullanıcı hesapları (kullanıcı adı/şifre/rol) oluşturur.",
+        "🔗 Onay Zincirleri": "Tutar aralığına göre hangi rolün onayının gerektiğini tanımlar.",
+        "📋 Kalite Doküman Kontrolü": "Prosedür/talimat gibi kontrollü dokümanların güncel versiyonunu yönetir.",
+        "⚙️ Genel Varsayılanlar": "Sistem genelindeki varsayılan ayarları (oranlar, eşikler vb.) düzenler.",
+        "🗑️ Çöp Kutusu": "Silinen kayıtları (kalıcı silinmez) geri getirme imkânı sunar.",
+        "🔐 Ekran Yetkilendirme": "Bir rolün sol menüsünde hangi ekranların görüneceğini belirler (gerçek erişim izni değildir, sadece navigasyon kolaylığı).",
+        "🗂️ Rapor Merkezi": "Birden fazla raporu seçip tek bir Excel dosyasında toplu indirir.",
+        "📤 Toplu İçe Aktarma": "Stok/Müşteri/Personel/Reçete kayıtlarını Excel şablonuyla toplu olarak sisteme yükler.",
+        "📁 Projeler": "İç/dış projeleri tanımlayıp takip eder.",
+        "✅ Proje Görevleri": "Bir projeye bağlı görevleri ve durumlarını yönetir.",
+    }
+
+    def yardim_penceresi_ac(self):
+        win = ctk.CTkToplevel(self)
+        win.title("❓ Yardım / Kullanım Kılavuzu")
+        win.geometry("640x640")
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="❓ Yardım / Kullanım Kılavuzu", font=("Arial", 17, "bold"), text_color="#76CCE1").pack(padx=20, pady=(18, 4), anchor="w")
+        ctk.CTkLabel(win, text="Sol menüdeki her ekranın ne işe yaradığını burada bulabilirsiniz. Aramak için ekran adı veya bir anahtar kelime yazın, "
+                               "bir satıra tıklayarak doğrudan o ekrana gidebilirsiniz.",
+                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=590, justify="left").pack(padx=20, pady=(0, 10), anchor="w")
+
+        arama_kutu = ctk.CTkEntry(win, placeholder_text="🔍 Ekran adı veya anahtar kelime ara...", height=36)
+        arama_kutu.pack(fill="x", padx=20, pady=(0, 10))
+
+        kaydirmali = ctk.CTkScrollableFrame(win, fg_color=RENK_KART)
+        kaydirmali.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        def listeyi_doldur(filtre=""):
+            for w in kaydirmali.winfo_children():
+                w.destroy()
+            filtre = filtre.strip().lower()
+            bulundu = False
+            for kategori_adi, gruplar in self._MODUL_OZET_GRUPLARI.items():
+                kategori_gosterildi = False
+                for grup_baslik, ekranlar in gruplar:
+                    eslesenler = []
+                    for ekran in ekranlar:
+                        aciklama = self._YARDIM_ACIKLAMALARI.get(ekran, "")
+                        if not filtre or filtre in ekran.lower() or filtre in aciklama.lower() or filtre in kategori_adi.lower():
+                            eslesenler.append((ekran, aciklama))
+                    if not eslesenler:
+                        continue
+                    bulundu = True
+                    if not kategori_gosterildi:
+                        ctk.CTkLabel(kaydirmali, text=kategori_adi, font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=(12, 2))
+                        kategori_gosterildi = True
+                    ctk.CTkLabel(kaydirmali, text=grup_baslik, font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(4, 2))
+                    for ekran, aciklama in eslesenler:
+                        def _ekrana_git(e=None, ad=ekran):
+                            win.destroy()
+                            self.sekmeye_git(ad)
+
+                        satir = ctk.CTkFrame(kaydirmali, fg_color=RENK_IKINCIL, corner_radius=8, cursor="hand2")
+                        satir.pack(fill="x", padx=10, pady=3)
+                        ic = ctk.CTkFrame(satir, fg_color="transparent")
+                        ic.pack(fill="x", padx=10, pady=6)
+                        baslik_lbl = ctk.CTkLabel(ic, text=ekran, font=("Arial", 12, "bold"), anchor="w", width=210, wraplength=205, justify="left")
+                        baslik_lbl.pack(side="left", anchor="n")
+                        aciklama_lbl = ctk.CTkLabel(ic, text=aciklama or "(açıklama eklenmemiş)", font=("Arial", 11), text_color=RENK_METIN_SOLUK,
+                                                     anchor="w", wraplength=290, justify="left")
+                        aciklama_lbl.pack(side="left", padx=(8, 0), fill="x", expand=True)
+                        ok_lbl = ctk.CTkLabel(ic, text="→", font=("Arial", 13, "bold"), text_color="#76CCE1", width=20)
+                        ok_lbl.pack(side="right", anchor="n")
+                        for widget in (satir, ic, baslik_lbl, aciklama_lbl, ok_lbl):
+                            widget.bind("<Button-1>", _ekrana_git)
+            if not bulundu:
+                ctk.CTkLabel(kaydirmali, text="Eşleşen bir ekran bulunamadı.", text_color=RENK_METIN_SOLUK).pack(pady=20)
+
+        arama_kutu.bind("<KeyRelease>", lambda e: listeyi_doldur(arama_kutu.get()))
+        listeyi_doldur()
 
     def _kategori_alt_gruplarina_gore_yeniden_ciz(self):
         """Her kategorinin sol menüdeki DÜZ ekran listesini, _MODUL_OZET_GRUPLARI
