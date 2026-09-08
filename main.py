@@ -604,9 +604,18 @@ def pdf_footer_ekle(pdf, ek_not: str = "", font_ailesi: str = "Arial"):
 
 app = FastAPI(title="Nisan Plastik ERP - Ultimate Enterprise Sürüm")
 
+# NOT: Önceden allow_origins=["*"] (HERHANGİ bir web sitesinin tarayıcı JS'i bu
+# API'ye istek atabiliyordu). Masaüstü uygulaması (arayuz.py) zaten tarayıcı
+# olmadığı için CORS'tan hiç etkilenmiyor - bu kısıtlama SADECE bir web sayfası
+# (örn. kötü niyetli bir site, ya da /mobil dışındaki bir sayfa) üzerinden yapılan
+# çapraz-kaynak isteklerini ilgilendiriyor. Artık sadece yerel ağ/localhost
+# kaynaklı tarayıcı istekleri (bkz. /mobil'in "aynı ağdaki cihazlar" tasarımı)
+# kabul ediliyor - internetteki rastgele bir site artık API'yi tarayıcı üzerinden
+# çağıramaz (doğrudan HTTP istemcisiyle -curl vb.- çağırmak zaten CORS'un
+# kapsamı dışında, ona karşı koruma /giris'teki hız sınırlaması sağlıyor).
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -626,7 +635,41 @@ _FIYAT_YONETIM_YOLLARI = (
 security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-SECRET_KEY = os.environ.get("NISAN_ERP_SECRET_KEY", "3d739dffb43c3da76dc5b0598ee571fc5a2e034154c5f21883a40f5d14d62f13")
+def _secret_key_yukle_veya_olustur() -> str:
+    """JWT imzalama anahtarını belirler. ÖNCEDEN, NISAN_ERP_SECRET_KEY ortam
+    değişkeni ayarlanmamışsa sabit, kod içine gömülü (ve artık Git geçmişinde de
+    duran) bir anahtara düşülüyordu - bu, o sabit değeri bilen HERKESİN (kaynak
+    koda erişimi olan) Yönetici rolünde SAHTE bir JWT token üretebileceği anlamına
+    geliyordu. Artık: 1) önce ortam değişkeni denenir (üretim/gerçek kurulum için
+    en güvenlisi), 2) o da yoksa daha önce oluşturulmuş yerel bir anahtar dosyası
+    (.secret_key, Git'e YÜKLENMEZ - bkz. .gitignore) okunur, 3) o da yoksa YENİ,
+    rastgele bir anahtar üretilip bu dosyaya yazılır - böylece her kurulum kendi
+    benzersiz anahtarına sahip olur ve yeniden başlatmalar arasında (dosya sabit
+    kaldığı sürece) oturumlar geçersiz kalmaz."""
+    env_deger = os.environ.get("NISAN_ERP_SECRET_KEY")
+    if env_deger:
+        return env_deger
+    dosya_yolu = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".secret_key")
+    try:
+        if os.path.exists(dosya_yolu):
+            with open(dosya_yolu, "r", encoding="utf-8") as f:
+                mevcut = f.read().strip()
+                if mevcut:
+                    return mevcut
+    except OSError:
+        pass
+    yeni_anahtar = secrets.token_hex(32)
+    try:
+        with open(dosya_yolu, "w", encoding="utf-8") as f:
+            f.write(yeni_anahtar)
+        print(f">>> Yeni bir JWT imzalama anahtarı oluşturulup '{dosya_yolu}' dosyasına kaydedildi "
+              f"(NISAN_ERP_SECRET_KEY ortam değişkeni tanımlı değildi).")
+    except OSError as e:
+        print(f">>> UYARI: Anahtar dosyaya yazılamadı ({e}) - bu anahtar sadece bu çalıştırma için geçerli olacak, "
+              f"sunucu yeniden başlatıldığında TÜM oturumlar geçersiz olacak.")
+    return yeni_anahtar
+
+SECRET_KEY = _secret_key_yukle_veya_olustur()
 ALGORITHM = "HS256"
 
 @app.get("/mobil", response_class=HTMLResponse)
@@ -5174,12 +5217,31 @@ def canliye_gecis_sifirla(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
     finally:
         conn.close()
 
+_GIRIS_KILIT_ESIK = 5          # bu kadar ardışık başarısız denemeden sonra kilitlenir
+_GIRIS_KILIT_DAKIKA = 15        # kilidin (ve sayaç penceresinin) süresi
+
 @app.post("/giris")
 def giris_yap(veri: GirisRequest, request: Request):
+    """NOT: Önceden bu uçta hiçbir hız sınırlaması YOKTU - başarısız denemeler
+    loglanıyordu (bkz. oturum_gunlugu_yaz) ama HİÇBİRİ engellenmiyordu, yani ağa
+    erişimi olan biri bir kullanıcı adına karşı sınırsız şifre deneyebilirdi
+    (kaba kuvvet/brute-force saldırısı). Artık son _GIRIS_KILIT_DAKIKA dakika
+    içinde aynı kullanıcı adına _GIRIS_KILIT_ESIK veya daha fazla başarısız deneme
+    varsa, DOĞRU şifre girilse bile 429 ile reddedilir - sayaç, kilit süresi
+    dolup yeni bir başarısız/başarılı deneme gelene kadar sıfırlanmaz."""
     ip_adresi = request.client.host if request.client else None
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        try:
+            cursor.execute("""SELECT COUNT(*) FROM OturumGunlugu WHERE KullaniciAdi=? AND IslemTuru='GIRIS_BASARISIZ'
+                               AND Tarih >= DATEADD(MINUTE, -?, GETDATE())""", (veri.KullaniciAdi, _GIRIS_KILIT_DAKIKA))
+            son_basarisiz_sayisi = cursor.fetchone()[0]
+        except pyodbc.Error:
+            son_basarisiz_sayisi = 0  # OturumGunlugu henüz oluşmamışsa (ilk kurulum) sessizce atla
+        if son_basarisiz_sayisi >= _GIRIS_KILIT_ESIK:
+            raise HTTPException(status_code=429, detail=f"Çok fazla başarısız giriş denemesi. Lütfen {_GIRIS_KILIT_DAKIKA} dakika sonra tekrar deneyin.")
+
         # Rol sütununu da çekiyoruz
         try:
             cursor.execute("SELECT SifreHash, Rol FROM Kullanicilar WHERE KullaniciAdi = ?", (veri.KullaniciAdi,))
@@ -5237,29 +5299,6 @@ def kullanici_ekle(veri: KullaniciEkle, user: dict = Depends(yetki_kontrol(["Yö
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        conn.close()
-
-@app.get("/stok-ozet")
-def stok_ozet():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        # Arka plandaki tüm giriş ve çıkış hareketlerini toplayıp net mevcut stoğu bulur
-        cursor.execute("""
-            SELECT 
-                UrunAd,
-                SUM(CASE WHEN HareketTipi = 'GİRİŞ' THEN Miktar ELSE 0 END) -
-                SUM(CASE WHEN HareketTipi IN ('ÇIKIŞ', 'İRSALİYE SEVK') THEN Miktar ELSE 0 END) AS MevcutMiktar
-            FROM StokHareketleri
-            GROUP BY UrunAd
-        """)
-        rows = cursor.fetchall()
-        
-        # Miktarı 0 olanları listede kalabalık yapmasın diye filtreleyebilirsin, şimdilik hepsini alıyoruz
-        return [{"UrunAd": row[0], "Miktar": float(row[1]) if row[1] else 0.0} for row in rows]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 

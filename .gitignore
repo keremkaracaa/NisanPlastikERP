@@ -1,4 +1,5 @@
 # --- Kişisel/hassas veriler (asla Git'e yüklenmemeli) ---
+.secret_key
 kisayollar_*.json
 belgeler/
 etiket_*.pdf

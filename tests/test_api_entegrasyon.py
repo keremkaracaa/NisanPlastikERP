@@ -1188,7 +1188,9 @@ class TestOturumDenetimi:
     başarısız denemeler (olası brute-force) hiç görünmüyordu."""
 
     def test_giris_basarisiz_denemede_oturum_gunlugune_yazilir(self, monkeypatch):
-        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)  # kullanıcı bulunamadı
+        conn, cursor = sahte_cursor_olustur()
+        # sırasıyla: son 15 dk başarısız deneme sayısı (0 - kilitli değil), kullanıcı bulunamadı
+        cursor.fetchone.side_effect = [(0,), None]
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
         yanit = TestClient(main.app).post("/giris", json={"KullaniciAdi": "yok_boyle_biri", "Sifre": "yanlis"})
@@ -1199,7 +1201,8 @@ class TestOturumDenetimi:
         conn.commit.assert_called()  # log kaybolmasın diye 401'den önce commit edilmeli
 
     def test_giris_basarili_oturum_gunlugune_yazilir(self, monkeypatch):
-        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("sahte_hash", "Satış"))
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(0,), ("sahte_hash", "Satış")]
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
         monkeypatch.setattr(main.pwd_context, "verify", lambda sifre, hash_: True)
 
@@ -1208,6 +1211,16 @@ class TestOturumDenetimi:
         basarili_kayit = [c for c in cursor.execute.call_args_list
                            if "INTO OturumGunlugu" in c.args[0] and "GIRIS_BASARILI" in c.args[1]]
         assert len(basarili_kayit) == 1
+
+    def test_giris_kilitliyken_dogru_sifreyle_bile_429_doner(self, monkeypatch):
+        """5+ başarısız deneme varsa DOĞRU şifre girilse bile reddedilmeli - kilit
+        şifreye bakmaksızın uygulanıyor (hızlı deneme saldırısına karşı)."""
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(5,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = TestClient(main.app).post("/giris", json={"KullaniciAdi": "master", "Sifre": "abcd"})
+        assert yanit.status_code == 429
 
     def test_oturum_gunlugu_yetkisiz_istekte_401_doner(self):
         yetkisiz_client = TestClient(main.app)
