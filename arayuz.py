@@ -9,7 +9,6 @@ from openpyxl.utils import get_column_letter
 import time
 import json
 import webbrowser
-import tempfile
 try:
     import win32api
     import win32print
@@ -31,12 +30,7 @@ from tkinter import filedialog
 from datetime import datetime
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image as RLImage
-try:
-    import qrcode
-    QRCODE_MEVCUT = True
-except ImportError:
-    QRCODE_MEVCUT = False
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -6629,39 +6623,115 @@ class MainApp(ctk.CTkToplevel):
         * E-Arşiv raporlamaları kapsamında alıcıya elektronik ortamda iletilmiştir.</font>
         """
         
-        # QR Kod - GİB'e bağlı gerçek bir doğrulama portalımız olmadığı için (bu sistem
-        # e-Fatura entegratörüne resmi bağlı değil, bkz. Bildirim Ayarları'ndaki e-Fatura
-        # notu) QR'ın içeriği bir URL DEĞİL, faturayı özetleyen düz metindir - telefonla
-        # okutunca fatura no/ETTN/tutarı hızlıca görüntülemek için.
-        qr_dosya = None
-        if QRCODE_MEVCUT:
-            try:
-                qr_icerik = f"NİSAN PLASTİK e-ARŞİV FATURA\nFatura No: {fatura_no_str}\nETTN: {ettn_kodu}\nTarih: {datetime.now().strftime('%d.%m.%Y')}\nTutar: {genel_toplam:,.2f} TL"
-                qr_dosya = os.path.join(tempfile.gettempdir(), f"nisan_qr_{fatura_id}_{int(time.time()*1000)}.png")
-                qrcode.make(qr_icerik).save(qr_dosya)
-            except Exception:
-                qr_dosya = None
-
-        if qr_dosya:
-            dip_izgara = [
-                [RLImage(qr_dosya, width=60, height=60), Paragraph(yasal_notlar, stil_kucuk), t_alt_hesap]
-            ]
-            t_dip = Table(dip_izgara, colWidths=[65, 245, 235])
-        else:
-            dip_izgara = [
-                [Paragraph(yasal_notlar, stil_kucuk), t_alt_hesap]
-            ]
-            t_dip = Table(dip_izgara, colWidths=[310, 235])
+        # NOT: Burada bilinçli olarak QR kod YOK. Gerçek bir GİB doğrulama portalımız
+        # olmadığından (sistem e-Fatura entegratörüne resmi bağlı değil) QR'a düz metin
+        # gömmek zorunda kalıyorduk - telefonla taratınca URL olmadığı için kameralar bunu
+        # otomatik bir Google araması olarak açıyor (müşteri karşısında "AI Bakışı" gibi
+        # alakasız/kafa karıştırıcı bir sonuç çıkıyor). Sahte/yarım bir QR, hiç QR
+        # olmamasından daha az profesyonel görünüyor - bu yüzden kaldırıldı.
+        dip_izgara = [
+            [Paragraph(yasal_notlar, stil_kucuk), t_alt_hesap]
+        ]
+        t_dip = Table(dip_izgara, colWidths=[310, 235])
         t_dip.setStyle(TableStyle([('VALIGN', (0,0), (-1,-1), 'TOP')]))
         hikaye.append(t_dip)
 
         doc.build(hikaye)
-        if qr_dosya:
-            try:
-                os.remove(qr_dosya)
-            except OSError:
-                pass
-    
+
+    def irsaliye_pdf_olustur(self, irsaliye_id):
+        """Sevk İrsaliyesi PDF'i - profesyonel_fatura_pdf_olustur ile AYNI ReportLab/QR
+        deseni kullanılır ama fiyat/KDV YOKTUR (irsaliye bir teslimat belgesidir, tutar
+        taşımaz). Sadece /irsaliye-kes ile kesilen irsaliyelerde kalem bilgisi vardır -
+        bkz. GET /irsaliye-detay docstring'i."""
+        try:
+            res = requests.get(f"{API}/irsaliye-detay/{irsaliye_id}", headers=self.req_headers(), timeout=10)
+            if res.status_code != 200:
+                self.api_hata_goster(res)
+                return
+            d = res.json()
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+            return
+
+        if not d.get("Kalemler"):
+            messagebox.showwarning("Kalem Bilgisi Yok",
+                                    "Bu irsaliyenin kalem detayı kayıtlı değil (Fatura Kes ekranındaki eski 'İrsaliye' evrak tipiyle kesilmiş olabilir) - "
+                                    "PDF kalemsiz oluşturulacak.")
+
+        dosya_yolu = f"Irsaliye_{irsaliye_id}.pdf"
+        doc = SimpleDocTemplate(dosya_yolu, pagesize=A4, rightMargin=25, leftMargin=25, topMargin=25, bottomMargin=25)
+        styles = getSampleStyleSheet()
+        stil_baslik = ParagraphStyle('Baslik', parent=styles['Normal'], fontName=F_BOLD, fontSize=13, leading=15, textColor=colors.HexColor("#0f172a"))
+        stil_kucuk_bold = ParagraphStyle('KucukBold', parent=styles['Normal'], fontName=F_BOLD, fontSize=8, leading=10, textColor=colors.HexColor("#0f172a"))
+        stil_kucuk = ParagraphStyle('Kucuk', parent=styles['Normal'], fontName=F_NORMAL, fontSize=8, leading=11, textColor=colors.HexColor("#334155"))
+        hikaye = []
+
+        ust_bilgi = [[
+            Paragraph("<b>NİSAN PLASTİK SAN. VE TİC. LTD. ŞTİ.</b>", stil_baslik),
+            Paragraph(f"<font size=11><b>SEVK İRSALİYESİ</b></font><br/><font size=7 color='#64748b'>{d['IrsaliyeTuru'].upper()}</font>",
+                       ParagraphStyle('SagBaslik', parent=styles['Normal'], fontName=F_NORMAL, alignment=2))
+        ]]
+        t_ust = Table(ust_bilgi, colWidths=[330, 215])
+        t_ust.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'MIDDLE')]))
+        hikaye.append(t_ust)
+        hikaye.append(Spacer(1, 6))
+        hikaye.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#0f172a"), spaceBefore=1, spaceAfter=6))
+
+        alici_metin = f"""<b>Sayın / Unvan:</b> {d['FirmaAdi']}<br/><b>Adres:</b> {d['Adres']}<br/>
+        <b>Vergi Dairesi:</b> {d['VergiDairesi']} &nbsp;&nbsp; <b>VKN/TCKN:</b> {d['VergiNo']}<br/>
+        <b>İletişim:</b> {d['Telefon']}"""
+        irsaliye_meta = f"""<b>İrsaliye No:</b> NSP-IRS-{d['IrsaliyeID']:08d}<br/><b>Tarih:</b> {d['Tarih']}<br/>
+        <b>Plaka:</b> {d['Plaka']} &nbsp;&nbsp; <b>Şoför:</b> {d['Sofor']}<br/><b>Açıklama:</b> {d['Aciklama']}"""
+
+        bilgi_tablosu = [
+            [Paragraph("<b>ALICI (MÜŞTERİ) BİLGİLERİ</b>", stil_kucuk_bold), Paragraph("<b>İRSALİYE KÜNYESİ</b>", stil_kucuk_bold)],
+            [Paragraph(alici_metin, stil_kucuk), Paragraph(irsaliye_meta, stil_kucuk)],
+        ]
+        t_bilgi = Table(bilgi_tablosu, colWidths=[310, 235])
+        t_bilgi.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#f8fafc")),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#94a3b8")),
+            ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ('TOPPADDING', (0, 0), (-1, -1), 5), ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ]))
+        hikaye.append(t_bilgi)
+        hikaye.append(Spacer(1, 10))
+
+        kalem_satirlari = [[Paragraph("<b>Stok Kod</b>", stil_kucuk_bold), Paragraph("<b>Ürün Adı</b>", stil_kucuk_bold), Paragraph("<b>Miktar</b>", stil_kucuk_bold)]]
+        for k in d.get("Kalemler", []):
+            kalem_satirlari.append([Paragraph(k["StokKod"], stil_kucuk), Paragraph(k["StokAdi"], stil_kucuk), Paragraph(f"{k['Miktar']:g}", stil_kucuk)])
+        if len(kalem_satirlari) == 1:
+            kalem_satirlari.append([Paragraph("-", stil_kucuk), Paragraph("(Kalem detayı kayıtlı değil)", stil_kucuk), Paragraph("-", stil_kucuk)])
+        t_kalemler = Table(kalem_satirlari, colWidths=[90, 335, 120])
+        t_kalemler.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+        hikaye.append(t_kalemler)
+        hikaye.append(Spacer(1, 10))
+
+        # NOT: QR kod bilinçli olarak yok - bkz. profesyonel_fatura_pdf_olustur'daki
+        # aynı gerekçe (gerçek bir doğrulama portalı olmadan düz metin QR, telefonlarda
+        # beklenmedik bir Google araması açıyor, hiç QR olmamasından daha az profesyonel).
+        hikaye.append(Spacer(1, 6))
+        hikaye.append(Paragraph("<font size=7 color='#475569'>Bu belge sevkiyat amaçlı düzenlenmiştir, fatura/tutar bilgisi içermez.</font>", stil_kucuk))
+
+        doc.build(hikaye)
+        try:
+            os.startfile(os.path.abspath(dosya_yolu))
+        except Exception as e:
+            messagebox.showwarning("PDF Hatası", f"İrsaliye oluşturuldu ama açılamadı: {e}\n\nDosya: {dosya_yolu}")
+
+    def secili_irsaliye_pdf_olustur(self):
+        secili = self.irs_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen bir irsaliye seçin.")
+            return
+        irsaliye_id = self.irs_tree.item(secili[0])["values"][0]
+        self.irsaliye_pdf_olustur(irsaliye_id)
+
     
 
     def dovizleri_yukle(self):
@@ -13275,7 +13345,9 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(irs_buton_satiri, text="👁️ XML'i Görüntüle", fg_color=RENK_KENARLIK, hover_color=RENK_IKINCIL,
                       command=self.secili_irsaliye_eirsaliye_goster).pack(side="left", padx=(0, 6))
         ctk.CTkButton(irs_buton_satiri, text="📤 Entegratöre Gönder", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.secili_irsaliye_eirsaliye_gonder).pack(side="left")
+                      command=self.secili_irsaliye_eirsaliye_gonder).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(irs_buton_satiri, text="📄 PDF Oluştur", fg_color="#42ACA2", hover_color="#38928A",
+                      command=self.secili_irsaliye_pdf_olustur).pack(side="left")
 
         self.irsaliyeleri_yukle()
 

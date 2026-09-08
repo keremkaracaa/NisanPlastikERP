@@ -4047,3 +4047,31 @@ class TestMusteriAnlasmaIskontosuOtomatikUygulama:
         fiyat_entry = SahteEntry("100")
         fm._fm_musteri_iskontosu_uygula("Yarı Mamul", fiyat_entry)
         assert fiyat_entry.get() == "100"  # değişmedi
+
+
+class TestIrsaliyeDetay:
+    """İrsaliye PDF'i için başlık+kalem detayı - /irsaliye-kes ile kesilenler
+    IrsaliyeKalemleri'ne yazıyor, bkz. GET /irsaliye-detay/{id}."""
+
+    def test_kalemlerle_birlikte_doner(self, client, monkeypatch):
+        baslik = (1, "ABC Plastik", "Adres", "VD", "1234567890", "5551234567", "34ABC34", "Ali Yılmaz", "Sevk", date(2026, 1, 15), "Toptan Satış İrsaliyesi")
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=baslik, fetchall_sonucu=[("PP-001", "Test Ürün", 10.0)])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/irsaliye-detay/1")
+        assert yanit.status_code == 200
+        d = yanit.json()
+        assert d["FirmaAdi"] == "ABC Plastik"
+        assert d["Kalemler"][0]["StokAdi"] == "Test Ürün"
+
+    def test_bulunamayan_irsaliye_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/irsaliye-detay/999")
+        assert yanit.status_code == 404
+
+    def test_yetkisiz_istekte_401_doner(self):
+        yetkisiz_client = TestClient(main.app)
+        yanit = yetkisiz_client.get("/irsaliye-detay/1")
+        assert yanit.status_code in (401, 403)

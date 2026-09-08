@@ -1575,6 +1575,14 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
                     INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Tarih, Aciklama)
                     VALUES (?, 'SEVK', ?, ?, ?)
                 """, (stok_kod, k.miktar, db_tarih, f"İrsaliye #{data.belge_no}"))
+                # /irsaliye-kes zaten IrsaliyeKalemleri'ne yazıyordu, bu yol (Fatura Kes
+                # ekranındaki 'İrsaliye' evrak tipi) YAZMIYORDU - İrsaliye PDF'i (bkz.
+                # /irsaliye-detay) kalemsiz kalıyordu. Artık ikisi de aynı tabloya yazıyor.
+                cursor.execute("SELECT IrsaliyeID FROM Irsaliyeler WHERE BelgeNo=? AND MusteriID=?", (data.belge_no, musteri_id))
+                irsaliye_id_row = cursor.fetchone()
+                if irsaliye_id_row:
+                    cursor.execute("INSERT INTO IrsaliyeKalemleri (IrsaliyeID, StokKod, StokAdi, Miktar) VALUES (?, ?, ?, ?)",
+                                   (irsaliye_id_row[0], stok_kod, k.urun_ad, k.miktar))
 
                 cursor.execute("""
                     UPDATE StokKartlari
@@ -10262,6 +10270,37 @@ def fatura_detay_getir(fatura_id: int, user: dict = Depends(yetki_kontrol(["Yön
         "musteri": musteri_bilgi,
         "kalemler": kalemler
     }
+
+@app.get("/irsaliye-detay/{irsaliye_id}")
+def irsaliye_detay_getir(irsaliye_id: int, user: dict = Depends(get_current_user)):
+    """İrsaliye PDF'i (bkz. arayuz.py irsaliye_pdf_olustur) için başlık + kalem
+    bilgisini tek çağrıda döner. NOT: /evrak-isleme üzerinden (Fatura Kes ekranındaki
+    'İrsaliye' evrak tipiyle) kesilen irsaliyelerde Kalemler BOŞ dönebilir - o yol
+    IrsaliyeKalemleri'ne hiç yazmıyor (sadece StokHareketleri'ne), sadece /irsaliye-kes
+    (İrsaliye ekranındaki asıl 'Sevk İrsaliyesi Kes' akışı) kalemleri kalıcı olarak saklar."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT i.IrsaliyeID, m.FirmaAdi, m.Adres, m.VergiDairesi, m.VergiNo, m.Telefon,
+                   i.Plaka, i.Sofor, i.Aciklama, i.Tarih, ISNULL(i.IrsaliyeTuru, 'Toptan Satış İrsaliyesi')
+            FROM Irsaliyeler i JOIN Musteriler m ON i.MusteriID = m.MusteriID WHERE i.IrsaliyeID=?
+        """, (irsaliye_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="İrsaliye bulunamadı.")
+        cursor.execute("SELECT StokKod, StokAdi, Miktar FROM IrsaliyeKalemleri WHERE IrsaliyeID=?", (irsaliye_id,))
+        kalemler = [{"StokKod": r[0] or "-", "StokAdi": r[1], "Miktar": float(r[2])} for r in cursor.fetchall()]
+        return {
+            "IrsaliyeID": row[0], "FirmaAdi": row[1], "Adres": row[2] or "-", "VergiDairesi": row[3] or "-",
+            "VergiNo": row[4] or "-", "Telefon": row[5] or "-", "Plaka": row[6] or "-", "Sofor": row[7] or "-",
+            "Aciklama": row[8] or "-", "Tarih": str(row[9])[:16] if row[9] else "-", "IrsaliyeTuru": row[10],
+            "Kalemler": kalemler,
+        }
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
 
 @app.get("/irsaliye-listesi")
 def irsaliye_listesi_getir(user: dict = Depends(get_current_user)):
