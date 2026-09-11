@@ -4477,6 +4477,31 @@ class TestGenelArama:
         turler = {s["tur"] for s in sonuclar}
         assert turler == {"musteri", "stok"}
 
+    def test_tedarikci_listesi_rol_kisiti_aramada_da_uygulanir(self, client, monkeypatch):
+        """/tedarikci-listesi rol kısıtlı (Yönetici/Muhasebe/Depo/Satınalma) - /genel-arama
+        AYNI Tedarikciler tablosunu aradığı için o kısıtı delip yetkisi olmayan bir role
+        (örn. Satış) tedarikçi adlarını sızdırmamalı."""
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [],  # Musteriler
+            [],  # StokKartlari (OR'lu tek sorgu, ama side_effect sirasi execute sirasina gore)
+            [],  # Siparisler
+        ]
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "satisci", "rol": "Satış"}
+        try:
+            yanit = client.get("/genel-arama", params={"q": "ABC"})
+        finally:
+            main.app.dependency_overrides.clear()
+        assert yanit.status_code == 200
+        turler = {s["tur"] for s in yanit.json()["sonuclar"]}
+        assert "tedarikci" not in turler
+        # Tedarikciler sorgusu hic calismamis olmali (rol kontrolu execute'a varmadan durdurmali)
+        calisan_sorgular = [c.args[0] for c in cursor.execute.call_args_list]
+        assert not any("Tedarikciler" in s for s in calisan_sorgular)
+
 
 class TestBordroFisiDetay:
     """/bordro-fisi-detay ÖNCEDEN yoktu - masaüstü arayüzde kesilen bir bordro

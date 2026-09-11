@@ -18879,6 +18879,29 @@ class MainApp(ctk.CTkToplevel):
                          text_color=gecerli_renk(RENK_METIN)).grid(row=i, column=1, padx=15, pady=8, sticky="ne")
         govde.grid_columnconfigure(1, weight=1)
 
+        # "Bordro Fişleri" ile "Son Personel İşlemleri" farklı listeler olduğu için
+        # kullanıcı sürekli karıştırıyordu ("kesilen bordro fişi açılmıyor",
+        # "kalıcı kayıtlara bir şey eklenmiyor" şikayetleri) - bir "Maaş Tahakkuku"
+        # işlemi bordro fişi kesmeden de oluşabildiğinden (elle Avans/Ödeme formu),
+        # köprü sadece ilişkili bir bordro fişi GERÇEKTEN varsa gösterilir.
+        islem_turu = degerler[2] if len(degerler) > 2 else ""
+        if islem_turu == "Maaş Tahakkuku":
+            def bordroya_git():
+                try:
+                    res = requests.get(f"{API}/bordro-fisi-hareketten/{hareket_id}", headers=self.req_headers(), timeout=6)
+                    if res.status_code == 404:
+                        messagebox.showinfo("Bulunamadı", "Bu işlemle ilişkili bir bordro fişi yok (elle girilmiş bir Maaş Tahakkuku olabilir).")
+                        return
+                    if res.status_code != 200:
+                        self.api_hata_goster(res)
+                        return
+                    pencere.destroy()
+                    self._bordro_fisi_detay_ac(res.json()["BordroID"])
+                except requests.exceptions.RequestException:
+                    messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+            ctk.CTkButton(pencere, text="📋 İlgili Bordro Fişini Gör", fg_color="#5585EF", hover_color="#4871CB",
+                          command=bordroya_git).pack(pady=(0, 8), padx=20, fill="x")
+
         ctk.CTkButton(pencere, text="Kapat", fg_color=RENK_KENARLIK, text_color=gecerli_renk(RENK_METIN),
                       hover_color=RENK_IKINCIL, command=pencere.destroy).pack(pady=(0, 15), padx=20, fill="x")
 
@@ -19044,7 +19067,12 @@ class MainApp(ctk.CTkToplevel):
         if not secili:
             messagebox.showinfo("Seçim Yok", "Lütfen görüntülemek istediğiniz bordro fişini listeden seçin.")
             return
-        bordro_id = secili[0]
+        self._bordro_fisi_detay_ac(secili[0])
+
+    def _bordro_fisi_detay_ac(self, bordro_id):
+        """bordro_fisi_detay_goster (liste seçiminden) VE personel_hareketi_detay_goster
+        ('İlgili Bordro Fişini Gör' köprüsünden) tarafından paylaşılan çekirdek - pencereyi
+        doğrudan bir BordroID ile açar, seçim listesine bağımlı değildir."""
         try:
             res = requests.get(f"{API}/bordro-fisi-detay/{bordro_id}", headers=self.req_headers(), timeout=6)
             if res.status_code != 200:

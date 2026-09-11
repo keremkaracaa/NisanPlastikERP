@@ -4400,9 +4400,13 @@ def genel_arama(q: str, user: dict = Depends(get_current_user)):
         for r in cursor.fetchall():
             sonuclar.append({"tur": "musteri", "id": r[0], "etiket": f"👤 {r[1]} (Müşteri)", "deger": r[1]})
 
-        cursor.execute("SELECT TOP 5 TedarikciID, FirmaAdi FROM Tedarikciler WHERE FirmaAdi LIKE ?", (desen,))
-        for r in cursor.fetchall():
-            sonuclar.append({"tur": "tedarikci", "id": r[0], "etiket": f"🏭 {r[1]} (Tedarikçi)", "deger": r[1]})
+        # Tedarikciler'in KENDİ listesi (/tedarikci-listesi) rol kısıtlı
+        # (Yönetici/Muhasebe/Depo/Satınalma) - burada get_current_user (her rol)
+        # kullanılıyor diye arama o kısıtı delmesin, aynı rol kontrolü tekrarlanıyor.
+        if user["rol"] in ("Yönetici", "Master", "Muhasebe", "Depo", "Satınalma"):
+            cursor.execute("SELECT TOP 5 TedarikciID, FirmaAdi FROM Tedarikciler WHERE FirmaAdi LIKE ?", (desen,))
+            for r in cursor.fetchall():
+                sonuclar.append({"tur": "tedarikci", "id": r[0], "etiket": f"🏭 {r[1]} (Tedarikçi)", "deger": r[1]})
 
         cursor.execute("SELECT TOP 5 StokKod, StokAdi FROM StokKartlari WHERE StokKod LIKE ? OR StokAdi LIKE ?", (desen, desen))
         for r in cursor.fetchall():
