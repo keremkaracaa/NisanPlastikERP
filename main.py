@@ -539,7 +539,7 @@ PDF_MARKA_RENGI = (249, 115, 22)   # Nisan Plastik turuncusu (#f97316)
 PDF_KOYU_GRI = (55, 65, 81)
 PDF_ACIK_GRI = (243, 244, 246)
 
-def pdf_profesyonel_baslik(pdf, belge_turu: str, belge_no: str, tarih: str, cari_bilgi_satirlari: list, font_ailesi: str = "Arial"):
+def pdf_profesyonel_baslik(pdf, belge_turu: str, belge_no: str, tarih: str, cari_bilgi_satirlari: list, font_ailesi: str = "Arial", bolum_basligi: str = "MUSTERI BILGILERI"):
     """Üstte renkli bir başlık şeridi + şirket adı + belge türü/no/tarih + cari bilgi
     kutusu çizer. Önceki sade metin başlığı yerine gerçek bir kurumsal doküman görünümü verir."""
     pdf.set_fill_color(*PDF_MARKA_RENGI)
@@ -563,7 +563,7 @@ def pdf_profesyonel_baslik(pdf, belge_turu: str, belge_no: str, tarih: str, cari
     pdf.set_xy(10, 34)
     pdf.set_fill_color(*PDF_ACIK_GRI)
     pdf.set_font(font_ailesi, "B", 10)
-    pdf.cell(190, 7, txt="  MUSTERI BILGILERI", ln=True, fill=True)
+    pdf.cell(190, 7, txt=f"  {bolum_basligi}", ln=True, fill=True)
     pdf.set_font(font_ailesi, "", 10)
     for satir in cari_bilgi_satirlari:
         pdf.cell(190, 6, txt=f"  {satir}", ln=True)
@@ -3147,6 +3147,24 @@ def startup_db_check():
             except Exception:
                 pass
 
+        try:
+            _bordro_fisi_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Bordro fişi migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _eksik_hesap_kodlari_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Eksik hesap kodları migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
         conn.commit()
         print(">>> Veritabanı tabloları başarıyla güncellendi.")
     except Exception as e:
@@ -4048,6 +4066,62 @@ def _recete_iscilik_migrationlari(cursor):
     zaman/vardiya takibi YOKTUR, kullanıcının kendi tahminine dayanır."""
     guvenli_sutun_ekle(cursor, "UretimReceteleri", "IscilikBirimMaliyet", "FLOAT NULL DEFAULT 0")
 
+def _bordro_fisi_migrationlari(cursor):
+    """Bordro Hesapla (/bordro-hesapla) önceden sadece TASLAK bir hesap makinesiydi -
+    hiçbir kayıt saklamıyordu, her seferinde personelin GÜNCEL brüt maaşıyla sıfırdan
+    hesaplanıyordu. Bu tablo, aynı hesaplamanın (yine 'resmi değil' uyarısıyla) belirli
+    bir Yıl/Ay için KALICI bir kırılım (brüt/SGK/vergi/net) olarak saklanmasını sağlar -
+    ilişkili PersonelHareketleri satırıyla (Maaş Tahakkuku) eşlenir. UNIQUE(PersonelID,
+    Yil, Ay) aynı ay için iki kez fiş kesilmesini engeller."""
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='BordroFisleri' and xtype='U')
+        CREATE TABLE BordroFisleri (
+            BordroID INT IDENTITY(1,1) PRIMARY KEY,
+            PersonelID INT NOT NULL FOREIGN KEY REFERENCES Personeller(PersonelID),
+            Yil INT NOT NULL,
+            Ay INT NOT NULL,
+            BrutMaas FLOAT NOT NULL,
+            SgkIscisi FLOAT NOT NULL,
+            IssizlikIscisi FLOAT NOT NULL,
+            GelirVergisiMatrahi FLOAT NOT NULL,
+            GelirVergisi FLOAT NOT NULL,
+            DamgaVergisi FLOAT NOT NULL,
+            NetMaas FLOAT NOT NULL,
+            IsverenSgkMaliyeti FLOAT NOT NULL,
+            ToplamIsverenMaliyeti FLOAT NOT NULL,
+            Durum NVARCHAR(20) NOT NULL DEFAULT 'Aktif',
+            IptalTarihi DATETIME NULL,
+            IptalEden NVARCHAR(50) NULL,
+            IptalNedeni NVARCHAR(300) NULL,
+            PersonelHareketID INT NULL,
+            OlusturanKullanici NVARCHAR(50) NULL,
+            OlusturmaTarihi DATETIME NOT NULL DEFAULT GETDATE(),
+            CONSTRAINT UQ_BordroFisleri_PersonelYilAy UNIQUE (PersonelID, Yil, Ay)
+        )
+    """, "BordroFisleri tablosu")
+    # İcra Kesintisi + Prim/Ek Ödeme - prim SGK/vergiye tabi ek brüt olarak hesaba
+    # katılır (_bordro_hesapla_ic'e brut+prim verilir), icra kesintisi ise NET
+    # maaştan bilgi amaçlı düşülür (gerçek muhasebe/yevmiye etkisi YOKTUR - bkz.
+    # /bordro-fisi-olustur docstring'i).
+    guvenli_sutun_ekle(cursor, "BordroFisleri", "PrimEkOdeme", "FLOAT NOT NULL DEFAULT 0")
+    guvenli_sutun_ekle(cursor, "BordroFisleri", "IcraKesintisi", "FLOAT NOT NULL DEFAULT 0")
+    guvenli_sutun_ekle(cursor, "BordroFisleri", "EleGecenNetMaas", "FLOAT NULL")
+
+def _eksik_hesap_kodlari_migrationlari(cursor):
+    """Kod tabanındaki tüm yevmiye_fisi_olustur çağrılarında kullanılan hesap kodları
+    ile gerçek HesapPlani içeriği canlı DB'de karşılaştırıldı - 101 (Alınan Çekler ve
+    Senetler), 191 (İndirilecek KDV), 335 (Personele Borçlar) hiçbir seed listesinde
+    birlikte yer almadığından bazı kurulumlarda (örn. /hesap-plani'nin main.py:4356
+    civarındaki sadece 8 temel hesaplı 'tablo yoksa oluştur' yedek bloğu ilk çalışan
+    olduysa) hiç oluşmamış olabiliyor. Kasa/çek-senet/personel hareketleri bu kodlara
+    doğru satır yazıyor ama hesap DB'de yoksa HesapPlani.Bakiye UPDATE'i sessizce 0
+    satır etkiler (hata vermez) - bakiye hep 0/eksik görünür, Mizan yanlış çıkar."""
+    for kod, ad in [("101", "Alınan Çekler ve Senetler"), ("191", "İndirilecek KDV"), ("335", "Personele Borçlar")]:
+        guvenli_migrasyon(cursor, f"""
+            IF NOT EXISTS (SELECT 1 FROM HesapPlani WHERE HesapKodu='{kod}')
+            INSERT INTO HesapPlani (HesapKodu, HesapAdi, Bakiye) VALUES ('{kod}', N'{ad}', 0)
+        """, f"HesapPlani {kod} eksik hesap eklendi")
+
 def _finans_iptal_migrationlari(cursor):
     """Kasa/Banka/Masraf/Personel hareketleri için Faturalar.Durum ile AYNI storno
     deseni (bkz. main.py:3940-3943, /fatura-iptal main.py:10719): kayıt asla
@@ -4144,6 +4218,24 @@ def butce_hedefi_belirle(veri: ButceHedefiRequest, user: dict = Depends(yetki_ko
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/butce-oneri")
+def butce_oneri(hesap_kodu: str, yil: int, ay: int, artis_yuzde: float = 0,
+                 user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    """Bütçe hedefi girerken elle tahmin etmek yerine geçen yılın AYNI ay/hesap
+    gerçekleşenini (butce_gerceklesen_hesapla - DEĞİŞTİRİLMEDİ, aynen tekrar
+    çağrılıyor) başlangıç noktası olarak önerir; artis_yuzde (varsayılan 0) ile
+    enflasyon/büyüme beklentisi isteğe bağlı eklenebilir. Otomatik trend analizi
+    DEĞİLDİR - sadece geçen yılın rakamını temel alan basit bir öneridir."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        gecen_yil_gerceklesen = butce_gerceklesen_hesapla(cursor, hesap_kodu, yil - 1, ay)
+        onerilen_hedef = gecen_yil_gerceklesen * (1 + artis_yuzde / 100)
+        return {"GecenYil": yil - 1, "GecenYilGerceklesen": gecen_yil_gerceklesen,
+                "ArtisYuzde": artis_yuzde, "OnerilenHedef": onerilen_hedef}
     finally:
         conn.close()
 
@@ -4287,6 +4379,48 @@ def demirbas_ekle(req: DemirbasRequest, current_user: dict = Depends(yetki_kontr
         raise HTTPException(status_code=500, detail=f"Veritabanı hatası: {str(e)}")
     finally:
         conn.close()
+@app.get("/genel-arama")
+def genel_arama(q: str, user: dict = Depends(get_current_user)):
+    """'Her yere git' arama kutusu ÖNCEDEN sadece ekran/modül adlarını arıyordu -
+    placeholder metni ('Örn: lot, fiyat listesi, sipariş, 1') gerçek kayıt aramasını
+    vaat ediyor ama karşılığı yoktu. Müşteri, tedarikçi, stok ve sipariş üzerinde
+    basit bir LIKE araması yapar; sonuç tıklanınca ilgili ekrana gidilip arama kutusu
+    otomatik doldurulur (bkz. arayuz.py _komut_paleti_secildi). Kapsam bilinçli
+    olarak bu 4 tabloyla sınırlı - en sık aranan kayıt türleri bunlar."""
+    q = (q or "").strip()
+    if len(q) < 2:
+        return {"sonuclar": []}
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        desen = f"%{q}%"
+        sonuclar = []
+
+        cursor.execute("SELECT TOP 5 MusteriID, FirmaAdi FROM Musteriler WHERE FirmaAdi LIKE ?", (desen,))
+        for r in cursor.fetchall():
+            sonuclar.append({"tur": "musteri", "id": r[0], "etiket": f"👤 {r[1]} (Müşteri)", "deger": r[1]})
+
+        cursor.execute("SELECT TOP 5 TedarikciID, FirmaAdi FROM Tedarikciler WHERE FirmaAdi LIKE ?", (desen,))
+        for r in cursor.fetchall():
+            sonuclar.append({"tur": "tedarikci", "id": r[0], "etiket": f"🏭 {r[1]} (Tedarikçi)", "deger": r[1]})
+
+        cursor.execute("SELECT TOP 5 StokKod, StokAdi FROM StokKartlari WHERE StokKod LIKE ? OR StokAdi LIKE ?", (desen, desen))
+        for r in cursor.fetchall():
+            sonuclar.append({"tur": "stok", "id": r[0], "etiket": f"📦 {r[1]} ({r[0]})", "deger": r[0]})
+
+        if q.isdigit():
+            cursor.execute("""SELECT TOP 5 s.SiparisID, m.FirmaAdi FROM Siparisler s
+                               JOIN Musteriler m ON s.MusteriID = m.MusteriID WHERE s.SiparisID = ?""", (int(q),))
+        else:
+            cursor.execute("""SELECT TOP 5 s.SiparisID, m.FirmaAdi FROM Siparisler s
+                               JOIN Musteriler m ON s.MusteriID = m.MusteriID WHERE m.FirmaAdi LIKE ?""", (desen,))
+        for r in cursor.fetchall():
+            sonuclar.append({"tur": "siparis", "id": r[0], "etiket": f"🛒 Sipariş #{r[0]} - {r[1]}", "deger": str(r[0])})
+
+        return {"sonuclar": sonuclar}
+    finally:
+        conn.close()
+
 @app.get("/hesap-plani")
 def hesap_plani_getir(user: dict = Depends(get_current_user)):
     conn = get_db_connection()
@@ -5295,6 +5429,11 @@ def tedarikci_ekstre(tedarikci_id: int, user: dict = Depends(yetki_kontrol(["Yö
 
 @app.post("/canliye-gecis-sifirla")
 def canliye_gecis_sifirla(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    """Bu endpoint NisanPlastikERP masaüstü arayüzünden HİÇ ÇAĞRILMAZ - kasıtlı olarak
+    API/Postman/entegratör üzerinden manuel tetiklenmek üzere bırakılmıştır (tüm test
+    verilerini/hareketlerini silip bakiyeleri sıfırlayan, tek seferlik ve YIKICI bir
+    "canlıya geçiş" işlemidir, bu yüzden UI'ya kasıtlı olarak buton konmamıştır).
+    Kullanılmadığından eminseniz güvenle kaldırılabilir."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -5495,11 +5634,29 @@ def kullanici_sifre_degistir(veri: KullaniciSifreDegistir, user: dict = Depends(
     
 
 @app.get("/islem-loglari")
-def islem_loglari_getir(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+def islem_loglari_getir(kullanici: str = None, ara: str = None, gun: int = None,
+                         user: dict = Depends(yetki_kontrol(["Yönetici"]))):
+    """Önceden filtre desteklemiyordu, her zaman son 300 kaydı dönüyordu - arama/filtre
+    ekranı olmadığı için binlerce satır arasında istenen kaydı bulmak pratikte imkansızdı.
+    kullanici/ara/gun verilmezse ESKİ davranış (TOP 300, filtresiz) korunur; herhangi biri
+    verilirse dinamik WHERE (aktivite-listesi'ndeki AYNI desen) uygulanıp TOP 500'e çıkılır."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT TOP 300 LogID, KullaniciAdi, Aciklama, Tarih FROM IslemLoglari ORDER BY Tarih DESC")
+        kosullar, params = [], []
+        if kullanici:
+            kosullar.append("KullaniciAdi LIKE ?"); params.append(f"%{kullanici}%")
+        if ara:
+            kosullar.append("Aciklama LIKE ?"); params.append(f"%{ara}%")
+        if gun and gun > 0:
+            kosullar.append("Tarih >= DATEADD(day, -?, GETDATE())"); params.append(gun)
+
+        top = 500 if kosullar else 300
+        sorgu = f"SELECT TOP {top} LogID, KullaniciAdi, Aciklama, Tarih FROM IslemLoglari"
+        if kosullar:
+            sorgu += " WHERE " + " AND ".join(kosullar)
+        sorgu += " ORDER BY Tarih DESC"
+        cursor.execute(sorgu, params)
         return {"loglar": [{"LogID": r[0], "KullaniciAdi": r[1], "Aciklama": r[2], "Tarih": str(r[3])} for r in cursor.fetchall()]}
     finally:
         conn.close()
@@ -6908,8 +7065,16 @@ def depo_transfer_listesi(user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
+_MALIYET_GIZLI_ROLLER = {"Depo", "Üretim"}
+
 @app.get("/stok-listesi")
 def stok_listesi_getir(user: dict = Depends(get_current_user)):
+    """maliyet_gizli: Depo/Üretim rolü ürün maliyetini ve kâr marjını GÖRMEMELİ (bu iki
+    alan Yönetici/Muhasebe/Satış/Finans/Patron/Master için hassas mali bilgidir) - önceden
+    bu endpoint get_current_user (rol ayrımı yapmayan) ile HERKESE OrtalamaMaliyet/KarMarji
+    döndürüyordu. Alanlar tamamen çıkarılmıyor (JSON şekli sabit kalsın, arayüz kırılmasın),
+    None'a çevriliyor - arayüz bunu '—' olarak gösterir."""
+    maliyet_gizli = user["rol"] in _MALIYET_GIZLI_ROLLER
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -6921,10 +7086,10 @@ def stok_listesi_getir(user: dict = Depends(get_current_user)):
             cursor.execute("SELECT StokKod, StokAdi, Birim, MevcutMiktar, BirimFiyat, ISNULL(MinStokSeviyesi,0), 0, Barkod, ISNULL(RezerveMiktar,0), UrunGrubu, GtipKodu FROM StokKartlari WHERE ISNULL(SilindiMi,0)=0")
         return {"stoklar": [{"StokKod": s[0], "StokAdi": s[1], "Birim": s[2], "MevcutMiktar": float(s[3]) if s[3] is not None else 0,
                               "BirimFiyat": float(s[4]) if s[4] is not None else 0, "MinStokSeviyesi": float(s[5]) if s[5] is not None else 0,
-                              "OrtalamaMaliyet": float(s[6]) if s[6] is not None else 0, "Barkod": s[7] or "",
+                              "OrtalamaMaliyet": None if maliyet_gizli else (float(s[6]) if s[6] is not None else 0), "Barkod": s[7] or "",
                               "RezerveMiktar": float(s[8]) if s[8] is not None else 0, "UrunGrubu": s[9] or "", "GtipKodu": s[10] or "",
                               "KullanilabilirMiktar": (float(s[3]) if s[3] is not None else 0) - (float(s[8]) if s[8] is not None else 0),
-                              "KarMarji": kar_marji_hesapla(float(s[4]), float(s[6]))} for s in cursor.fetchall()]}
+                              "KarMarji": None if maliyet_gizli else kar_marji_hesapla(float(s[4]), float(s[6]))} for s in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -12507,10 +12672,12 @@ def musteri_segment_ata(musteri_id: int, veri: MusteriSegmentAtaRequest, user: d
         conn.close()
 
 @app.get("/kar-marji-analizi")
-def kar_marji_analizi_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe", "Üretim", "Patron"]))):
+def kar_marji_analizi_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe", "Patron"]))):
     """Her ürünün toplam satış tutarı, tahmini maliyeti (OrtalamaMaliyet üzerinden) ve
     kâr marjını hesaplar. En çok satan ürün ile en kârlı ürünün genelde AYNI ürün
-    olmadığını göstermek için hem ciro hem kâr bazında sıralanabilir."""
+    olmadığını göstermek için hem ciro hem kâr bazında sıralanabilir. "Üretim" bilinçli
+    olarak izinli rol listesinden çıkarıldı - kâr marjı/maliyet Depo ile aynı şekilde
+    Üretim rolünden de gizleniyor (bkz. /stok-listesi _MALIYET_GIZLI_ROLLER)."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -13241,6 +13408,25 @@ def banka_hareket_iptal(hareket_id: int, veri: HareketIptalRequest, user: dict =
     finally:
         conn.close()
 
+def _ekstre_satirlarini_kaydet(cursor, hesap_id, satirlar):
+    """/banka-ekstresi-yukle (CSV) VE /banka-api-senkronize (adaptör) ORTAK yazma
+    çekirdeği - ikisi de aynı BankaEkstreSatirlari tablosuna, aynı şekilde satır
+    ekler; sonrasındaki /banka-mutabakat-onerileri akışı kaynağın CSV mi yoksa
+    API mi olduğunu hiç bilmez, hiç değişmeden çalışır. satirlar: [{Tarih, Tutar,
+    Aciklama}, ...] - her sözlükte Tarih/Tutar zaten doğrulanmış/temizlenmiş olmalı."""
+    eklenen = 0
+    for satir in satirlar:
+        try:
+            tarih = str(satir["Tarih"]).strip()
+            tutar = float(str(satir["Tutar"]).strip().replace(",", "."))
+            aciklama = (satir.get("Aciklama") or "").strip()
+        except (KeyError, ValueError, TypeError):
+            continue
+        cursor.execute("""INSERT INTO BankaEkstreSatirlari (HesapID, Tarih, Tutar, Aciklama) VALUES (?, ?, ?, ?)""",
+                       (hesap_id, tarih, tutar, aciklama))
+        eklenen += 1
+    return eklenen
+
 @app.post("/banka-ekstresi-yukle")
 def banka_ekstresi_yukle(hesap_id: int = Form(...), dosya: UploadFile = File(...),
                           user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
@@ -13263,20 +13449,59 @@ def banka_ekstresi_yukle(hesap_id: int = Form(...), dosya: UploadFile = File(...
         cursor.execute("SELECT 1 FROM BankaHesaplari WHERE HesapID=?", (hesap_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="Banka hesabı bulunamadı.")
-        eklenen = 0
-        for satir in satirlar:
-            try:
-                tarih = satir["Tarih"].strip()
-                tutar = float(satir["Tutar"].strip().replace(",", "."))
-                aciklama = (satir.get("Aciklama") or "").strip()
-            except (KeyError, ValueError):
-                continue
-            cursor.execute("""INSERT INTO BankaEkstreSatirlari (HesapID, Tarih, Tutar, Aciklama) VALUES (?, ?, ?, ?)""",
-                           (hesap_id, tarih, tutar, aciklama))
-            eklenen += 1
+        eklenen = _ekstre_satirlarini_kaydet(cursor, hesap_id, satirlar)
         log_islem(cursor, f"Banka ekstresi yüklendi: {dosya.filename} ({eklenen} satır)", user["username"])
         conn.commit()
         return {"mesaj": f"{eklenen} ekstre satırı yüklendi.", "Yuklenen": eklenen, "Toplam": len(satirlar)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+class BankaApiAdaptoru:
+    """Banka API/açık bankacılık entegrasyonu için soyut taban sınıf. Kullanıcının
+    hangi sağlayıcıyı (kurumsal banka API'si, Param/Fintables gibi bir aggregator vb.)
+    kullanacağı bu yazıldığı anda netleşmemişti - bu yüzden gerçek bir HTTP istemcisi
+    YAZILMADI. Sağlayıcı netleşince yapılacak TEK iş: bu sınıftan türeyen, gerçek API'yi
+    çağıran bir alt sınıf yazıp AKTIF_BANKA_ADAPTORU'nu ona işaret ettirmek - geri kalan
+    her şey (mutabakat/öneri/onay akışı, arayüz) zaten hazır ve DEĞİŞMEYECEK."""
+    def hesap_hareketlerini_cek(self, hesap_no: str, baslangic: str, bitis: str) -> list:
+        """Döner: [{"Tarih": "YYYY-AA-GG", "Tutar": float, "Aciklama": str}, ...]"""
+        raise NotImplementedError
+
+class YapilandirilmamisAdaptor(BankaApiAdaptoru):
+    def hesap_hareketlerini_cek(self, hesap_no, baslangic, bitis):
+        raise HTTPException(status_code=501, detail=(
+            "Banka API sağlayıcısı henüz yapılandırılmadı. Şimdilik '📤 Ekstre CSV Yükle' "
+            "ile devam edebilirsiniz - sağlayıcınızı (banka kurumsal API'si, Param/Fintables "
+            "gibi bir açık bankacılık aracısı vb.) belirtirseniz gerçek bağlantı eklenir."
+        ))
+
+AKTIF_BANKA_ADAPTORU = YapilandirilmamisAdaptor()
+
+@app.post("/banka-api-senkronize/{hesap_id}")
+def banka_api_senkronize(hesap_id: int, baslangic: str = None, bitis: str = None,
+                          user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    """/banka-ekstresi-yukle'nin (CSV) otomatik alternatifi - AKTIF_BANKA_ADAPTORU
+    üzerinden hareketleri çekip AYNI _ekstre_satirlarini_kaydet ile BankaEkstreSatirlari'na
+    yazar, ardından mevcut /banka-mutabakat-onerileri akışı hiç değişmeden devam eder.
+    Sağlayıcı henüz yapılandırılmadıysa (varsayılan durum) 501 döner."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT IbanNo FROM BankaHesaplari WHERE HesapID=?", (hesap_id,))
+        satir = cursor.fetchone()
+        if not satir:
+            raise HTTPException(status_code=404, detail="Banka hesabı bulunamadı.")
+        iban_no = satir[0]
+        satirlar = AKTIF_BANKA_ADAPTORU.hesap_hareketlerini_cek(iban_no, baslangic, bitis)
+        eklenen = _ekstre_satirlarini_kaydet(cursor, hesap_id, satirlar)
+        log_islem(cursor, f"Banka API ile senkronize edildi: hesap #{hesap_id} ({eklenen} satır)", user["username"])
+        conn.commit()
+        return {"mesaj": f"{eklenen} ekstre satırı API üzerinden yüklendi.", "Yuklenen": eklenen}
     except HTTPException:
         raise
     except Exception as e:
@@ -14552,37 +14777,46 @@ def personel_listesi_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "İn
     finally:
         conn.close()
 
+def _personel_hareket_isle(cursor, personel_id, islem_turu, tutar, aciklama, hesap_id, kullanici):
+    """personel_hareket_ekle ve /bordro-fisi-olustur ORTAK çekirdeği (aynı /kasa
+    tarafındaki _kasa_hareket_isle deseni) - PersonelHareketleri satırını ekler,
+    Avans/Maaş Ödemesi için kasa/banka bakiyesini gerçekten düşer, ilgili yevmiye
+    fişini atar. Döner: yeni HareketID (bordro fişiyle eşleştirmek için)."""
+    cursor.execute("""INSERT INTO PersonelHareketleri (PersonelID, IslemTuru, Tutar, Aciklama, HesapID)
+                       OUTPUT inserted.HareketID VALUES (?, ?, ?, ?, ?)""",
+                   (personel_id, islem_turu, tutar, aciklama, hesap_id))
+    hareket_id = int(cursor.fetchone()[0])
+
+    if hesap_id and islem_turu in ['Avans', 'Maaş Ödemesi']:
+        cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye - ? WHERE HesapID = ?", (tutar, hesap_id))
+        cursor.execute("INSERT INTO BankaHareketleri (HesapID, IslemTuru, Tutar, Aciklama) VALUES (?, 'Giden Havale', ?, ?)",
+                       (hesap_id, tutar, f"IK İşlemi: {aciklama}"))
+    elif not hesap_id and islem_turu in ['Avans', 'Maaş Ödemesi']:
+        # HesapID verilmezse (nakit ödeme) yevmiyede "100 Kasa" yazılıyordu ama gerçek
+        # Kasalar.Bakiye/KasaHareketleri hiç güncellenmiyordu - Banka dalıyla tutarlı
+        # olması için burada da _kasa_hareket_isle çağrılır (varsayılan TL kasası).
+        cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi='TL'")
+        kasa = cursor.fetchone()
+        if kasa:
+            _kasa_hareket_isle(cursor, kasa[0], "Ödeme", tutar, "Çıkış", f"IK İşlemi: {aciklama}", None, kullanici)
+
+    odeme_hesap_kodu = "102" if hesap_id else "100"
+    yevmiye_haritasi = {
+        "Maaş Tahakkuku": [("770", tutar, 0, "Personel gideri tahakkuku"), ("335", 0, tutar, "Personele Borçlar")],
+        "Avans": [("335", tutar, 0, "Personele Borçlar - avans"), (odeme_hesap_kodu, 0, tutar, "Avans ödemesi")],
+        "Maaş Ödemesi": [("335", tutar, 0, "Personele Borçlar - maaş"), (odeme_hesap_kodu, 0, tutar, "Maaş ödemesi")],
+    }
+    if islem_turu in yevmiye_haritasi:
+        yevmiye_fisi_olustur(cursor, f"Personel {islem_turu}: {aciklama}", "Personel", personel_id,
+                             yevmiye_haritasi[islem_turu], kullanici)
+    return hareket_id
+
 @app.post("/personel-hareket-ekle")
 def personel_hareket_ekle(veri: PersonelHareketEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları"]))):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO PersonelHareketleri (PersonelID, IslemTuru, Tutar, Aciklama, HesapID) VALUES (?, ?, ?, ?, ?)",
-                       (veri.PersonelID, veri.IslemTuru, veri.Tutar, veri.Aciklama, veri.HesapID))
-
-        if veri.HesapID and veri.IslemTuru in ['Avans', 'Maaş Ödemesi']:
-            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye - ? WHERE HesapID = ?", (veri.Tutar, veri.HesapID))
-            cursor.execute("INSERT INTO BankaHareketleri (HesapID, IslemTuru, Tutar, Aciklama) VALUES (?, 'Giden Havale', ?, ?)",
-                           (veri.HesapID, veri.Tutar, f"IK İşlemi: {veri.Aciklama}"))
-        elif not veri.HesapID and veri.IslemTuru in ['Avans', 'Maaş Ödemesi']:
-            # HesapID verilmezse (nakit ödeme) yevmiyede "100 Kasa" yazılıyordu ama gerçek
-            # Kasalar.Bakiye/KasaHareketleri hiç güncellenmiyordu - Banka dalıyla tutarlı
-            # olması için burada da _kasa_hareket_isle çağrılır (varsayılan TL kasası).
-            cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi='TL'")
-            kasa = cursor.fetchone()
-            if kasa:
-                _kasa_hareket_isle(cursor, kasa[0], "Ödeme", veri.Tutar, "Çıkış", f"IK İşlemi: {veri.Aciklama}", None, user["username"])
-
-        odeme_hesap_kodu = "102" if veri.HesapID else "100"
-        yevmiye_haritasi = {
-            "Maaş Tahakkuku": [("770", veri.Tutar, 0, "Personel gideri tahakkuku"), ("335", 0, veri.Tutar, "Personele Borçlar")],
-            "Avans": [("335", veri.Tutar, 0, "Personele Borçlar - avans"), (odeme_hesap_kodu, 0, veri.Tutar, "Avans ödemesi")],
-            "Maaş Ödemesi": [("335", veri.Tutar, 0, "Personele Borçlar - maaş"), (odeme_hesap_kodu, 0, veri.Tutar, "Maaş ödemesi")],
-        }
-        if veri.IslemTuru in yevmiye_haritasi:
-            yevmiye_fisi_olustur(cursor, f"Personel {veri.IslemTuru}: {veri.Aciklama}", "Personel", veri.PersonelID,
-                                 yevmiye_haritasi[veri.IslemTuru], user["username"])
-
+        _personel_hareket_isle(cursor, veri.PersonelID, veri.IslemTuru, veri.Tutar, veri.Aciklama, veri.HesapID, user["username"])
         log_islem(cursor, f"Personel Hareketi: {veri.IslemTuru} - {veri.Tutar} TL", user["username"])
         conn.commit()
         return {"mesaj": "İşlem kaydedildi."}
@@ -14592,52 +14826,58 @@ def personel_hareket_ekle(veri: PersonelHareketEkle, user: dict = Depends(yetki_
     finally:
         conn.close()
 
+def _personel_hareketi_geri_al(cursor, hareket_id, neden, donem_kilit_sifresi, kullanici):
+    """personel_hareket_iptal ve /bordro-fisi-iptal ORTAK storno çekirdeği. Maaş
+    Tahakkuku sadece 770/335 arası bir tahakkuk kaydıdır (kasa/banka çıkışı yok) -
+    Avans/Maaş Ödemesi ise gerçek bir kasa/banka çıkışıdır, HesapID kayıtlıysa o
+    taraf da geri alınır. Kayıt bulunamazsa/zaten iptalse/dönem kilitliyse uygun
+    HTTPException fırlatır. Döner: PersonelID (çağıranın loglamak/kullanmak isteyebileceği)."""
+    cursor.execute("""SELECT PersonelID, IslemTuru, Tutar, Aciklama, ISNULL(Durum,'Aktif'), Tarih, HesapID
+                       FROM PersonelHareketleri WHERE HareketID=?""", (hareket_id,))
+    satir = cursor.fetchone()
+    if not satir:
+        raise HTTPException(status_code=404, detail="Personel hareketi bulunamadı.")
+    personel_id, islem_turu, tutar, aciklama, durum, tarih, hesap_id = satir
+    if durum == "İptal":
+        raise HTTPException(status_code=400, detail="Bu personel hareketi zaten iptal edilmiş.")
+    if islem_turu not in ("Maaş Tahakkuku", "Avans", "Maaş Ödemesi"):
+        raise HTTPException(status_code=400, detail=f"'{islem_turu}' türündeki bir kayıt otomatik iptal edilemez.")
+
+    hareket_tarihi = tarih.date() if hasattr(tarih, "date") else tarih
+    if donem_kilitli_mi(cursor, hareket_tarihi.year, hareket_tarihi.month):
+        if not donem_kilit_sifresi or not _donem_kilit_sifresi_dogrula(cursor, donem_kilit_sifresi):
+            raise HTTPException(status_code=403, detail=f"{hareket_tarihi.year}-{hareket_tarihi.month:02d} dönemi kilitli - iptal için doğru dönem kilit şifresi gerekli.")
+
+    cursor.execute("UPDATE PersonelHareketleri SET Durum='İptal', IptalTarihi=GETDATE(), IptalEden=?, IptalNedeni=? WHERE HareketID=?",
+                   (kullanici, neden, hareket_id))
+
+    odeme_hesap_kodu = "102" if hesap_id else "100"
+    if islem_turu in ("Avans", "Maaş Ödemesi"):
+        if hesap_id:
+            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID=?", (tutar, hesap_id))
+            cursor.execute("INSERT INTO BankaHareketleri (HesapID, IslemTuru, Tutar, Aciklama) VALUES (?, 'Gelen Havale', ?, ?)",
+                           (hesap_id, tutar, f"Personel İptali: {islem_turu} - {neden}"))
+        else:
+            cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi='TL'")
+            kasa = cursor.fetchone()
+            if kasa:
+                _kasa_hareket_isle(cursor, kasa[0], "Tahsilat", tutar, "Giriş", f"Personel İptali: {islem_turu} - {neden}", None, kullanici)
+        yevmiye_satirlari = [(odeme_hesap_kodu, tutar, 0, f"{islem_turu} iptali (storno)"), ("335", 0, tutar, "Personele Borçlar (storno)")]
+    else:  # Maaş Tahakkuku
+        yevmiye_satirlari = [("335", tutar, 0, "Personele Borçlar (storno)"), ("770", 0, tutar, "Personel gideri tahakkuku iptali")]
+
+    yevmiye_fisi_olustur(cursor, f"Personel Hareketi İptali: {islem_turu} - {neden}", "PersonelIptal", hareket_id,
+                         yevmiye_satirlari, kullanici)
+    log_islem(cursor, f"Personel hareketi iptal edildi: #{hareket_id} - {neden}", kullanici)
+    return personel_id
+
 @app.put("/personel-hareket-iptal/{hareket_id}")
 def personel_hareket_iptal(hareket_id: int, veri: HareketIptalRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "İnsan Kaynakları"]))):
-    """Diğer iptal endpoint'leriyle AYNI storno deseni. Maaş Tahakkuku sadece 770/335
-    arası bir tahakkuk kaydıdır (kasa/banka çıkışı yok) - Avans/Maaş Ödemesi ise
-    gerçek bir kasa/banka çıkışıdır, HesapID kayıtlıysa (personel_hareket_ekle artık
-    saklıyor) o taraf da geri alınır."""
+    """Diğer iptal endpoint'leriyle AYNI storno deseni - gövde _personel_hareketi_geri_al'a taşındı."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("""SELECT PersonelID, IslemTuru, Tutar, Aciklama, ISNULL(Durum,'Aktif'), Tarih, HesapID
-                           FROM PersonelHareketleri WHERE HareketID=?""", (hareket_id,))
-        satir = cursor.fetchone()
-        if not satir:
-            raise HTTPException(status_code=404, detail="Personel hareketi bulunamadı.")
-        personel_id, islem_turu, tutar, aciklama, durum, tarih, hesap_id = satir
-        if durum == "İptal":
-            raise HTTPException(status_code=400, detail="Bu personel hareketi zaten iptal edilmiş.")
-        if islem_turu not in ("Maaş Tahakkuku", "Avans", "Maaş Ödemesi"):
-            raise HTTPException(status_code=400, detail=f"'{islem_turu}' türündeki bir kayıt otomatik iptal edilemez.")
-
-        hareket_tarihi = tarih.date() if hasattr(tarih, "date") else tarih
-        if donem_kilitli_mi(cursor, hareket_tarihi.year, hareket_tarihi.month):
-            if not veri.DonemKilitSifresi or not _donem_kilit_sifresi_dogrula(cursor, veri.DonemKilitSifresi):
-                raise HTTPException(status_code=403, detail=f"{hareket_tarihi.year}-{hareket_tarihi.month:02d} dönemi kilitli - iptal için doğru dönem kilit şifresi gerekli.")
-
-        cursor.execute("UPDATE PersonelHareketleri SET Durum='İptal', IptalTarihi=GETDATE(), IptalEden=?, IptalNedeni=? WHERE HareketID=?",
-                       (user["username"], veri.Neden, hareket_id))
-
-        odeme_hesap_kodu = "102" if hesap_id else "100"
-        if islem_turu in ("Avans", "Maaş Ödemesi"):
-            if hesap_id:
-                cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID=?", (tutar, hesap_id))
-                cursor.execute("INSERT INTO BankaHareketleri (HesapID, IslemTuru, Tutar, Aciklama) VALUES (?, 'Gelen Havale', ?, ?)",
-                               (hesap_id, tutar, f"Personel İptali: {islem_turu} - {veri.Neden}"))
-            else:
-                cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi='TL'")
-                kasa = cursor.fetchone()
-                if kasa:
-                    _kasa_hareket_isle(cursor, kasa[0], "Tahsilat", tutar, "Giriş", f"Personel İptali: {islem_turu} - {veri.Neden}", None, user["username"])
-            yevmiye_satirlari = [(odeme_hesap_kodu, tutar, 0, f"{islem_turu} iptali (storno)"), ("335", 0, tutar, "Personele Borçlar (storno)")]
-        else:  # Maaş Tahakkuku
-            yevmiye_satirlari = [("335", tutar, 0, "Personele Borçlar (storno)"), ("770", 0, tutar, "Personel gideri tahakkuku iptali")]
-
-        yevmiye_fisi_olustur(cursor, f"Personel Hareketi İptali: {islem_turu} - {veri.Neden}", "PersonelIptal", hareket_id,
-                             yevmiye_satirlari, user["username"])
-        log_islem(cursor, f"Personel hareketi iptal edildi: #{hareket_id} - {veri.Neden}", user["username"])
+        _personel_hareketi_geri_al(cursor, hareket_id, veri.Neden, veri.DonemKilitSifresi, user["username"])
         conn.commit()
         return {"mesaj": "Personel hareketi iptal edildi, ters muhasebe kaydı atıldı."}
     except HTTPException:
@@ -14725,6 +14965,295 @@ def bordro_hesapla(veri: BordroHesaplaRequest, user: dict = Depends(yetki_kontro
     sonuc = _bordro_hesapla_ic(veri.BrutMaas, oranlar)
     sonuc["Not"] = "Bu tahmini bir hesaplamadır; kümülatif yıllık matrah dikkate alınmaz. Kesin tutarlar için mali müşavirinize danışın."
     return sonuc
+
+class BordroFisiOlusturRequest(BaseModel):
+    PersonelID: int
+    Yil: int
+    Ay: int = Field(ge=1, le=12)
+    PrimEkOdeme: float = Field(default=0, ge=0)
+    IcraTutari: float = Field(default=0, ge=0)
+
+def _tek_bordro_fisi_olustur(cursor, personel_id: int, yil: int, ay: int, prim: float, icra: float, kullanici: str):
+    """/bordro-fisi-olustur VE /bordro-fisi-toplu-olustur tarafından paylaşılan çekirdek
+    mantık - tek bir personel için kırılımı hesaplar, 'Maaş Tahakkuku' hareketini düşer
+    ve BordroFisleri satırını ekler. Commit/rollback çağıranın sorumluluğundadır (toplu
+    oluşturmada her personel kendi commit/rollback'ini ayrı yönetir - biri başarısız
+    olursa diğerlerinin işlemini geri almasın diye)."""
+    cursor.execute("SELECT AdSoyad, BrutMaas FROM Personeller WHERE PersonelID=?", (personel_id,))
+    personel = cursor.fetchone()
+    if not personel:
+        raise HTTPException(status_code=404, detail="Personel bulunamadı.")
+    ad_soyad, brut_maas = personel
+    if not brut_maas or brut_maas <= 0:
+        raise HTTPException(status_code=400, detail=f"{ad_soyad} için Brüt Maaş kayıtlı değil - önce personel kartından girin.")
+
+    cursor.execute("SELECT BordroID FROM BordroFisleri WHERE PersonelID=? AND Yil=? AND Ay=? AND Durum='Aktif'",
+                   (personel_id, yil, ay))
+    if cursor.fetchone():
+        raise HTTPException(status_code=400, detail=f"{ad_soyad} için {yil}-{ay:02d} döneminde zaten aktif bir bordro fişi var.")
+
+    oranlar = bordro_oranlarini_getir()
+    h = _bordro_hesapla_ic(float(brut_maas) + prim, oranlar)
+
+    icra_uygulanan = min(icra, h["NetMaas"] * 0.25)
+    if icra > icra_uygulanan:
+        h["IcraUyarisi"] = (f"Talep edilen icra kesintisi ({icra:,.2f} TL) yasal üst sınırı "
+                             f"(net maaşın %25'i = {icra_uygulanan:,.2f} TL) aşıyor - sadece sınır kadar uygulandı. "
+                             f"Bu basit bir tahmindir, nafaka gibi istisnalar için mali müşavirinize danışın.")
+    h["PrimEkOdeme"] = prim
+    h["IcraKesintisi"] = icra_uygulanan
+    h["EleGecenNetMaas"] = h["NetMaas"] - icra_uygulanan
+
+    hareket_id = _personel_hareket_isle(cursor, personel_id, "Maaş Tahakkuku", h["BrutMaas"],
+                                        f"Bordro Fişi {yil}-{ay:02d}", None, kullanici)
+
+    cursor.execute("""INSERT INTO BordroFisleri (PersonelID, Yil, Ay, BrutMaas, SgkIscisi, IssizlikIscisi,
+                           GelirVergisiMatrahi, GelirVergisi, DamgaVergisi, NetMaas, IsverenSgkMaliyeti,
+                           ToplamIsverenMaliyeti, PersonelHareketID, OlusturanKullanici,
+                           PrimEkOdeme, IcraKesintisi, EleGecenNetMaas)
+                       OUTPUT inserted.BordroID
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (personel_id, yil, ay, h["BrutMaas"], h["SgkIscisi"], h["IssizlikIscisi"],
+                    h["GelirVergisiMatrahi"], h["GelirVergisi"], h["DamgaVergisi"], h["NetMaas"],
+                    h["IsverenSgkMaliyeti"], h["ToplamIsverenMaliyeti"], hareket_id, kullanici,
+                    prim, icra_uygulanan, h["EleGecenNetMaas"]))
+    bordro_id = int(cursor.fetchone()[0])
+    return ad_soyad, h, bordro_id
+
+@app.post("/bordro-fisi-olustur")
+def bordro_fisi_olustur(veri: BordroFisiOlusturRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları"]))):
+    """/bordro-hesapla'nın (TASLAK, resmi değil) sonucunu belirli bir Yıl/Ay için
+    KALICI bir 'Bordro Fişi' kaydına dönüştürür: BordroFisleri'ne kırılımı yazar ve
+    _personel_hareket_isle ile 'Maaş Tahakkuku' PersonelHareketleri satırını (770/335
+    yevmiye kaydıyla birlikte) otomatik düşer. Aynı (Personel,Yıl,Ay) için ikinci kez
+    fiş kesilemez (UNIQUE kısıtı + burada 400 ile açık mesaj).
+
+    PrimEkOdeme SGK/vergiye tabi ek brüt olarak hesaba katılır (prim de brüt maaşın
+    parçasıdır) - _bordro_hesapla_ic'e (brut+prim) verilir, yevmiyeye de bu toplam
+    yazılır. IcraTutari ise NET maaştan BİLGİ AMAÇLI düşülür - İİK md.83 genel kuralı
+    (maaşın 1/4'ü haczedilebilir, nafaka gibi istisnalar bu TASLAK aracın kapsamı
+    dışında) kabaca uygulanır; talep sınırı aşarsa işlem YİNE DE tamamlanır, sadece
+    IcraUyarisi ile bilgilendirilir. İcra kesintisinin GERÇEK bir muhasebe/yevmiye
+    etkisi YOKTUR - gerçek icra ödemesi ayrı bir Masraf/Kasa kaydı olarak girilmelidir."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        ad_soyad, h, bordro_id = _tek_bordro_fisi_olustur(cursor, veri.PersonelID, veri.Yil, veri.Ay,
+                                                           veri.PrimEkOdeme, veri.IcraTutari, user["username"])
+        log_islem(cursor, f"Bordro fişi kesildi: {ad_soyad} {veri.Yil}-{veri.Ay:02d} (Net: {h['NetMaas']:.2f} TL)", user["username"])
+        conn.commit()
+        h["BordroID"] = bordro_id
+        h["Not"] = "Bu tahmini bir hesaplamadır; kümülatif yıllık matrah dikkate alınmaz. Kesin tutarlar için mali müşavirinize danışın."
+        return {"mesaj": f"{ad_soyad} için {veri.Yil}-{veri.Ay:02d} bordro fişi kesildi.", "detay": h}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+class BordroFisiTopluOlusturRequest(BaseModel):
+    Yil: int
+    Ay: int = Field(ge=1, le=12)
+
+@app.post("/bordro-fisi-toplu-olustur")
+def bordro_fisi_toplu_olustur(veri: BordroFisiTopluOlusturRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları"]))):
+    """Tüm personel için tek seferde o dönemin bordro fişini keser - 5 kişilik ekipte
+    bile her ay her personeli tek tek Personel ID girip kesmek gereksiz tekrarlı iş
+    yaratıyordu. Prim/icra içermez (bunlar istisnai, kişiye özel - hâlâ tekli akıştan
+    girilir). Brüt Maaşı olmayan veya o dönem için zaten aktif fişi olan personel
+    HATA VERMEDEN atlanır, sonuç özetinde 'atlanan' listesinde nedeniyle raporlanır -
+    tek bir personelin durumu diğerlerinin kesilmesini engellemesin diye her personel
+    kendi commit/rollback'ini ayrı yönetir."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT PersonelID, AdSoyad FROM Personeller ORDER BY AdSoyad")
+        personeller = cursor.fetchall()
+    finally:
+        conn.close()
+
+    basarili, atlanan = [], []
+    for personel_id, ad_soyad_varsayilan in personeller:
+        conn2 = get_db_connection()
+        cursor2 = conn2.cursor()
+        try:
+            ad_soyad, h, bordro_id = _tek_bordro_fisi_olustur(cursor2, personel_id, veri.Yil, veri.Ay, 0, 0, user["username"])
+            log_islem(cursor2, f"Bordro fişi kesildi (toplu): {ad_soyad} {veri.Yil}-{veri.Ay:02d} (Net: {h['NetMaas']:.2f} TL)", user["username"])
+            conn2.commit()
+            basarili.append({"PersonelID": personel_id, "AdSoyad": ad_soyad, "BordroID": bordro_id, "NetMaas": h["NetMaas"]})
+        except HTTPException as e:
+            conn2.rollback()
+            atlanan.append({"PersonelID": personel_id, "AdSoyad": ad_soyad_varsayilan, "Neden": e.detail})
+        except Exception as e:
+            conn2.rollback()
+            atlanan.append({"PersonelID": personel_id, "AdSoyad": ad_soyad_varsayilan, "Neden": str(e)})
+        finally:
+            conn2.close()
+
+    return {"mesaj": f"{veri.Yil}-{veri.Ay:02d} dönemi için {len(basarili)} fiş kesildi, {len(atlanan)} personel atlandı.",
+            "basarili": basarili, "atlanan": atlanan}
+
+@app.get("/bordro-fisi-listesi")
+def bordro_fisi_listesi_getir(yil: int = None, ay: int = None, personel_id: int = None,
+                               user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        kosullar, params = [], []
+        if yil:
+            kosullar.append("b.Yil = ?"); params.append(yil)
+        if ay:
+            kosullar.append("b.Ay = ?"); params.append(ay)
+        if personel_id:
+            kosullar.append("b.PersonelID = ?"); params.append(personel_id)
+        sorgu = """SELECT b.BordroID, p.AdSoyad, b.Yil, b.Ay, b.BrutMaas, b.NetMaas, b.ToplamIsverenMaliyeti,
+                          ISNULL(b.Durum,'Aktif'), b.OlusturmaTarihi
+                   FROM BordroFisleri b JOIN Personeller p ON b.PersonelID = p.PersonelID"""
+        if kosullar:
+            sorgu += " WHERE " + " AND ".join(kosullar)
+        sorgu += " ORDER BY b.Yil DESC, b.Ay DESC, p.AdSoyad"
+        cursor.execute(sorgu, params)
+        return {"fisler": [{"BordroID": r[0], "AdSoyad": r[1], "Yil": r[2], "Ay": r[3], "BrutMaas": float(r[4]),
+                             "NetMaas": float(r[5]), "ToplamIsverenMaliyeti": float(r[6]), "Durum": r[7],
+                             "OlusturmaTarihi": str(r[8])[:16]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+def _bordro_fisi_detay_sorgula(cursor, bordro_id: int):
+    """JSON endpoint'i ve PDF endpoint'i tarafından paylaşılan sorgu - iki yerde
+    aynı SELECT'i tekrar yazmamak için."""
+    cursor.execute("""SELECT b.BordroID, p.AdSoyad, b.Yil, b.Ay, b.BrutMaas, b.PrimEkOdeme, b.SgkIscisi,
+                              b.IssizlikIscisi, b.GelirVergisiMatrahi, b.GelirVergisi, b.DamgaVergisi, b.NetMaas,
+                              b.IcraKesintisi, b.EleGecenNetMaas, b.IsverenSgkMaliyeti, b.ToplamIsverenMaliyeti,
+                              ISNULL(b.Durum,'Aktif'), b.IptalTarihi, b.IptalEden, b.IptalNedeni,
+                              b.OlusturanKullanici, b.OlusturmaTarihi
+                       FROM BordroFisleri b JOIN Personeller p ON b.PersonelID = p.PersonelID
+                       WHERE b.BordroID = ?""", (bordro_id,))
+    r = cursor.fetchone()
+    if not r:
+        raise HTTPException(status_code=404, detail="Bordro fişi bulunamadı.")
+    return {"BordroID": r[0], "AdSoyad": r[1], "Yil": r[2], "Ay": r[3], "BrutMaas": float(r[4]),
+            "PrimEkOdeme": float(r[5]), "SgkIscisi": float(r[6]), "IssizlikIscisi": float(r[7]),
+            "GelirVergisiMatrahi": float(r[8]), "GelirVergisi": float(r[9]), "DamgaVergisi": float(r[10]),
+            "NetMaas": float(r[11]), "IcraKesintisi": float(r[12]),
+            "EleGecenNetMaas": float(r[13]) if r[13] is not None else float(r[11]),
+            "IsverenSgkMaliyeti": float(r[14]), "ToplamIsverenMaliyeti": float(r[15]), "Durum": r[16],
+            "IptalTarihi": str(r[17])[:16] if r[17] else None, "IptalEden": r[18], "IptalNedeni": r[19],
+            "OlusturanKullanici": r[20], "OlusturmaTarihi": str(r[21])[:16]}
+
+@app.get("/bordro-fisi-detay/{bordro_id}")
+def bordro_fisi_detay_getir(bordro_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        return _bordro_fisi_detay_sorgula(cursor, bordro_id)
+    finally:
+        conn.close()
+
+@app.get("/bordro-fisi-hareketten/{hareket_id}")
+def bordro_fisi_hareketten_bul(hareket_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları", "Muhasebe"]))):
+    """"Son Personel İşlemleri" listesindeki bir 'Maaş Tahakkuku' satırının, ona
+    karşılık gelen KALICI BordroFisleri kaydını bulmak için - kullanıcı iki listeyi
+    (personel hareketleri vs. bordro fişleri) sürekli karıştırdığı için, hareket
+    detayından doğrudan ilgili bordro fişine köprü kurulabilsin diye eklendi."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT BordroID FROM BordroFisleri WHERE PersonelHareketID=?", (hareket_id,))
+        r = cursor.fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Bu işlemle ilişkili bir bordro fişi bulunamadı.")
+        return {"BordroID": r[0]}
+    finally:
+        conn.close()
+
+@app.get("/bordro-fisi-pdf/{bordro_id}")
+def bordro_fisi_pdf(bordro_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları", "Muhasebe"]))):
+    """Kesilen bir bordro fişinin yazdırılabilir/imzalanabilir tek sayfalık PDF
+    dökümü - müşteri 360 özeti (main.py:11075) ile AYNI pdf_* yardımcı
+    fonksiyonlarını kullanır, kurumsal görünüm tutarlı kalsın diye."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        d = _bordro_fisi_detay_sorgula(cursor, bordro_id)
+
+        pdf = FPDF()
+        pdf.add_page()
+        font = pdf_unicode_font_yukle(pdf)
+        pdf_filigran_ekle(pdf)
+        pdf_profesyonel_baslik(pdf, "BORDRO FISI (TASLAK)", f"BRD-{d['BordroID']}",
+                                f"{d['Yil']}-{d['Ay']:02d}",
+                                [f"Personel: {d['AdSoyad']}", f"Durum: {d['Durum']}"], font,
+                                bolum_basligi="PERSONEL BILGILERI")
+
+        satirlar = [
+            ("Brut Maas", d["BrutMaas"]), ("Prim / Ek Odeme", d["PrimEkOdeme"]),
+            ("SGK Isci Payi", -d["SgkIscisi"]), ("Issizlik Sigortasi (Isci)", -d["IssizlikIscisi"]),
+            ("Gelir Vergisi Matrahi", d["GelirVergisiMatrahi"]), ("Gelir Vergisi", -d["GelirVergisi"]),
+            ("Damga Vergisi", -d["DamgaVergisi"]), ("Net Maas", d["NetMaas"]),
+            ("Icra Kesintisi", -d["IcraKesintisi"]), ("Ele Gecen Net", d["EleGecenNetMaas"]),
+            ("Isveren SGK Maliyeti", d["IsverenSgkMaliyeti"]), ("Toplam Isveren Maliyeti", d["ToplamIsverenMaliyeti"]),
+        ]
+        pdf_tablo_basligi(pdf, [("Kalem", 120, "L"), ("Tutar (TL)", 70, "R")], font)
+        for idx, (ad, tutar) in enumerate(satirlar):
+            pdf_tablo_satiri(pdf, [(ad, 120, "L"), (f"{tutar:,.2f}", 70, "R")], idx, font)
+        pdf.ln(6)
+
+        pdf.set_font(font, "", 9)
+        pdf.multi_cell(0, 5, "Bu belge tahmini bir hesaplamadir; kumulatif yillik matrah dikkate alinmaz. "
+                              "Resmi bordro degildir, kesin tutarlar icin mali musavirinize danisin.")
+        if d["Durum"] == "İptal":
+            pdf.ln(2)
+            pdf.set_text_color(200, 50, 50)
+            pdf.multi_cell(0, 5, f"IPTAL EDILDI - {d.get('IptalTarihi') or '-'} ({d.get('IptalEden') or '-'}): {d.get('IptalNedeni') or '-'}")
+            pdf.set_text_color(0, 0, 0)
+
+        pdf_footer_ekle(pdf, font_ailesi=font)
+
+        os.makedirs("BordroFisleri", exist_ok=True)
+        pdf_yolu = os.path.join("BordroFisleri", f"Bordro_{bordro_id}.pdf")
+        pdf.output(pdf_yolu)
+        return FileResponse(pdf_yolu, media_type="application/pdf", filename=os.path.basename(pdf_yolu))
+    except HTTPException:
+        raise
+    finally:
+        conn.close()
+
+@app.put("/bordro-fisi-iptal/{bordro_id}")
+def bordro_fisi_iptal(bordro_id: int, veri: HareketIptalRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "İnsan Kaynakları"]))):
+    """Bordro fişini VE bağlı PersonelHareketleri (Maaş Tahakkuku) kaydını AYNI ANDA
+    storno eder - _personel_hareketi_geri_al ile personel_hareket_iptal ile birebir
+    aynı mantık (dönem kilidi dahil) kullanılır, kod tekrarı yok."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT PersonelHareketID, ISNULL(Durum,'Aktif') FROM BordroFisleri WHERE BordroID=?", (bordro_id,))
+        satir = cursor.fetchone()
+        if not satir:
+            raise HTTPException(status_code=404, detail="Bordro fişi bulunamadı.")
+        hareket_id, durum = satir
+        if durum == "İptal":
+            raise HTTPException(status_code=400, detail="Bu bordro fişi zaten iptal edilmiş.")
+
+        if hareket_id:
+            _personel_hareketi_geri_al(cursor, hareket_id, f"Bordro fişi iptali: {veri.Neden}", veri.DonemKilitSifresi, user["username"])
+
+        cursor.execute("UPDATE BordroFisleri SET Durum='İptal', IptalTarihi=GETDATE(), IptalEden=?, IptalNedeni=? WHERE BordroID=?",
+                       (user["username"], veri.Neden, bordro_id))
+        log_islem(cursor, f"Bordro fişi iptal edildi: #{bordro_id} - {veri.Neden}", user["username"])
+        conn.commit()
+        return {"mesaj": "Bordro fişi iptal edildi, ilişkili personel hareketi de geri alındı."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
 
 @app.get("/muhtasar-beyanname-taslak")
 def muhtasar_beyanname_taslak(yil: int, ay: int, user: dict = Depends(yetki_kontrol(["Yönetici", "İnsan Kaynakları", "Muhasebe"]))):
@@ -14872,6 +15401,11 @@ def excel_olustur(baslik, kolonlar, satirlar):
 
 
 # --- EXCEL'E AKTARMA ----------------------------------------------
+# Aşağıdaki 4 endpoint NisanPlastikERP masaüstü arayüzünden HİÇ ÇAĞRILMAZ - arayüz
+# kendi yerel "tabloyu_excele_aktar" fonksiyonuyla (ekranda o an görüneni doğrudan
+# CSV'ye yazar) dışa aktarma yapıyor. Bunlar kasıtlı olarak API/Postman/entegratör
+# üzerinden sunucu taraflı, biçimlendirilmiş gerçek .xlsx üretimi için bırakılmıştır.
+# Kullanılmadığından eminseniz güvenle kaldırılabilir.
 @app.get("/disa-aktar/stok")
 def disa_aktar_stok(user: dict = Depends(get_current_user)):
     conn = get_db_connection()

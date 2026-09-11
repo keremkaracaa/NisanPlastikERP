@@ -4299,3 +4299,379 @@ class TestIrsaliyeDetay:
         yetkisiz_client = TestClient(main.app)
         yanit = yetkisiz_client.get("/irsaliye-detay/1")
         assert yanit.status_code in (401, 403)
+
+
+class TestBordroFisiOlustur:
+    """/bordro-fisi-olustur ÖNCEDEN yoktu - /bordro-hesapla sadece TASLAK bir hesap
+    makinesiydi, hiçbir kayıt saklamıyordu. Bu artık kalıcı bir BordroFisleri kaydı +
+    otomatik 'Maaş Tahakkuku' PersonelHareketleri satırı oluşturur."""
+
+    def test_personel_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/bordro-fisi-olustur", json={"PersonelID": 999, "Yil": 2026, "Ay": 3})
+        assert yanit.status_code == 404
+
+    def test_brut_maas_kayitli_degilse_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("Ahmet Yilmaz", None))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/bordro-fisi-olustur", json={"PersonelID": 1, "Yil": 2026, "Ay": 3})
+        assert yanit.status_code == 400
+
+    def test_ayni_ay_icin_ikinci_kez_fis_kesilemez(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("Ahmet Yilmaz", 30000.0),  # Personeller
+            (5,),  # BordroFisleri - zaten aktif bir kayit var
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/bordro-fisi-olustur", json={"PersonelID": 1, "Yil": 2026, "Ay": 3})
+        assert yanit.status_code == 400
+
+    def test_basarili_fis_olusturma_personel_hareketi_ve_yevmiye_atar(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("Ahmet Yilmaz", 30000.0),  # Personeller
+            None,  # BordroFisleri - aktif kayit yok
+            (10,),  # _personel_hareket_isle: PersonelHareketleri OUTPUT HareketID
+            (1,),  # yevmiye_fisi_olustur FisID
+            (1,),  # BordroFisleri OUTPUT BordroID
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/bordro-fisi-olustur", json={"PersonelID": 1, "Yil": 2026, "Ay": 3})
+        assert yanit.status_code == 200
+        detay = yanit.json()["detay"]
+        assert detay["BrutMaas"] == 30000.0
+        assert detay["NetMaas"] < detay["BrutMaas"]
+        insert_pers = [c for c in cursor.execute.call_args_list if "INTO PersonelHareketleri" in c.args[0]][0]
+        assert "Maaş Tahakkuku" in insert_pers.args[1]
+        insert_bordro = [c for c in cursor.execute.call_args_list if "INTO BordroFisleri" in c.args[0]]
+        assert len(insert_bordro) == 1
+
+    def test_prim_ek_odeme_bruit_maasa_eklenir(self, client, monkeypatch):
+        """Prim SGK/vergiye tabi ek brüt olarak hesaba katılmalı - personelin kayıtlı
+        30000 brüt maaşına 5000 prim eklenince fişteki BrutMaas 35000 olmalı."""
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("Ahmet Yilmaz", 30000.0),
+            None,
+            (10,),
+            (1,),
+            (1,),
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/bordro-fisi-olustur", json={"PersonelID": 1, "Yil": 2026, "Ay": 3, "PrimEkOdeme": 5000})
+        assert yanit.status_code == 200
+        detay = yanit.json()["detay"]
+        assert detay["BrutMaas"] == 35000.0
+        assert detay["PrimEkOdeme"] == 5000.0
+
+    def test_icra_yasal_siniri_asarsa_uyariyla_sinirlanir(self, client, monkeypatch):
+        """İcra kesintisi net maaşın %25'ini aşarsa işlem YİNE DE tamamlanmalı, sadece
+        sınıra kadar uygulanıp IcraUyarisi ile bilgilendirilmeli."""
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("Ahmet Yilmaz", 30000.0),
+            None,
+            (10,),
+            (1,),
+            (1,),
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/bordro-fisi-olustur", json={"PersonelID": 1, "Yil": 2026, "Ay": 3, "IcraTutari": 1000000})
+        assert yanit.status_code == 200
+        detay = yanit.json()["detay"]
+        assert "IcraUyarisi" in detay
+        assert detay["IcraKesintisi"] == pytest.approx(detay["NetMaas"] * 0.25)
+        assert detay["EleGecenNetMaas"] == pytest.approx(detay["NetMaas"] - detay["IcraKesintisi"])
+
+    def test_icra_sinir_altindaysa_uyari_verilmez(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("Ahmet Yilmaz", 30000.0),
+            None,
+            (10,),
+            (1,),
+            (1,),
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/bordro-fisi-olustur", json={"PersonelID": 1, "Yil": 2026, "Ay": 3, "IcraTutari": 100})
+        assert yanit.status_code == 200
+        detay = yanit.json()["detay"]
+        assert "IcraUyarisi" not in detay
+        assert detay["IcraKesintisi"] == 100.0
+
+
+class TestBordroFisiTopluOlustur:
+    """/bordro-fisi-toplu-olustur ÖNCEDEN yoktu - her ay her personel için tek tek
+    Personel ID girip kesmek gerekiyordu (kullanıcı bildirimi: "bulk bordro kesme").
+    Çekirdek hesaplama mantığı (_tek_bordro_fisi_olustur) zaten TestBordroFisiOlustur
+    tarafından test edildiği için burada SADECE bu endpoint'in kendi orkestrasyon
+    davranışı (personel listesi üzerinde dönme, başarılı/atlanan ayrımı) test edilir -
+    _tek_bordro_fisi_olustur mock'lanarak gerçek SQL akışından izole edilir."""
+
+    def test_basarili_ve_atlanan_ayrimi_dogru_raporlanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[(1, "Ahmet Yılmaz"), (2, "Ayşe Kaya")])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        def sahte_tek_olustur(cursor, personel_id, yil, ay, prim, icra, kullanici):
+            if personel_id == 1:
+                return "Ahmet Yılmaz", {"NetMaas": 25000.0}, 10
+            raise main.HTTPException(status_code=400, detail="Brüt Maaş kayıtlı değil.")
+        monkeypatch.setattr(main, "_tek_bordro_fisi_olustur", sahte_tek_olustur)
+        monkeypatch.setattr(main, "log_islem", lambda *a, **k: None)
+
+        yanit = client.post("/bordro-fisi-toplu-olustur", json={"Yil": 2026, "Ay": 3})
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert len(veri["basarili"]) == 1
+        assert veri["basarili"][0]["PersonelID"] == 1
+        assert veri["basarili"][0]["NetMaas"] == 25000.0
+        assert len(veri["atlanan"]) == 1
+        assert veri["atlanan"][0]["PersonelID"] == 2
+        assert "Brüt Maaş" in veri["atlanan"][0]["Neden"]
+
+    def test_personel_yoksa_bos_sonuc_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/bordro-fisi-toplu-olustur", json={"Yil": 2026, "Ay": 3})
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["basarili"] == []
+        assert veri["atlanan"] == []
+
+
+class TestGenelArama:
+    """/genel-arama ÖNCEDEN yoktu - "Her yere git" arama kutusu placeholder'ı
+    ("Örn: lot, fiyat listesi, sipariş, 1") gerçek kayıt aramasını vaat ediyordu ama
+    sadece ekran/modül adlarını arıyordu (kullanıcı bildirimi: gerçek arama)."""
+
+    def test_kisa_sorgu_bos_sonuc_doner(self, client):
+        yanit = client.get("/genel-arama", params={"q": "a"})
+        assert yanit.status_code == 200
+        assert yanit.json()["sonuclar"] == []
+
+    def test_musteri_ve_stok_eslesmeleri_birlikte_doner(self, client, monkeypatch):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [(5, "ABC Plastik")],  # Musteriler
+            [],                    # Tedarikciler
+            [("PP-001", "Polipropilen ABC")],  # StokKartlari
+            [],                    # Siparisler (musteri adina gore)
+        ]
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/genel-arama", params={"q": "ABC"})
+        assert yanit.status_code == 200
+        sonuclar = yanit.json()["sonuclar"]
+        turler = {s["tur"] for s in sonuclar}
+        assert turler == {"musteri", "stok"}
+
+
+class TestBordroFisiDetay:
+    """/bordro-fisi-detay ÖNCEDEN yoktu - masaüstü arayüzde kesilen bir bordro
+    fişine tıklandığında hiçbir şey açılmıyordu (kullanıcı bildirimi: "kesilen
+    bordro fişi açılmıyor"). Bu endpoint çift-tıklama detay penceresi içindir."""
+
+    def test_bulunamayan_fis_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/bordro-fisi-detay/999")
+        assert yanit.status_code == 404
+
+    def test_basarili_detay_tum_alanlari_dondurur(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(
+            1, "Ali Veli", 2026, 3, 32000.0, 2000.0, 4760.0, 340.0, 27900.0, 4185.0, 25.79,
+            22688.21, 5000.0, 17688.21, 5610.0, 37610.0, "Aktif", None, None, None, "kerem", "2026-03-01 10:00:00"))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/bordro-fisi-detay/1")
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["AdSoyad"] == "Ali Veli"
+        assert veri["EleGecenNetMaas"] == 17688.21
+        assert veri["Durum"] == "Aktif"
+
+
+class TestBordroFisiPdf:
+    """/bordro-fisi-pdf ÖNCEDEN yoktu - kesilen bir bordro fişinin yazdırılabilir
+    çıktısı yoktu (kullanıcı bildirimi: bordro PDF çıktısı)."""
+
+    def test_bulunamayan_fis_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/bordro-fisi-pdf/999")
+        assert yanit.status_code == 404
+
+    def test_basarili_pdf_uretilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(
+            1, "Ali Veli", 2026, 3, 32000.0, 2000.0, 4760.0, 340.0, 27900.0, 4185.0, 25.79,
+            22688.21, 5000.0, 17688.21, 5610.0, 37610.0, "Aktif", None, None, None, "kerem", "2026-03-01 10:00:00"))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/bordro-fisi-pdf/1")
+        assert yanit.status_code == 200
+        assert yanit.headers["content-type"] == "application/pdf"
+        assert len(yanit.content) > 1000
+
+
+class TestBordroFisiIptal:
+    def test_zaten_iptal_edilmisse_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(10, "İptal")]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/bordro-fisi-iptal/1", json={"Neden": "hatali"})
+        assert yanit.status_code == 400
+
+    def test_bulunamayan_fis_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/bordro-fisi-iptal/999", json={"Neden": "test"})
+        assert yanit.status_code == 404
+
+    def test_basarili_iptal_bagli_personel_hareketini_de_geri_alir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            (10, "Aktif"),  # BordroFisleri: PersonelHareketID, Durum
+            (1, "Maaş Tahakkuku", 30000.0, "Bordro Fisi 2026-03", "Aktif", date(2026, 3, 1), None),  # PersonelHareketleri
+            None,  # donem_kilitli_mi -> False
+            (1,),  # yevmiye_fisi_olustur FisID (storno)
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/bordro-fisi-iptal/1", json={"Neden": "hatali girildi"})
+        assert yanit.status_code == 200
+        guncelle = [c for c in cursor.execute.call_args_list if "UPDATE BordroFisleri SET Durum='İptal'" in c.args[0]]
+        assert len(guncelle) == 1
+
+
+class TestBankaApiSenkronize:
+    """/banka-api-senkronize ÖNCEDEN yoktu - banka API sağlayıcısı henüz netleşmediği
+    için AKTIF_BANKA_ADAPTORU varsayılan olarak YapilandirilmamisAdaptor - 501 dönmeli,
+    sunucu hatası (500) DEĞİL."""
+
+    def test_saglayici_yapilandirilmamisken_501_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=("TR000000000000000000000000",))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/banka-api-senkronize/1")
+        assert yanit.status_code == 501
+
+    def test_hesap_bulunamazsa_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/banka-api-senkronize/999")
+        assert yanit.status_code == 404
+
+
+class TestIslemLoglariFiltre:
+    """/islem-loglari ÖNCEDEN filtre desteklemiyordu, her zaman TOP 300 dönüyordu -
+    binlerce satır arasında istenen kaydı bulmak imkansızdı."""
+
+    def test_filtresiz_eski_davranis_korunur(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/islem-loglari")
+        assert yanit.status_code == 200
+        sorgu = cursor.execute.call_args_list[0].args[0]
+        assert "WHERE" not in sorgu
+        assert "TOP 300" in sorgu
+
+    def test_filtre_verilince_dinamik_where_ve_top_500_uretir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=[])
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/islem-loglari", params={"kullanici": "ahmet", "ara": "iptal", "gun": 7})
+        assert yanit.status_code == 200
+        sorgu = cursor.execute.call_args_list[0].args[0]
+        assert "KullaniciAdi LIKE" in sorgu
+        assert "Aciklama LIKE" in sorgu
+        assert "Tarih >= DATEADD" in sorgu
+        assert "TOP 500" in sorgu
+
+
+class TestButceOneri:
+    """/butce-oneri ÖNCEDEN yoktu - bütçe hedefi girerken kullanıcı elle tahmin etmek
+    zorundaydı, geçen yılın gerçekleşenine göre bir başlangıç noktası önerilmiyordu."""
+
+    def test_gecen_yil_gerceklesenine_gore_oneri_hesaplar(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(100000.0, 0.0))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/butce-oneri", params={"hesap_kodu": "760", "yil": 2026, "ay": 3, "artis_yuzde": 10})
+        assert yanit.status_code == 200
+        veri = yanit.json()
+        assert veri["GecenYil"] == 2025
+        assert veri["GecenYilGerceklesen"] == 100000.0
+        assert veri["OnerilenHedef"] == pytest.approx(110000.0)
+
+    def test_artis_yuzde_verilmezse_gecen_yil_rakami_aynen_onerilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(50000.0, 0.0))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/butce-oneri", params={"hesap_kodu": "760", "yil": 2026, "ay": 3})
+        assert yanit.status_code == 200
+        assert yanit.json()["OnerilenHedef"] == 50000.0
+
+
+class TestStokListesiMaliyetGizleme:
+    """/stok-listesi ÖNCEDEN get_current_user ile HERKESE (rol ayrımı yapmadan)
+    OrtalamaMaliyet/KarMarji döndürüyordu - Depo/Üretim rolü de bu hassas mali
+    bilgiyi görebiliyordu."""
+
+    def test_depo_rolu_maliyet_ve_kar_marji_goremez(self, monkeypatch):
+        satirlar = [("PP-001", "Test Urun", "KG", 100.0, 50.0, 10.0, 30.0, "1234567890", 0.0, "Ham Madde", "3901.10")]
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=satirlar, fetchone_sonucu=(4,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "depocu", "rol": "Depo"}
+        try:
+            gecici_client = TestClient(main.app)
+            yanit = gecici_client.get("/stok-listesi")
+            assert yanit.status_code == 200
+            veri = yanit.json()["stoklar"][0]
+            assert veri["OrtalamaMaliyet"] is None
+            assert veri["KarMarji"] is None
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_uretim_rolu_maliyet_ve_kar_marji_goremez(self, monkeypatch):
+        satirlar = [("PP-001", "Test Urun", "KG", 100.0, 50.0, 10.0, 30.0, "1234567890", 0.0, "Ham Madde", "3901.10")]
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=satirlar, fetchone_sonucu=(4,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        main.app.dependency_overrides[main.get_current_user] = lambda: {"username": "uretimci", "rol": "Üretim"}
+        try:
+            gecici_client = TestClient(main.app)
+            yanit = gecici_client.get("/stok-listesi")
+            assert yanit.status_code == 200
+            veri = yanit.json()["stoklar"][0]
+            assert veri["OrtalamaMaliyet"] is None
+            assert veri["KarMarji"] is None
+        finally:
+            main.app.dependency_overrides.clear()
+
+    def test_yonetici_rolu_maliyet_ve_kar_marjini_gorebilir(self, client, monkeypatch):
+        satirlar = [("PP-001", "Test Urun", "KG", 100.0, 50.0, 10.0, 30.0, "1234567890", 0.0, "Ham Madde", "3901.10")]
+        conn, cursor = sahte_cursor_olustur(fetchall_sonucu=satirlar, fetchone_sonucu=(4,))
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.get("/stok-listesi")
+        assert yanit.status_code == 200
+        veri = yanit.json()["stoklar"][0]
+        assert veri["OrtalamaMaliyet"] == 30.0
+        assert veri["KarMarji"] is not None
