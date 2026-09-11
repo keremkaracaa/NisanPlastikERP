@@ -627,9 +627,10 @@ app.add_middleware(
 # Fiyat Listeleri) ekleme/güncelleme yapamaz, sadece görüntüler. Bu kontrol
 # get_current_user() içinde (aşağıda) uygulanıyor.
 _FIYAT_YONETIM_YOLLARI = (
-    "/fiyat-listesi-ekle", "/fiyat-listesi-kalem-ekle", "/musteri-fiyat-listesi-ata",
-    "/iskonto-kademe-ekle", "/fiyat-onerisi-hesapla", "/urun-maliyeti-kaydet",
-    "/urun-maliyeti-sil",
+    "/fiyat-listesi-ekle", "/fiyat-listesi-guncelle", "/fiyat-listesi-sil",
+    "/fiyat-listesi-kalem-ekle", "/fiyat-listesi-kalem-sil",
+    "/musteri-fiyat-listesi-ata", "/musteri-fiyat-listesi-kaldir", "/iskonto-kademe-ekle",
+    "/fiyat-onerisi-hesapla", "/urun-maliyeti-kaydet", "/urun-maliyeti-sil",
 )
 
 security = HTTPBearer()
@@ -947,9 +948,16 @@ def yevmiye_fisi_olustur(cursor, aciklama: str, kaynak_modul: str, kaynak_id, sa
             cursor.execute("INSERT INTO HesapHareketleri (HesapKodu, Aciklama, Borc, Alacak, FisNo) VALUES (?, ?, ?, ?, ?)",
                            (hesap_kodu, satir_aciklama or aciklama, borc, alacak, fis_no_str))
         return fis_id
-    except Exception:
+    except Exception as e:
         # Yevmiye kaydı, ana işlemi (fatura/tahsilat vb.) bloke etmemeli - hesap planı henüz
-        # kurulmamışsa veya bir hesap kodu eksikse sessizce geçilir, asıl işlem yine de kaydedilir.
+        # kurulmamışsa veya bir hesap kodu eksikse geçilir, asıl işlem yine de kaydedilir.
+        # ÖNCEDEN bu tamamen sessizdi (kullanıcıya hiçbir iz kalmadan muhasebe kaydı
+        # oluşmuyordu) - artık en azından Sistem Logları'na görünür bir uyarı düşüyor.
+        try:
+            cursor.execute("INSERT INTO IslemLoglari (KullaniciAdi, Aciklama) VALUES (?, ?)",
+                           (kullanici, f"⚠️ YEVMİYE KAYDI BAŞARISIZ ({kaynak_modul} #{kaynak_id}): {e}"))
+        except Exception:
+            pass
         return None
 
 def agirlikli_ortalama_maliyet_hesapla(eski_miktar: float, eski_ortalama: float, gelen_miktar: float, gelen_fiyat: float) -> float:
@@ -1579,32 +1587,33 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
             """, (genel_toplam, db_tarih, data.cari_ad))
 
         elif data.evrak_tipi == "İrsaliye":
+            # ÖNCEDEN: bu yol (Fatura Kes / Evrak Merkezi ekranındaki "İrsaliye" seçeneği)
+            # dedicated /irsaliye-kes endpoint'inden (İrsaliye ekranının asıl kullandığı
+            # yol) FARKLI davranıyordu - MevcutMiktar'ı hemen düşürüyor ve
+            # Siparisler.TeslimEdilenMiktar'ı artırıyordu. /irsaliye-kes ise BİLEREK stok
+            # hareketi tetiklemiyor (kod içindeki yorum: "stok düşümü zaten fatura/sipariş
+            # aşamasında oluyor") ve TeslimEdilenMiktar'a dokunmuyor, sadece sipariş
+            # durumunu 'Kargoda' yapıyor. Aynı belge türü ("İrsaliye") hangi ekrandan
+            # kesildiğine göre iki farklı, ÇELİŞEN sonuç veriyordu: buradan kesilen bir
+            # irsaliye stoğu hemen düşürüyordu, sonra o sipariş faturalandığında (Satış
+            # Faturası her zaman kendi kalemleri için stoğu AYRICA düşürür) aynı mal iki
+            # kez düşmüş oluyordu. Artık bu yol da /irsaliye-kes ile birebir aynı, tutarlı
+            # davranışı izliyor: stok/TeslimEdilenMiktar'a dokunmaz, sadece belgeyi ve
+            # kalemlerini kaydeder, sipariş varsa 'Kargoda' olarak işaretler.
             cursor.execute("""
                 INSERT INTO Irsaliyeler (MusteriID, BelgeNo, Tarih, CariAd, SiparisID, Plaka, Sofor, Aciklama)
                 VALUES (?, ?, ?, ?, ?, '-', '-', ?)
             """, (musteri_id, data.belge_no, db_tarih, data.cari_ad, data.siparis_id, f"Evrak Merkezi #{data.belge_no}"))
 
+            cursor.execute("SELECT IrsaliyeID FROM Irsaliyeler WHERE BelgeNo=? AND MusteriID=?", (data.belge_no, musteri_id))
+            irsaliye_id_row = cursor.fetchone()
+
             if data.siparis_id:
-                cursor.execute("SELECT StokKod, StokAdi, Miktar, ISNULL(TeslimEdilenMiktar,0), Durum FROM Siparisler WHERE SiparisID=?", (data.siparis_id,))
+                cursor.execute("SELECT Durum FROM Siparisler WHERE SiparisID=?", (data.siparis_id,))
                 sip_row = cursor.fetchone()
-                if sip_row:
-                    sip_stok_kod, sip_urun_adi, sip_miktar, sip_teslim, sip_durum = sip_row
-                    teslim_bu_irsaliyede = sum(k.miktar for k in data.kalemler
-                                                if (k.stok_kod and k.stok_kod == sip_stok_kod) or (not k.stok_kod and k.urun_ad == sip_urun_adi))
-                    yeni_teslim = min(sip_teslim + teslim_bu_irsaliyede, sip_miktar)
-                    if yeni_teslim >= sip_miktar - 0.0001:
-                        yeni_durum = "Tamamlandı"
-                    elif sip_durum != "Tamamlandı":
-                        yeni_durum = "Kısmi Teslim" if teslim_bu_irsaliyede > 0 else "Kargoda"
-                    else:
-                        yeni_durum = sip_durum
-                    cursor.execute("""UPDATE Siparisler SET TeslimEdilenMiktar=?, Durum=?,
-                                       GercekTeslimTarihi=CASE WHEN ?='Tamamlandı' THEN GETDATE() ELSE GercekTeslimTarihi END
-                                       WHERE SiparisID=?""",
-                                   (yeni_teslim, yeni_durum, yeni_durum, data.siparis_id))
-                    if sip_stok_kod and teslim_bu_irsaliyede > 0:
-                        stok_rezerve_coz(cursor, sip_stok_kod, teslim_bu_irsaliyede)
-            
+                if sip_row and sip_row[0] != "Tamamlandı":
+                    cursor.execute("UPDATE Siparisler SET Durum='Kargoda' WHERE SiparisID=?", (data.siparis_id,))
+
             for k in data.kalemler:
                 if k.stok_kod:
                     stok_kod = k.stok_kod
@@ -1613,27 +1622,9 @@ def evrak_isleme(data: EvrakPayload, background_tasks: BackgroundTasks, user: di
                     sk_row = cursor.fetchone()
                     stok_kod = sk_row[0] if sk_row else ""
 
-                stok_kalite_kontrol_et(cursor, stok_kod, k.miktar)
-                cursor.execute("""
-                    INSERT INTO StokHareketleri (StokKod, IslemTuru, Miktar, Tarih, Aciklama)
-                    VALUES (?, 'SEVK', ?, ?, ?)
-                """, (stok_kod, k.miktar, db_tarih, f"İrsaliye #{data.belge_no}"))
-                # /irsaliye-kes zaten IrsaliyeKalemleri'ne yazıyordu, bu yol (Fatura Kes
-                # ekranındaki 'İrsaliye' evrak tipi) YAZMIYORDU - İrsaliye PDF'i (bkz.
-                # /irsaliye-detay) kalemsiz kalıyordu. Artık ikisi de aynı tabloya yazıyor.
-                cursor.execute("SELECT IrsaliyeID FROM Irsaliyeler WHERE BelgeNo=? AND MusteriID=?", (data.belge_no, musteri_id))
-                irsaliye_id_row = cursor.fetchone()
                 if irsaliye_id_row:
                     cursor.execute("INSERT INTO IrsaliyeKalemleri (IrsaliyeID, StokKod, StokAdi, Miktar) VALUES (?, ?, ?, ?)",
                                    (irsaliye_id_row[0], stok_kod, k.urun_ad, k.miktar))
-
-                cursor.execute("""
-                    UPDATE StokKartlari
-                    SET MevcutMiktar = MevcutMiktar - ?
-                    WHERE StokKod = ?
-                """, (k.miktar, stok_kod))
-                if stok_kod:
-                    depo_stok_guncelle(cursor, stok_kod, (data.depo_id or varsayilan_depo_id(cursor)), -k.miktar)
 
         else:
             raise ValueError("Geçersiz evrak tipi.")
@@ -1684,10 +1675,21 @@ class StokKartiEkle(BaseModel):
     UrunGrubu: Optional[str] = None
     GtipKodu: Optional[str] = None
 
+class HareketIptalRequest(BaseModel):
+    """Kasa/Banka/Masraf/Personel hareketi iptal endpoint'lerinin (main.py'de birden
+    fazla yerde kullanılıyor, o yüzden diğer Pydantic modelleriyle birlikte en başta
+    tanımlanıyor - kullanıldığı ilk endpoint dosyanın ortasındaydı, sınıf tanımından
+    ÖNCE geliyordu ve NameError'a yol açıyordu) ortak gövdesi."""
+    Neden: str
+    DonemKilitSifresi: Optional[str] = None
+
 class MasrafEkle(BaseModel):
     Kategori: str
     Tutar: float = Field(gt=0)
     Aciklama: str
+    OdemeYeri: str = "Kasa"  # "Kasa" veya "Banka" - hangi alt sistemin gerçekten düşüleceği
+    ParaBirimi: str = "TL"   # OdemeYeri="Kasa" ise hangi kasa (Kasalar.ParaBirimi)
+    BankaHesapID: Optional[int] = None  # OdemeYeri="Banka" ise hangi banka hesabı
 
 class StokGuncelle(BaseModel):
     StokKod: str
@@ -1742,6 +1744,10 @@ class TahsilatEkle(BaseModel):
     Aciklama: str
     ParaBirimi: str = "TL"
     SiparisID: Optional[int] = None  # Opsiyonel: bu tahsilat belirli bir siparişe karşılıksa
+    BankaHesapID: Optional[int] = None    # OdemeTuru Havale/EFT veya Kredi Kartı ise: hangi banka hesabına yattığı (verilirse o hesabın bakiyesi de güncellenir)
+    CekEvrakNo: Optional[str] = None      # OdemeTuru Çek ise
+    CekVadeTarihi: Optional[str] = None   # OdemeTuru Çek ise ("YYYY-MM-DD")
+    CekBankaBilgisi: Optional[str] = None  # OdemeTuru Çek ise
 
 class KasaHareketEkle(BaseModel):
     KasaID: int
@@ -1749,16 +1755,20 @@ class KasaHareketEkle(BaseModel):
     Tutar: float = Field(gt=0)
     Aciklama: str = ""
     BelgeNo: Optional[str] = None
+    TedarikciID: Optional[int] = None  # IslemTuru="Ödeme" ise: hangi tedarikçiye yapıldığı (tedarikçi ekstresine işlenir)
+    BankaHesapID: Optional[int] = None  # IslemTuru="Bankadan Çekilen"/"Bankaya Yatırılan" ise: hangi banka hesabı (verilirse o hesabın bakiyesi de güncellenir)
 
 class AlisIrsaliyeKalem(BaseModel):
     StokKod: str
     StokAdi: str
     Miktar: float = Field(gt=0)
+    BirimFiyat: Optional[float] = None  # opsiyonel - girilirse ortalama maliyet ve muhasebe fişi güncellenir
     KaliteSonucu: Optional[str] = None  # KABUL | RED | SARTLI_KABUL - opsiyonel, Tedarikçi Skor Kartı için
 
 class AlisIrsaliyeKesRequest(BaseModel):
     TedarikciID: int
-    BelgeNo: Optional[str] = None
+    BelgeNo: Optional[str] = None  # İrsaliye/sevkiyat belge no - FaturaNo'dan farklı, tedarikçi henüz fatura kesmemiş olabilir
+    FaturaNo: Optional[str] = None  # Tedarikçinin fatura no'su (varsa) - e-Fatura entegratör eşleştirmesi için ayrı tutulur
     Aciklama: Optional[str] = None
     Kalemler: list[AlisIrsaliyeKalem]
     DepoID: Optional[int] = None  # Belirtilmezse varsayılan (Merkez) depo kullanılır
@@ -1778,15 +1788,6 @@ class IrsaliyeKesRequest(BaseModel):
     IrsaliyeTuru: str = "Toptan Satış İrsaliyesi"
     SiparisID: Optional[int] = None
     Kalemler: list[IrsaliyeKalem] = []
-
-class SiparisEkleRequest(BaseModel):
-    MusteriID: int
-    StokKod: str
-    StokAdi: str
-    Miktar: float = Field(gt=0)
-    BirimFiyat: float = Field(ge=0)
-    ParaBirimi: str = "TL"
-    SozVerilenTeslimTarihi: Optional[str] = None  # "YYYY-MM-DD", opsiyonel
 
 class SiparisGrupKalem(BaseModel):
     StokKod: str
@@ -2024,6 +2025,27 @@ def _eski_migrationlar_calistir(cursor):
         )
     """, "Masraflar tablosu")
 
+    # Tedarikçi Ödemeleri Tablosu (YENİ) - önceden hiç oluşturulmuyordu; /tedarikci-detay
+    # endpoint'i bu tabloyu try/except ile okumaya çalışıyordu ama hiçbir endpoint yazmıyordu,
+    # bu yüzden tedarikçi ekstresindeki "ödenen tutar" her zaman 0 kalıyordu (kopukluk).
+    guvenli_migrasyon(cursor, """
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='TedarikciOdemeleri' and xtype='U')
+        CREATE TABLE TedarikciOdemeleri (
+            OdemeID INT IDENTITY(1,1) PRIMARY KEY,
+            TedarikciID INT NOT NULL FOREIGN KEY REFERENCES Tedarikciler(TedarikciID),
+            Tutar FLOAT,
+            OdemeTuru NVARCHAR(50),
+            Aciklama NVARCHAR(200),
+            Tarih DATETIME DEFAULT GETDATE(),
+            KullaniciAdi NVARCHAR(50)
+        )
+    """, "TedarikciOdemeleri tablosu")
+
+    cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='TedarikciOdemeleri' AND COLUMN_NAME='KullaniciAdi'")
+    if cursor.fetchone() is None:
+        cursor.execute("ALTER TABLE TedarikciOdemeleri ADD KullaniciAdi NVARCHAR(50)")
+        print(">>> Veritabanı güncellendi: TedarikciOdemeleri.KullaniciAdi sütunu eklendi.")
+
     guvenli_migrasyon(cursor, """
         IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='CariParaHareketleri' and xtype='U')
         CREATE TABLE CariParaHareketleri (
@@ -2181,6 +2203,8 @@ def _eski_migrationlar_calistir(cursor):
     # düştüğü anda otomatik damgalanır).
     guvenli_sutun_ekle(cursor, "Siparisler", "SozVerilenTeslimTarihi", "DATE NULL")
     guvenli_sutun_ekle(cursor, "Siparisler", "GercekTeslimTarihi", "DATE NULL")
+    # Belge Zinciri detay popup'ında "kimin teklifi verdiği" gösterilebilsin diye
+    guvenli_sutun_ekle(cursor, "Teklifler", "OlusturanKullanici", "NVARCHAR(50) NULL")
 
     # --- Üretim Planlama / Kapasite Çizelgesi ---
     guvenli_migrasyon(cursor, """
@@ -2899,6 +2923,15 @@ def startup_db_check():
                 pass
 
         try:
+            _fiyat_listesi_kalem_para_birimi_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Fiyat listesi kalem para birimi migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
             _demirbas_hareket_migrationlari(cursor)
         except Exception as e:
             print(f">>> Demirbaş hareket migration bloğu hata verdi: {e}")
@@ -3100,6 +3133,15 @@ def startup_db_check():
             _recete_iscilik_migrationlari(cursor)
         except Exception as e:
             print(f">>> Reçete işçilik migration bloğu hata verdi: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        try:
+            _finans_iptal_migrationlari(cursor)
+        except Exception as e:
+            print(f">>> Finans iptal/storno migration bloğu hata verdi: {e}")
             try:
                 conn.rollback()
             except Exception:
@@ -3594,6 +3636,14 @@ def _tedarikci_skor_migrationlari(cursor):
     kırılgan değildir."""
     guvenli_sutun_ekle(cursor, "AlisIrsaliyeleri", "SozVerilenTeslimTarihi", "DATE NULL")
     guvenli_sutun_ekle(cursor, "AlisIrsaliyeKalemleri", "KaliteSonucu", "NVARCHAR(20) NULL")
+    guvenli_sutun_ekle(cursor, "AlisIrsaliyeKalemleri", "BirimFiyat", "DECIMAL(18,2) NULL")
+    guvenli_sutun_ekle(cursor, "AlisIrsaliyeleri", "FaturaNo", "NVARCHAR(50) NULL")
+
+def _fiyat_listesi_kalem_para_birimi_migrationlari(cursor):
+    """Fiyat Listesi kalemlerinde önceden sadece sayısal Fiyat vardı, hangi para
+    biriminde olduğu varsayılıyordu (TL) - artık diğer kalem tablolarıyla (Sipariş,
+    Alış İrsaliyesi vb.) tutarlı şekilde ParaBirimi de tutuluyor."""
+    guvenli_sutun_ekle(cursor, "FiyatListesiKalemleri", "ParaBirimi", "NVARCHAR(5) NOT NULL DEFAULT 'TL'")
 
 def _demirbas_hareket_migrationlari(cursor):
     """Varlık Hareketleri (Transfer/Lokasyon) - Demirbaslar'a Lokasyon alanı + geçmiş
@@ -3998,6 +4048,32 @@ def _recete_iscilik_migrationlari(cursor):
     zaman/vardiya takibi YOKTUR, kullanıcının kendi tahminine dayanır."""
     guvenli_sutun_ekle(cursor, "UretimReceteleri", "IscilikBirimMaliyet", "FLOAT NULL DEFAULT 0")
 
+def _finans_iptal_migrationlari(cursor):
+    """Kasa/Banka/Masraf/Personel hareketleri için Faturalar.Durum ile AYNI storno
+    deseni (bkz. main.py:3940-3943, /fatura-iptal main.py:10719): kayıt asla
+    silinmez, Durum='İptal' işaretlenir ve ters yevmiye fişi atılır. Önceden bu
+    4 modülde hiçbir düzeltme/iptal yolu yoktu - yanlış girilen bir kasa hareketi
+    ya da masraf API üzerinden asla geri alınamıyordu. KurKullanilan/TutarTL,
+    döviz kasa/masraf hareketlerinin yevmiyeye hangi TL karşılığıyla yazıldığının
+    denetim izidir (bkz. kasa_hareket_ekle, masraf_ekle)."""
+    for tablo in ("KasaHareketleri", "BankaHareketleri", "Masraflar", "PersonelHareketleri"):
+        guvenli_sutun_ekle(cursor, tablo, "Durum", "NVARCHAR(20) NOT NULL DEFAULT 'Aktif'")
+        guvenli_sutun_ekle(cursor, tablo, "IptalTarihi", "DATETIME NULL")
+        guvenli_sutun_ekle(cursor, tablo, "IptalEden", "NVARCHAR(50) NULL")
+        guvenli_sutun_ekle(cursor, tablo, "IptalNedeni", "NVARCHAR(300) NULL")
+    for tablo in ("KasaHareketleri", "Masraflar"):
+        guvenli_sutun_ekle(cursor, tablo, "KurKullanilan", "FLOAT NULL")
+        guvenli_sutun_ekle(cursor, tablo, "TutarTL", "FLOAT NULL")
+    guvenli_sutun_ekle(cursor, "KasaHareketleri", "BankaHesapID", "INT NULL")
+    # masraf_iptal'in hangi alt sistemden (Kasa/Banka) düşüldüğünü bilip storno'da
+    # o tarafı da geri alabilmesi için - ÖNCEDEN Masraflar bu bilgiyi hiç saklamıyordu.
+    guvenli_sutun_ekle(cursor, "Masraflar", "OdemeYeri", "NVARCHAR(10) NULL")
+    guvenli_sutun_ekle(cursor, "Masraflar", "KasaID", "INT NULL")
+    guvenli_sutun_ekle(cursor, "Masraflar", "BankaHesapID", "INT NULL")
+    # personel_hareket_iptal'in Avans/Maaş Ödemesi'nin banka mı kasadan mı yapıldığını
+    # bilip storno'da o tarafı da geri alabilmesi için.
+    guvenli_sutun_ekle(cursor, "PersonelHareketleri", "HesapID", "INT NULL")
+
 def _musteri_anlasma_migrationlari(cursor):
     """Müşteri Özel Fiyat/İskonto Anlaşması Takibi - bir müşteriyle yapılan özel
     iskonto anlaşmasının (isteğe bağlı olarak belirli bir ürün grubuna özel) süresini
@@ -4243,6 +4319,31 @@ def hesap_plani_getir(user: dict = Depends(get_current_user)):
         return sonuc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Veritabanı hatası: {str(e)}")
+    finally:
+        conn.close()
+
+class HesapPlaniEkleRequest(BaseModel):
+    HesapKodu: str
+    HesapAdi: str
+    AcilisBakiyesi: float = 0
+
+@app.post("/hesap-plani-ekle")
+def hesap_plani_ekle(veri: HesapPlaniEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Master", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        kod = veri.HesapKodu.strip()
+        ad = veri.HesapAdi.strip()
+        if not kod or not ad:
+            raise HTTPException(status_code=400, detail="Hesap Kodu ve Hesap Adı zorunludur.")
+        cursor.execute("SELECT 1 FROM HesapPlani WHERE HesapKodu=?", (kod,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail=f"'{kod}' kodlu hesap zaten mevcut.")
+        cursor.execute("INSERT INTO HesapPlani (HesapKodu, HesapAdi, Bakiye) VALUES (?, ?, ?)",
+                       (kod, ad, veri.AcilisBakiyesi))
+        log_islem(cursor, f"Yeni hesap açıldı: {kod} - {ad}", user["username"])
+        conn.commit()
+        return {"mesaj": "Hesap eklendi.", "HesapKodu": kod}
     finally:
         conn.close()
 
@@ -5058,9 +5159,10 @@ def tedarikci_skor_listesi(user: dict = Depends(yetki_kontrol(["Yönetici", "Sat
 @app.get("/tedarikci-fiyat-gecmisi/{stok_kod}")
 def tedarikci_fiyat_gecmisi(stok_kod: str, user: dict = Depends(yetki_kontrol(["Yönetici", "Satınalma", "Depo", "Muhasebe"]))):
     """Bir hammaddenin/ürünün geçmişte hangi tedarikçiden hangi fiyata alındığını
-    (AlisFaturaSatirlari + AlisFaturalari üzerinden - hem /evrak-isleme'nin Alım
-    Faturası hem de basit /alis-faturasi-gir yolu buraya yazıyor) listeler ve
-    tedarikçi bazında özetler - en ucuz ortalama fiyata sahip tedarikçi ilk sırada."""
+    (AlisFaturaSatirlari + AlisFaturalari - hem /evrak-isleme'nin Alım Faturası hem
+    de eski /alis-faturasi-gir yolu buraya yazıyor - VE fiyat girilmiş AlisIrsaliyeKalemleri
+    - güncel 'Alış İrsaliyesi Kes' ekranından girilen fiyatlar - üzerinden) listeler
+    ve tedarikçi bazında özetler - en ucuz ortalama fiyata sahip tedarikçi ilk sırada."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -5070,8 +5172,14 @@ def tedarikci_fiyat_gecmisi(stok_kod: str, user: dict = Depends(yetki_kontrol(["
             JOIN AlisFaturalari af ON afs.AlisFaturaID = af.AlisFaturaID
             LEFT JOIN Tedarikciler t ON af.TedarikciID = t.TedarikciID
             WHERE afs.StokKod = ? AND ISNULL(afs.BirimFiyat, 0) > 0
-            ORDER BY af.Tarih DESC
-        """, (stok_kod,))
+            UNION ALL
+            SELECT t2.FirmaAdi AS TedarikciAdi, k.BirimFiyat, k.Miktar, ai.Tarih
+            FROM AlisIrsaliyeKalemleri k
+            JOIN AlisIrsaliyeleri ai ON k.AlisIrsaliyeID = ai.AlisIrsaliyeID
+            JOIN Tedarikciler t2 ON ai.TedarikciID = t2.TedarikciID
+            WHERE k.StokKod = ? AND ISNULL(k.BirimFiyat, 0) > 0
+            ORDER BY Tarih DESC
+        """, (stok_kod, stok_kod))
         satirlar = cursor.fetchall()
         gecmis = [{"Tedarikci": r[0] or "Bilinmiyor", "BirimFiyat": float(r[1]), "Miktar": float(r[2] or 0), "Tarih": str(r[3])[:10]} for r in satirlar]
 
@@ -5832,6 +5940,18 @@ def kredi_ekle(veri: KrediEkleRequest, user: dict = Depends(yetki_kontrol(["Yön
             gun = min(vade.day, 28)
             vade = vade.replace(year=yil, month=ay, day=gun)
 
+        # Kredi bir banka hesabına bağlanmışsa (BankaHesapID), kullanılan kredi tutarı
+        # sadece soyut "102 Bankalar" kaydı değil, o hesabın gerçek bakiyesine de işlenir
+        # - taksit ödemesi zaten o hesaptan düşüldüğü için (bkz. taksit_ode), kredinin
+        # kullanımının da aynı hesaba girmesi tutarlılık için gerekli.
+        if veri.BankaHesapID:
+            cursor.execute("SELECT 1 FROM BankaHesaplari WHERE HesapID=?", (veri.BankaHesapID,))
+            if cursor.fetchone():
+                cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID=?", (veri.AnaparaTutari, veri.BankaHesapID))
+                cursor.execute("""INSERT INTO BankaHareketleri (HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama)
+                                   VALUES (?, NULL, NULL, 'Gelen Havale', ?, ?)""",
+                               (veri.BankaHesapID, veri.AnaparaTutari, f"Kredi kullanımı: {veri.KrediAdi}"))
+
         yevmiye_fisi_olustur(cursor, f"Kredi kullanımı: {veri.KrediAdi}", "BankaKredisi", kredi_id, [
             ("102", veri.AnaparaTutari, 0, "Kredi kullanımı - Banka girişi"),
             ("300", 0, veri.AnaparaTutari, f"Banka Kredisi: {veri.KrediAdi}"),
@@ -5880,20 +6000,49 @@ def taksit_ode(taksit_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", 
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("""SELECT t.KrediID, t.TaksitTutari, t.AnaparaPayi, t.FaizPayi, t.OdendiMi, t.TaksitNo, k.KrediAdi
+        cursor.execute("""SELECT t.KrediID, t.TaksitTutari, t.AnaparaPayi, t.FaizPayi, t.OdendiMi, t.TaksitNo, k.KrediAdi, k.BankaHesapID
                            FROM KrediTaksitleri t JOIN BankaKredileri k ON t.KrediID = k.KrediID WHERE t.TaksitID=?""", (taksit_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Taksit bulunamadı.")
         if row[4]:
             raise HTTPException(status_code=400, detail="Bu taksit zaten ödenmiş.")
-        kredi_id, tutar, anapara_payi, faiz_payi, _, taksit_no, kredi_adi = row
+        kredi_id, tutar, anapara_payi, faiz_payi, _, taksit_no, kredi_adi, banka_hesap_id = row
 
         cursor.execute("UPDATE KrediTaksitleri SET OdendiMi=1, OdemeTarihi=GETDATE() WHERE TaksitID=?", (taksit_id,))
+
+        # Kredi bir banka hesabına bağlıysa (BankaKredileri.BankaHesapID), taksit ödemesi
+        # sadece soyut "102 Bankalar" muhasebe kaydı bırakmakla kalmaz, o hesabın gerçek
+        # bakiyesini de düşürür ve BankaHareketleri'ne işler - Finans & Banka ekranıyla
+        # tutarlı olsun diye (Tahsilat/tahsilat-ekle'deki aynı kopukluk düzeltmesiyle aynı mantık).
+        ek_not = ""
+        odeme_hesap_kodu = "102"
+        odeme_yapildi = False
+        if banka_hesap_id:
+            cursor.execute("SELECT 1 FROM BankaHesaplari WHERE HesapID=?", (banka_hesap_id,))
+            if cursor.fetchone():
+                cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye - ? WHERE HesapID=?", (tutar, banka_hesap_id))
+                cursor.execute("""INSERT INTO BankaHareketleri (HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama)
+                                   VALUES (?, NULL, NULL, 'Giden Havale', ?, ?)""",
+                               (banka_hesap_id, tutar, f"Kredi Taksidi #{taksit_no}: {kredi_adi}"))
+                ek_not = " ve banka hesabından düşüldü"
+                odeme_yapildi = True
+
+        if not odeme_yapildi:
+            # Kredi bir banka hesabına bağlı değilse (nakit kredi/BankaHesapID hiç
+            # seçilmemiş), taksit ödemesi eskiden hiçbir alt sisteme düşmüyordu - ne
+            # Kasa'ya ne Banka'ya. Varsayılan olarak Kasa TL'den düşülür.
+            cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi='TL'")
+            kasa = cursor.fetchone()
+            if kasa:
+                _kasa_hareket_isle(cursor, kasa[0], "Ödeme", tutar, "Çıkış", f"Kredi Taksidi #{taksit_no}: {kredi_adi}", None, user["username"])
+                odeme_hesap_kodu = "100"
+                ek_not = " ve kasadan düşüldü"
+
         yevmiye_fisi_olustur(cursor, f"Kredi Taksidi #{taksit_no}: {kredi_adi}", "KrediTaksiti", taksit_id, [
             ("300", anapara_payi, 0, "Kredi anapara ödemesi"),
             ("780", faiz_payi, 0, "Kredi faiz gideri"),
-            ("102", 0, tutar, "Banka çıkışı - taksit ödemesi"),
+            (odeme_hesap_kodu, 0, tutar, "Banka/Kasa çıkışı - taksit ödemesi"),
         ], user["username"])
 
         cursor.execute("SELECT COUNT(*) FROM KrediTaksitleri WHERE KrediID=? AND OdendiMi=0", (kredi_id,))
@@ -5902,7 +6051,7 @@ def taksit_ode(taksit_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", 
 
         log_islem(cursor, f"Kredi taksidi ödendi: {kredi_adi} - Taksit #{taksit_no}", user["username"])
         conn.commit()
-        return {"mesaj": f"Taksit #{taksit_no} ödendi olarak işaretlendi."}
+        return {"mesaj": f"Taksit #{taksit_no} ödendi olarak işaretlendi{ek_not}."}
     except HTTPException:
         conn.rollback()
         raise
@@ -7090,15 +7239,116 @@ def masraf_ekle(veri: MasrafEkle, user: dict = Depends(yetki_kontrol(["Yönetici
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO Masraflar (Kategori, Tutar, Aciklama, KullaniciAdi) VALUES (?, ?, ?, ?)",
-                       (veri.Kategori, veri.Tutar, veri.Aciklama, user["username"]))
-        yevmiye_fisi_olustur(cursor, f"Masraf: {veri.Kategori} - {veri.Aciklama}", "Masraf", None, [
-            ("770", veri.Tutar, 0, f"Genel Yönetim Gideri - {veri.Kategori}"),
-            ("100", 0, veri.Tutar, "Kasa çıkışı"),
-        ], user["username"])
-        log_islem(cursor, f"Masraf girildi: {veri.Kategori} - {veri.Tutar} TL", user["username"])
+        # ÖNCEDEN: masraf her zaman soyut "100 Kasa" hesabına muhasebe kaydı bırakıyordu,
+        # ama gerçek Kasalar.Bakiye/KasaHareketleri hiçbir zaman güncellenmiyordu (Kasa
+        # ekranında bu çıkışı hiç göremezdiniz). Artık OdemeYeri="Kasa" ise ilgili kasanın
+        # bakiyesi gerçekten düşülür (_kasa_hareket_isle ile, Tahsilat'la aynı mantık);
+        # OdemeYeri="Banka" ise BankaHesapID verilen hesabın bakiyesi düşülür.
+        # Döviz kasa düzeltmesi (kasa_hareket_ekle ile AYNI sebep/çözüm): EUR/USD
+        # kasadan yapılan bir masraf artık TL karşılığıyla yevmiyeye yazılıyor.
+        kasa_para_birimi = veri.ParaBirimi if veri.OdemeYeri != "Banka" else "TL"
+        tutar_tl, kur = tl_karsiligi_hesapla(veri.Tutar, kasa_para_birimi)
+        kur_kullanilan = kur if kasa_para_birimi.upper() != "TL" else None
+        tutar_tl_kayit = tutar_tl if kasa_para_birimi.upper() != "TL" else None
+
+        ek_not = ""
+        kasa_id_kayit = None
+        if veri.OdemeYeri == "Banka" and veri.BankaHesapID:
+            cursor.execute("SELECT 1 FROM BankaHesaplari WHERE HesapID=?", (veri.BankaHesapID,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Belirtilen banka hesabı bulunamadı.")
+            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye - ? WHERE HesapID=?", (veri.Tutar, veri.BankaHesapID))
+            cursor.execute("""INSERT INTO BankaHareketleri (HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama)
+                               VALUES (?, NULL, NULL, 'Giden Havale', ?, ?)""",
+                           (veri.BankaHesapID, veri.Tutar, f"Masraf: {veri.Kategori} - {veri.Aciklama}"))
+            yevmiye_fisi_olustur(cursor, f"Masraf: {veri.Kategori} - {veri.Aciklama}", "Masraf", None, [
+                ("770", veri.Tutar, 0, f"Genel Yönetim Gideri - {veri.Kategori}"),
+                ("102", 0, veri.Tutar, "Banka çıkışı"),
+            ], user["username"])
+            ek_not = " (banka hesabından düşüldü)"
+        else:
+            cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi=?", (veri.ParaBirimi,))
+            kasa = cursor.fetchone()
+            if kasa:
+                kasa_id_kayit = kasa[0]
+                _kasa_hareket_isle(cursor, kasa[0], "Ödeme", veri.Tutar, "Çıkış", f"Masraf: {veri.Kategori} - {veri.Aciklama}", None, user["username"],
+                                   kur_kullanilan, tutar_tl_kayit)
+                ek_not = " (kasadan düşüldü)"
+            yevmiye_fisi_olustur(cursor, f"Masraf: {veri.Kategori} - {veri.Aciklama}", "Masraf", None, [
+                ("770", tutar_tl, 0, f"Genel Yönetim Gideri - {veri.Kategori}"),
+                ("100", 0, tutar_tl, "Kasa çıkışı"),
+            ], user["username"])
+
+        cursor.execute("""INSERT INTO Masraflar (Kategori, Tutar, Aciklama, KullaniciAdi, KurKullanilan, TutarTL, OdemeYeri, KasaID, BankaHesapID)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (veri.Kategori, veri.Tutar, veri.Aciklama, user["username"], kur_kullanilan, tutar_tl_kayit,
+                        veri.OdemeYeri, kasa_id_kayit, veri.BankaHesapID if veri.OdemeYeri == "Banka" else None))
+
+        log_islem(cursor, f"Masraf girildi: {veri.Kategori} - {veri.Tutar} {kasa_para_birimi}", user["username"])
         conn.commit()
-        return {"mesaj": "Masraf başarıyla kaydedildi."}
+        return {"mesaj": f"Masraf başarıyla kaydedildi{ek_not}."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+@app.put("/masraf-iptal/{masraf_id}")
+def masraf_iptal(masraf_id: int, veri: HareketIptalRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    """Kasa hareketi iptaliyle AYNI storno deseni. masraf_ekle artık hangi alt sistemden
+    (Kasa/Banka, hangi KasaID/BankaHesapID) düşüldüğünü Masraflar'a kaydediyor - bu
+    sayede iptal SADECE yevmiyeyi değil, o kasanın/banka hesabının bakiyesini de
+    gerçekten geri alıyor (ÖNCEDEN bu bilgi hiç saklanmıyordu, storno sadece yevmiyede
+    kalır, kasa/banka bakiyesi yanlış kalmaya devam ederdi)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT Kategori, Tutar, Aciklama, ISNULL(Durum,'Aktif'), Tarih, KurKullanilan, TutarTL, OdemeYeri, KasaID, BankaHesapID
+                           FROM Masraflar WHERE MasrafID=?""", (masraf_id,))
+        satir = cursor.fetchone()
+        if not satir:
+            raise HTTPException(status_code=404, detail="Masraf bulunamadı.")
+        kategori, tutar, aciklama, durum, tarih, kur_kullanilan, tutar_tl, odeme_yeri, kasa_id, banka_hesap_id = satir
+        if durum == "İptal":
+            raise HTTPException(status_code=400, detail="Bu masraf zaten iptal edilmiş.")
+
+        masraf_tarihi = tarih.date() if hasattr(tarih, "date") else tarih
+        if donem_kilitli_mi(cursor, masraf_tarihi.year, masraf_tarihi.month):
+            if not veri.DonemKilitSifresi or not _donem_kilit_sifresi_dogrula(cursor, veri.DonemKilitSifresi):
+                raise HTTPException(status_code=403, detail=f"{masraf_tarihi.year}-{masraf_tarihi.month:02d} dönemi kilitli - iptal için doğru dönem kilit şifresi gerekli.")
+
+        cursor.execute("UPDATE Masraflar SET Durum='İptal', IptalTarihi=GETDATE(), IptalEden=?, IptalNedeni=? WHERE MasrafID=?",
+                       (user["username"], veri.Neden, masraf_id))
+
+        tutar_yevmiye = tutar_tl if tutar_tl is not None else tutar
+        if odeme_yeri == "Banka" and banka_hesap_id:
+            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID=?", (tutar, banka_hesap_id))
+            cursor.execute("""INSERT INTO BankaHareketleri (HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama)
+                               VALUES (?, NULL, NULL, 'Gelen Havale', ?, ?)""",
+                           (banka_hesap_id, tutar, f"Masraf İptali: {kategori} - {veri.Neden}"))
+            hedef_hesap_kodu = "102"
+        elif kasa_id:
+            cursor.execute("UPDATE Kasalar SET Bakiye = Bakiye + ? WHERE KasaID=?", (tutar, kasa_id))
+            cursor.execute("""INSERT INTO KasaHareketleri (KasaID, IslemTuru, Aciklama, Tutar, Yon, KullaniciAdi, KurKullanilan, TutarTL)
+                               VALUES (?, 'Tahsilat', ?, ?, 'Giriş', ?, ?, ?)""",
+                           (kasa_id, f"Masraf İptali: {kategori} - {veri.Neden}", tutar, user["username"], kur_kullanilan, tutar_tl))
+            hedef_hesap_kodu = "100"
+        else:
+            hedef_hesap_kodu = "100"
+
+        yevmiye_fisi_olustur(cursor, f"Masraf İptali: {kategori} - {veri.Neden}", "MasrafIptal", masraf_id, [
+            (hedef_hesap_kodu, tutar_yevmiye, 0, "Kasa/Banka girişi (storno)"),
+            ("770", 0, tutar_yevmiye, f"Genel Yönetim Gideri iptali - {kategori}"),
+        ], user["username"])
+        log_islem(cursor, f"Masraf iptal edildi: #{masraf_id} - {veri.Neden}", user["username"])
+        conn.commit()
+        return {"mesaj": "Masraf iptal edildi, ters muhasebe kaydı ve kasa/banka bakiyesi geri alındı."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
 
@@ -7107,15 +7357,15 @@ def masraf_listesi_getir(baslangic: str = None, bitis: str = None, user: dict = 
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        sorgu = "SELECT MasrafID, Kategori, Tutar, Aciklama, Tarih, KullaniciAdi FROM Masraflar"
+        sorgu = "SELECT MasrafID, Kategori, Tutar, Aciklama, Tarih, KullaniciAdi, ISNULL(Durum,'Aktif') FROM Masraflar"
         parametreler = []
         if baslangic and bitis: # Tarih bazlı filtreleme
             sorgu += " WHERE Tarih >= ? AND Tarih <= ?"
             parametreler.extend([baslangic, bitis + " 23:59:59"])
         sorgu += " ORDER BY Tarih DESC"
-        
+
         cursor.execute(sorgu, parametreler)
-        return {"masraflar": [{"MasrafID": r[0], "Kategori": r[1], "Tutar": r[2], "Aciklama": r[3], "Tarih": str(r[4])[:16], "Kullanici": r[5]} for r in cursor.fetchall()]}
+        return {"masraflar": [{"MasrafID": r[0], "Kategori": r[1], "Tutar": r[2], "Aciklama": r[3], "Tarih": str(r[4])[:16], "Kullanici": r[5], "Durum": r[6]} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -8322,10 +8572,39 @@ def fiyat_listeleri_getir(user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
+@app.put("/fiyat-listesi-guncelle/{liste_id}")
+def fiyat_listesi_guncelle(liste_id: int, veri: FiyatListesiEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE FiyatListeleri SET ListeAdi=?, Aciklama=? WHERE ListeID=?", (veri.ListeAdi, veri.Aciklama, liste_id))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Fiyat listesi bulunamadı.")
+        conn.commit()
+        return {"mesaj": "Fiyat listesi güncellendi."}
+    finally:
+        conn.close()
+
+@app.delete("/fiyat-listesi-sil/{liste_id}")
+def fiyat_listesi_sil(liste_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM FiyatListesiKalemleri WHERE ListeID=?", (liste_id,))
+        cursor.execute("DELETE FROM MusteriFiyatListesi WHERE ListeID=?", (liste_id,))
+        cursor.execute("DELETE FROM FiyatListeleri WHERE ListeID=?", (liste_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Fiyat listesi bulunamadı.")
+        conn.commit()
+        return {"mesaj": "Fiyat listesi silindi."}
+    finally:
+        conn.close()
+
 class FiyatListesiKalemRequest(BaseModel):
     ListeID: int
     StokKod: str
     Fiyat: float = Field(ge=0)
+    ParaBirimi: str = "TL"
 
 @app.post("/fiyat-listesi-kalem-ekle")
 def fiyat_listesi_kalem_ekle(veri: FiyatListesiKalemRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe"]))):
@@ -8335,9 +8614,10 @@ def fiyat_listesi_kalem_ekle(veri: FiyatListesiKalemRequest, user: dict = Depend
         cursor.execute("SELECT KalemID FROM FiyatListesiKalemleri WHERE ListeID=? AND StokKod=?", (veri.ListeID, veri.StokKod))
         mevcut = cursor.fetchone()
         if mevcut:
-            cursor.execute("UPDATE FiyatListesiKalemleri SET Fiyat=? WHERE KalemID=?", (veri.Fiyat, mevcut[0]))
+            cursor.execute("UPDATE FiyatListesiKalemleri SET Fiyat=?, ParaBirimi=? WHERE KalemID=?", (veri.Fiyat, veri.ParaBirimi, mevcut[0]))
         else:
-            cursor.execute("INSERT INTO FiyatListesiKalemleri (ListeID, StokKod, Fiyat) VALUES (?, ?, ?)", (veri.ListeID, veri.StokKod, veri.Fiyat))
+            cursor.execute("INSERT INTO FiyatListesiKalemleri (ListeID, StokKod, Fiyat, ParaBirimi) VALUES (?, ?, ?, ?)",
+                           (veri.ListeID, veri.StokKod, veri.Fiyat, veri.ParaBirimi))
         conn.commit()
         return {"mesaj": "Fiyat kaydedildi."}
     finally:
@@ -8348,10 +8628,23 @@ def fiyat_listesi_kalemleri_getir(liste_id: int, user: dict = Depends(get_curren
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("""SELECT k.KalemID, k.StokKod, ISNULL(s.StokAdi, k.StokKod), k.Fiyat
+        cursor.execute("""SELECT k.KalemID, k.StokKod, ISNULL(s.StokAdi, k.StokKod), k.Fiyat, ISNULL(k.ParaBirimi, 'TL')
                            FROM FiyatListesiKalemleri k LEFT JOIN StokKartlari s ON k.StokKod = s.StokKod
                            WHERE k.ListeID=? ORDER BY k.StokKod""", (liste_id,))
-        return {"kalemler": [{"KalemID": r[0], "StokKod": r[1], "StokAdi": r[2], "Fiyat": float(r[3])} for r in cursor.fetchall()]}
+        return {"kalemler": [{"KalemID": r[0], "StokKod": r[1], "StokAdi": r[2], "Fiyat": float(r[3]), "ParaBirimi": r[4]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.delete("/fiyat-listesi-kalem-sil/{kalem_id}")
+def fiyat_listesi_kalem_sil(kalem_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe"]))):
+    """Bir üründeki özel fiyatı bu listeden kaldırır (o ürün için tekrar standart
+    stok fiyatı geçerli olur)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM FiyatListesiKalemleri WHERE KalemID=?", (kalem_id,))
+        conn.commit()
+        return {"mesaj": "Özel fiyat kaldırıldı."}
     finally:
         conn.close()
 
@@ -8371,6 +8664,34 @@ def musteri_fiyat_listesi_ata(veri: MusteriFiyatListesiAtaRequest, user: dict = 
             cursor.execute("INSERT INTO MusteriFiyatListesi (MusteriID, ListeID) VALUES (?, ?)", (veri.MusteriID, veri.ListeID))
         conn.commit()
         return {"mesaj": "Müşteriye fiyat listesi atandı."}
+    finally:
+        conn.close()
+
+@app.get("/fiyat-listesi-musterileri/{liste_id}")
+def fiyat_listesi_musterileri_getir(liste_id: int, user: dict = Depends(get_current_user)):
+    """Bu fiyat listesinin şu anda hangi müşterilere atanmış olduğunu döner -
+    atama ekranında 'kime ne atadım' görünürlüğü için (arayüzden geri bildirim:
+    atama yapılıyor ama sonrası hiç görünmüyordu)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT m.MusteriID, m.FirmaAdi
+            FROM MusteriFiyatListesi mf JOIN Musteriler m ON mf.MusteriID = m.MusteriID
+            WHERE mf.ListeID = ? ORDER BY m.FirmaAdi
+        """, (liste_id,))
+        return {"musteriler": [{"MusteriID": r[0], "FirmaAdi": r[1]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.delete("/musteri-fiyat-listesi-kaldir/{musteri_id}")
+def musteri_fiyat_listesi_kaldir(musteri_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış", "Muhasebe"]))):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM MusteriFiyatListesi WHERE MusteriID=?", (musteri_id,))
+        conn.commit()
+        return {"mesaj": "Müşterinin fiyat listesi ataması kaldırıldı."}
     finally:
         conn.close()
 
@@ -8447,7 +8768,7 @@ def urun_fiyati_hesapla(stok_kod: str, miktar: float = 1, musteri_id: Optional[i
 
 def fiyat_politikasi_kontrol_et(cursor, stok_kod: str, musteri_id: Optional[int], miktar: float, girilen_fiyat: float, user: dict):
     """KRİTİK GÜVENLİK KONTROLÜ: Fiyat Listeleri/İskonto Kademeleri ekranları
-    önceden doğru hesaplıyordu ama /siparis-ekle, /siparis-grup-ekle, /teklif-olustur
+    önceden doğru hesaplıyordu ama /siparis-grup-ekle, /teklif-olustur
     hiçbirinde HİÇ danışılmıyordu - yani bir satış elemanı herhangi bir müşteriye
     herhangi bir fiyatı sisteme hiçbir engelle karşılaşmadan girebiliyordu ('fiyat
     politikası' tamamen dekoratifti). Bu fonksiyon, girilen fiyatın politika
@@ -9042,6 +9363,23 @@ def tedarikci_sil(tedarikci_id: int, user: dict = Depends(yetki_kontrol(["Yönet
 
 @app.post("/tahsilat-ekle")
 def tahsilat_ekle(tahsilat: TahsilatEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Satış"]))):
+    """Tahsilat kaydı + ödeme türüne göre ilgili alt sisteme otomatik işleme.
+
+    ÖNCEDEN: Nakit dışındaki HER ödeme türü (Havale/EFT, Kredi Kartı, Çek) sadece
+    soyut, genel "102 Bankalar" hesabına bir muhasebe kaydı düşüyordu - ne belirli
+    bir banka hesabının bakiyesi (Finans & Banka > Banka Hesapları listesi)
+    güncelleniyordu, ne de Çek seçilince Çek/Senet Portföyüne (vade/ciro takibi)
+    otomatik giriyordu. Bu üç sistem (Tahsilat, Banka Hesapları, Çek/Senet Portföyü)
+    birbirinden kopuktu - aynı işi iki farklı ekrandan iki farklı şekilde girmek
+    gerekiyordu. Artık:
+      - Havale/EFT veya Kredi Kartı ile birlikte bir BankaHesapID verilirse, o
+        hesabın bakiyesi de güncellenir ve BankaHareketleri'ne işlenir - Finans &
+        Banka ekranındaki "Banka Hareketi İşle" ile BİREBİR AYNI mantık kullanılır.
+      - Çek seçilirse otomatik olarak Çek/Senet Portföyüne (CekSenetKartlari) de
+        eklenir - Finans & Banka ekranındaki "Portföye Ekle" ile aynı mantık.
+    Banka hesabı/çek bilgisi verilmezse (opsiyonel alanlar boş bırakılırsa) eski,
+    basit davranışa (sadece genel 102 hesabına soyut kayıt) geri düşülür - geriye
+    dönük uyumluluk bozulmaz."""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -9055,20 +9393,60 @@ def tahsilat_ekle(tahsilat: TahsilatEkle, user: dict = Depends(yetki_kontrol(["Y
 
         cursor.execute("INSERT INTO Tahsilatlar (MusteriID, Tutar, OdemeTuru, Aciklama, SiparisID) VALUES (?, ?, ?, ?, ?)",
                        (tahsilat.MusteriID, tahsilat.Tutar, tahsilat.OdemeTuru, tahsilat.Aciklama, tahsilat.SiparisID))
+
+        ek_not = ""
         if tahsilat.OdemeTuru == "Nakit":
+            # Döviz kasa düzeltmesi (kasa_hareket_ekle ile AYNI sebep/çözüm): ÖNCEDEN EUR/USD
+            # kasaya nakit tahsilat, tutarı hiç çevrilmeden 1:1 TL gibi yevmiyeye yazılıyordu.
             cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi=?", (tahsilat.ParaBirimi,))
             kasa = cursor.fetchone()
+            tutar_tl, kur = tl_karsiligi_hesapla(tahsilat.Tutar, tahsilat.ParaBirimi)
             if kasa:
-                _kasa_hareket_isle(cursor, kasa[0], "Tahsilat", tahsilat.Tutar, "Giriş", tahsilat.Aciklama, None, user["username"])
-        hesap_kodu_kasa = "100" if tahsilat.OdemeTuru == "Nakit" else "102"
-        yevmiye_fisi_olustur(cursor, f"Tahsilat: {tahsilat.Aciklama}", "Tahsilat", tahsilat.MusteriID, [
-            (hesap_kodu_kasa, tahsilat.Tutar, 0, f"{tahsilat.OdemeTuru} tahsilat girişi"),
-            ("120", 0, tahsilat.Tutar, "Alıcılar hesabından düşüm"),
-        ], user["username"])
+                kur_kullanilan = kur if tahsilat.ParaBirimi.upper() != "TL" else None
+                tutar_tl_kayit = tutar_tl if tahsilat.ParaBirimi.upper() != "TL" else None
+                _kasa_hareket_isle(cursor, kasa[0], "Tahsilat", tahsilat.Tutar, "Giriş", tahsilat.Aciklama, None, user["username"],
+                                   kur_kullanilan, tutar_tl_kayit)
+            yevmiye_fisi_olustur(cursor, f"Tahsilat: {tahsilat.Aciklama}", "Tahsilat", tahsilat.MusteriID, [
+                ("100", tutar_tl, 0, "Nakit tahsilat girişi"),
+                ("120", 0, tutar_tl, "Alıcılar hesabından düşüm"),
+            ], user["username"])
+
+        elif tahsilat.OdemeTuru in ("Havale/EFT", "Kredi Kartı") and tahsilat.BankaHesapID:
+            cursor.execute("SELECT 1 FROM BankaHesaplari WHERE HesapID=?", (tahsilat.BankaHesapID,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Belirtilen banka hesabı bulunamadı.")
+            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID=?", (tahsilat.Tutar, tahsilat.BankaHesapID))
+            cursor.execute("""INSERT INTO BankaHareketleri (HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama)
+                               VALUES (?, ?, NULL, 'Gelen Havale', ?, ?)""",
+                           (tahsilat.BankaHesapID, tahsilat.MusteriID, tahsilat.Tutar, tahsilat.Aciklama))
+            yevmiye_fisi_olustur(cursor, f"Tahsilat (Banka): {tahsilat.Aciklama}", "Tahsilat", tahsilat.MusteriID, [
+                ("102", tahsilat.Tutar, 0, f"{tahsilat.OdemeTuru} tahsilat girişi - banka hesabına işlendi"),
+                ("120", 0, tahsilat.Tutar, "Alıcılar hesabından düşüm"),
+            ], user["username"])
+            ek_not = " ve banka hesabına işlendi"
+
+        elif tahsilat.OdemeTuru == "Çek":
+            evrak_no = tahsilat.CekEvrakNo or f"TAHS-{tahsilat.MusteriID}-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+            vade = tahsilat.CekVadeTarihi or datetime.date.today().isoformat()
+            cursor.execute("""INSERT INTO CekSenetKartlari (EvrakTipi, EvrakNo, AlinanMusteriID, Tutar, VadeTarihi, BankaBilgisi)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                           ("Müşteri Çeki", evrak_no, tahsilat.MusteriID, tahsilat.Tutar, vade, tahsilat.CekBankaBilgisi or ""))
+            yevmiye_fisi_olustur(cursor, f"Çek/Senet Kabulü (Tahsilat): {evrak_no}", "CekSenetKabul", evrak_no, [
+                ("101", tahsilat.Tutar, 0, f"Alınan Çekler ve Senetler - {evrak_no}"),
+                ("120", 0, tahsilat.Tutar, f"Alıcılar - {evrak_no} ile tahsil"),
+            ], user["username"])
+            ek_not = f" ve Çek/Senet Portföyüne eklendi ({evrak_no})"
+
+        else:
+            yevmiye_fisi_olustur(cursor, f"Tahsilat: {tahsilat.Aciklama}", "Tahsilat", tahsilat.MusteriID, [
+                ("102", tahsilat.Tutar, 0, f"{tahsilat.OdemeTuru} tahsilat girişi"),
+                ("120", 0, tahsilat.Tutar, "Alıcılar hesabından düşüm"),
+            ], user["username"])
+
         siparis_notu = f" (Sipariş #{tahsilat.SiparisID} karşılığı)" if tahsilat.SiparisID else ""
         log_islem(cursor, f"Tahsilat girildi: {tahsilat.Tutar} TL (Müşteri ID:{tahsilat.MusteriID}){siparis_notu}", user["username"])
         conn.commit()
-        return {"mesaj": f"{tahsilat.Tutar} TL tahsilat kasaya işlendi.{siparis_notu}"}
+        return {"mesaj": f"{tahsilat.Tutar} TL tahsilat işlendi{ek_not}.{siparis_notu}"}
     except HTTPException:
         conn.rollback()
         raise
@@ -9107,11 +9485,18 @@ def siparis_tahsilat_ozeti_getir(siparis_id: int, user: dict = Depends(get_curre
     finally:
         conn.close()
 
-def _kasa_hareket_isle(cursor, kasa_id, islem_turu, tutar, yon, aciklama, belge_no, kullanici):
+def _kasa_hareket_isle(cursor, kasa_id, islem_turu, tutar, yon, aciklama, belge_no, kullanici,
+                        kur_kullanilan=None, tutar_tl=None, banka_hesap_id=None):
+    """Kasalar.Bakiye HER ZAMAN kasanın kendi para biriminde güncellenir (tutar,
+    çevrilmeden) - bu doğru. kur_kullanilan/tutar_tl SADECE denetim izi için
+    KasaHareketleri'ne yazılır (o hareketin yevmiyeye hangi TL karşılığıyla
+    işlendiğini sonradan görebilmek için, bkz. kasa_hareket_ekle/masraf_ekle/
+    tahsilat_ekle - hepsi TL olmayan bir kasa seçildiğinde bunu doldurur)."""
     isaret = 1 if yon == "Giriş" else -1
     cursor.execute("UPDATE Kasalar SET Bakiye = Bakiye + ? WHERE KasaID=?", (tutar * isaret, kasa_id))
-    cursor.execute("""INSERT INTO KasaHareketleri (KasaID, IslemTuru, BelgeNo, Aciklama, Tutar, Yon, KullaniciAdi)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""", (kasa_id, islem_turu, belge_no, aciklama, tutar, yon, kullanici))
+    cursor.execute("""INSERT INTO KasaHareketleri (KasaID, IslemTuru, BelgeNo, Aciklama, Tutar, Yon, KullaniciAdi, KurKullanilan, TutarTL, BankaHesapID)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (kasa_id, islem_turu, belge_no, aciklama, tutar, yon, kullanici, kur_kullanilan, tutar_tl, banka_hesap_id))
 
 @app.get("/kasalar")
 def kasalari_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans", "Satış"]))):
@@ -9125,31 +9510,66 @@ def kasalari_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", 
 
 @app.post("/kasa-hareket-ekle")
 def kasa_hareket_ekle(veri: KasaHareketEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    """ÖNEMLİ (döviz kasa düzeltmesi): ÖNCEDEN EUR/USD kasadaki bir hareket, tutarı
+    HİÇ çevrilmeden 1:1 TL gibi yevmiyeye ("100"/"102") yazılıyordu - Kasalar.Bakiye
+    doğru döviz tutarını tutsa bile, muhasebe defteri (Mizan/Bilanço) o tutarı TL
+    sanıyordu. Artık tl_karsiligi_hesapla (TCMB kuru, kur-farki-fisi-ekle ile aynı
+    kaynak) ile TL karşılığı hesaplanıp yevmiyeye O yazılıyor; Kasalar.Bakiye yine
+    kendi döviz cinsinden (çevrilmeden) güncelleniyor - iki taraf da doğru.
+
+    Ayrıca "Bankadan Çekilen"/"Bankaya Yatırılan" artık opsiyonel BankaHesapID ile
+    gerçek bir banka hesabına bağlanabiliyor (verilmezse eskisi gibi soyut "102"
+    hesabına, gerçek BankaHesaplari/BankaHareketleri'ne dokunmadan işlenir - geriye
+    dönük uyumluluk bozulmaz)."""
     gecerli_islemler = {"Tahsilat": "Giriş", "Ödeme": "Çıkış", "Bankadan Çekilen": "Giriş", "Bankaya Yatırılan": "Çıkış"}
     if veri.IslemTuru not in gecerli_islemler:
         raise HTTPException(status_code=400, detail=f"Geçersiz işlem türü. Geçerli değerler: {list(gecerli_islemler)}")
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT Bakiye FROM Kasalar WHERE KasaID=?", (veri.KasaID,))
+        cursor.execute("SELECT Bakiye, ParaBirimi FROM Kasalar WHERE KasaID=?", (veri.KasaID,))
         kasa = cursor.fetchone()
         if not kasa:
             raise HTTPException(status_code=404, detail="Kasa bulunamadı.")
+        kasa_bakiye, kasa_para_birimi = kasa[0], kasa[1]
         yon = gecerli_islemler[veri.IslemTuru]
-        if yon == "Çıkış" and kasa[0] < veri.Tutar:
-            raise HTTPException(status_code=400, detail=f"Kasa bakiyesi yetersiz. Mevcut: {kasa[0]:.2f}")
-        _kasa_hareket_isle(cursor, veri.KasaID, veri.IslemTuru, veri.Tutar, yon, veri.Aciklama, veri.BelgeNo, user["username"])
+        if yon == "Çıkış" and kasa_bakiye < veri.Tutar:
+            raise HTTPException(status_code=400, detail=f"Kasa bakiyesi yetersiz. Mevcut: {kasa_bakiye:.2f} {kasa_para_birimi}")
+
+        tutar_tl, kur = tl_karsiligi_hesapla(veri.Tutar, kasa_para_birimi)
+        kur_kullanilan = kur if kasa_para_birimi.upper() != "TL" else None
+        tutar_tl_kayit = tutar_tl if kasa_para_birimi.upper() != "TL" else None
+
+        if veri.IslemTuru in ("Bankadan Çekilen", "Bankaya Yatırılan") and veri.BankaHesapID:
+            cursor.execute("SELECT 1 FROM BankaHesaplari WHERE HesapID=?", (veri.BankaHesapID,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Belirtilen banka hesabı bulunamadı.")
+            # Banka hesapları bu sistemde her zaman TL - kasa dövizse tl_karsiligi_hesapla
+            # ile hesaplanan TL karşılığı kullanılır, kasa TL ise zaten tutar_tl==veri.Tutar.
+            banka_isaret = -1 if veri.IslemTuru == "Bankadan Çekilen" else 1
+            banka_islem_turu = "Giden Havale" if veri.IslemTuru == "Bankadan Çekilen" else "Gelen Havale"
+            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID=?", (tutar_tl * banka_isaret, veri.BankaHesapID))
+            cursor.execute("""INSERT INTO BankaHareketleri (HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama)
+                               VALUES (?, NULL, NULL, ?, ?, ?)""",
+                           (veri.BankaHesapID, banka_islem_turu, tutar_tl, f"Kasa Hareketi: {veri.IslemTuru} - {veri.Aciklama}"))
+
+        _kasa_hareket_isle(cursor, veri.KasaID, veri.IslemTuru, veri.Tutar, yon, veri.Aciklama, veri.BelgeNo, user["username"],
+                           kur_kullanilan, tutar_tl_kayit, veri.BankaHesapID)
 
         yevmiye_satirlari_haritasi = {
-            "Tahsilat": [("100", veri.Tutar, 0, "Kasa girişi"), ("120", 0, veri.Tutar, "Alıcılar - kasa tahsilatı")],
-            "Ödeme": [("320", veri.Tutar, 0, "Satıcılar - kasa ödemesi"), ("100", 0, veri.Tutar, "Kasa çıkışı")],
-            "Bankadan Çekilen": [("100", veri.Tutar, 0, "Kasa girişi"), ("102", 0, veri.Tutar, "Bankadan çekiliş")],
-            "Bankaya Yatırılan": [("102", veri.Tutar, 0, "Bankaya yatırılan"), ("100", 0, veri.Tutar, "Kasa çıkışı")],
+            "Tahsilat": [("100", tutar_tl, 0, "Kasa girişi"), ("120", 0, tutar_tl, "Alıcılar - kasa tahsilatı")],
+            "Ödeme": [("320", tutar_tl, 0, "Satıcılar - kasa ödemesi"), ("100", 0, tutar_tl, "Kasa çıkışı")],
+            "Bankadan Çekilen": [("100", tutar_tl, 0, "Kasa girişi"), ("102", 0, tutar_tl, "Bankadan çekiliş")],
+            "Bankaya Yatırılan": [("102", tutar_tl, 0, "Bankaya yatırılan"), ("100", 0, tutar_tl, "Kasa çıkışı")],
         }
         yevmiye_fisi_olustur(cursor, f"Kasa Hareketi: {veri.IslemTuru} - {veri.Aciklama}", "KasaHareketi", veri.KasaID,
                              yevmiye_satirlari_haritasi[veri.IslemTuru], user["username"])
 
-        log_islem(cursor, f"Kasa hareketi: {veri.IslemTuru} - {veri.Tutar}", user["username"])
+        if veri.IslemTuru == "Ödeme" and veri.TedarikciID:
+            cursor.execute("INSERT INTO TedarikciOdemeleri (TedarikciID, Tutar, OdemeTuru, Aciklama, KullaniciAdi) VALUES (?, ?, 'Nakit', ?, ?)",
+                           (veri.TedarikciID, veri.Tutar, veri.Aciklama, user["username"]))
+
+        log_islem(cursor, f"Kasa hareketi: {veri.IslemTuru} - {veri.Tutar} {kasa_para_birimi}", user["username"])
         conn.commit()
         return {"mesaj": "Kasa hareketi işlendi."}
     except HTTPException:
@@ -9164,11 +9584,90 @@ def kasa_hareketleri_getir(kasa_id: int, user: dict = Depends(yetki_kontrol(["Y�
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT HareketID, Tarih, IslemTuru, BelgeNo, Aciklama, Tutar, Yon, KullaniciAdi
+            SELECT HareketID, Tarih, IslemTuru, BelgeNo, Aciklama, Tutar, Yon, KullaniciAdi, ISNULL(Durum,'Aktif')
             FROM KasaHareketleri WHERE KasaID=? ORDER BY Tarih DESC
         """, (kasa_id,))
         return {"hareketler": [{"HareketID": r[0], "Tarih": str(r[1])[:16], "IslemTuru": r[2], "BelgeNo": r[3] or "-",
-                                 "Aciklama": r[4] or "", "Tutar": r[5], "Yon": r[6], "Kullanici": r[7] or "-"} for r in cursor.fetchall()]}
+                                 "Aciklama": r[4] or "", "Tutar": r[5], "Yon": r[6], "Kullanici": r[7] or "-", "Durum": r[8]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.put("/kasa-hareket-iptal/{hareket_id}")
+def kasa_hareket_iptal(hareket_id: int, veri: HareketIptalRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    """/fatura-iptal (main.py:10719) ile AYNI storno deseni: kayıt SİLİNMEZ, Durum='İptal'
+    işaretlenir, Kasalar.Bakiye ters işaretle geri alınır, orijinalin TAM TERSİ bir
+    storno yevmiye fişi atılır (orijinalde KurKullanilan/TutarTL varsa - döviz kasa -
+    O TL karşılığı kullanılır, yoksa Tutar 1:1). ÖNCEDEN kasa hareketleri için hiçbir
+    düzeltme yolu yoktu - yanlış girilen bir hareket ya kalıcı olarak yevmiyede
+    yanlış dururdu ya da elden DB'den silinip öksüz yevmiye kaydı bırakırdı."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT KasaID, IslemTuru, Tutar, Yon, Aciklama, ISNULL(Durum,'Aktif'), Tarih, KurKullanilan, TutarTL
+                           FROM KasaHareketleri WHERE HareketID=?""", (hareket_id,))
+        satir = cursor.fetchone()
+        if not satir:
+            raise HTTPException(status_code=404, detail="Kasa hareketi bulunamadı.")
+        kasa_id, islem_turu, tutar, yon, aciklama, durum, tarih, kur_kullanilan, tutar_tl = satir
+        if durum == "İptal":
+            raise HTTPException(status_code=400, detail="Bu kasa hareketi zaten iptal edilmiş.")
+
+        hareket_tarihi = tarih.date() if hasattr(tarih, "date") else tarih
+        if donem_kilitli_mi(cursor, hareket_tarihi.year, hareket_tarihi.month):
+            if not veri.DonemKilitSifresi or not _donem_kilit_sifresi_dogrula(cursor, veri.DonemKilitSifresi):
+                raise HTTPException(status_code=403, detail=f"{hareket_tarihi.year}-{hareket_tarihi.month:02d} dönemi kilitli - iptal için doğru dönem kilit şifresi gerekli.")
+
+        cursor.execute("UPDATE KasaHareketleri SET Durum='İptal', IptalTarihi=GETDATE(), IptalEden=?, IptalNedeni=? WHERE HareketID=?",
+                       (user["username"], veri.Neden, hareket_id))
+
+        ters_isaret = -1 if yon == "Giriş" else 1
+        cursor.execute("UPDATE Kasalar SET Bakiye = Bakiye + ? WHERE KasaID=?", (tutar * ters_isaret, kasa_id))
+
+        tutar_yevmiye = tutar_tl if tutar_tl is not None else tutar
+        yevmiye_satirlari_haritasi = {
+            "Tahsilat": [("120", tutar_yevmiye, 0, "Alıcılar - kasa tahsilat iptali"), ("100", 0, tutar_yevmiye, "Kasa çıkışı (storno)")],
+            "Ödeme": [("100", tutar_yevmiye, 0, "Kasa girişi (storno)"), ("320", 0, tutar_yevmiye, "Satıcılar - kasa ödeme iptali")],
+            "Bankadan Çekilen": [("102", tutar_yevmiye, 0, "Bankadan çekiliş iptali"), ("100", 0, tutar_yevmiye, "Kasa çıkışı (storno)")],
+            "Bankaya Yatırılan": [("100", tutar_yevmiye, 0, "Kasa girişi (storno)"), ("102", 0, tutar_yevmiye, "Bankaya yatırılan iptali")],
+        }
+        if islem_turu in yevmiye_satirlari_haritasi:
+            yevmiye_fisi_olustur(cursor, f"Kasa Hareketi İptali: {islem_turu} - {veri.Neden}", "KasaHareketIptal", hareket_id,
+                                 yevmiye_satirlari_haritasi[islem_turu], user["username"])
+
+        log_islem(cursor, f"Kasa hareketi iptal edildi: #{hareket_id} - {veri.Neden}", user["username"])
+        conn.commit()
+        return {"mesaj": "Kasa hareketi iptal edildi, ters muhasebe kaydı atıldı."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/banka-hareketleri/{hesap_id}")
+def banka_hareketleri_getir(hesap_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "Finans"]))):
+    """Bir banka hesabının hareket geçmişini döner. ÖNCEDEN bu endpoint hiç yoktu -
+    BankaHareketleri tablosuna banka-hareket-ekle/masraf-ekle/taksit-ode/tahsilat-ekle
+    gibi endpoint'lerden yazılıyordu ama hiçbir yerden GERİ OKUNMUYORDU; kullanıcı bir
+    ödeme/tahsilat yaptığında hesabın Bakiye'sinin değiştiğini görüyordu ama işlemin
+    kendisini (kime, ne zaman, ne kadar) hiçbir listede göremiyordu - Kasa Hareketleri
+    ile aynı işlevi Banka için de sağlar."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT b.HareketID, b.Tarih, b.IslemTuru, b.Tutar, b.Aciklama,
+                   m.FirmaAdi, t.FirmaAdi, b.Mutabik, ISNULL(b.Durum,'Aktif')
+            FROM BankaHareketleri b
+            LEFT JOIN Musteriler m ON b.MusteriID = m.MusteriID
+            LEFT JOIN Tedarikciler t ON b.TedarikciID = t.TedarikciID
+            WHERE b.HesapID=? ORDER BY b.Tarih DESC
+        """, (hesap_id,))
+        return {"hareketler": [{"HareketID": r[0], "Tarih": str(r[1])[:16], "IslemTuru": r[2], "Tutar": float(r[3]),
+                                 "Aciklama": r[4] or "", "Musteri": r[5] or "-", "Tedarikci": r[6] or "-",
+                                 "Mutabik": bool(r[7]) if r[7] is not None else False, "Durum": r[8]} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -9536,9 +10035,9 @@ def teklif_olustur(veri: TeklifOlusturRequest, background_tasks: BackgroundTasks
             kur = kurlar.get(k.ParaBirimi, 1.0)
             toplam_tutar += satir_tutari * kur
 
-        cursor.execute("""INSERT INTO Teklifler (MusteriID, ToplamTutar, PdfYolu)
-                           OUTPUT inserted.TeklifID VALUES (?, ?, 'Gecici')""",
-                       (veri.MusteriID, toplam_tutar))
+        cursor.execute("""INSERT INTO Teklifler (MusteriID, ToplamTutar, PdfYolu, OlusturanKullanici)
+                           OUTPUT inserted.TeklifID VALUES (?, ?, 'Gecici', ?)""",
+                       (veri.MusteriID, toplam_tutar, user["username"]))
         teklif_id = int(cursor.fetchone()[0])
 
         for kalem in veri.Kalemler:
@@ -9616,6 +10115,44 @@ def teklif_listesi_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Satı
         """)
         return {"teklifler": [{"TeklifID": r[0], "FirmaAdi": r[1], "ToplamTutar": r[2], "Durum": r[3], "Tarih": str(r[4])[:10],
                                 "PdfYolu": r[5], "MusteriID": r[6]} for r in cursor.fetchall()]}
+    finally:
+        conn.close()
+
+@app.get("/teklif-detay/{teklif_id}")
+def teklif_detay_getir(teklif_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
+    """Bir teklifin başlık bilgisi + kalemlerini döner - liste ekranında bir teklife
+    çift tıklandığında içeriğini (PDF açmadan) göstermek için."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT t.TeklifID, m.FirmaAdi, t.ToplamTutar, t.Durum, t.Tarih, t.MusteriID, t.OlusturanKullanici
+            FROM Teklifler t JOIN Musteriler m ON t.MusteriID = m.MusteriID WHERE t.TeklifID = ?
+        """, (teklif_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Teklif bulunamadı.")
+        musteri_id = row[5]
+        cursor.execute("""SELECT StokKod, StokAdi, Miktar, BirimFiyat, ParaBirimi, SatirToplami
+                           FROM TeklifSatirlari WHERE TeklifID = ?""", (teklif_id,))
+        kalemler = []
+        for r in cursor.fetchall():
+            stok_kod, stok_adi, miktar, birim_fiyat = r[0], r[1], float(r[2]), float(r[3])
+            iskonto_tutari = 0.0
+            try:
+                # Kalemin girildiği andaki değil, GÜNCEL fiyat politikasına göre taban
+                # fiyat - geçmişe dönük tam doğru olmayabilir ama gerçek bir referans
+                # noktası verir (uydurma bir değer değil).
+                politika = _fiyat_politikasi_hesapla(cursor, stok_kod, musteri_id, miktar)
+                fark = (politika["TabanFiyat"] - birim_fiyat) * miktar
+                iskonto_tutari = round(fark, 2) if fark > 0 else 0.0
+            except Exception:
+                pass
+            kalemler.append({"StokKod": stok_kod, "StokAdi": stok_adi, "Miktar": miktar, "BirimFiyat": birim_fiyat,
+                              "ParaBirimi": r[4], "SatirToplami": float(r[5]), "IskontoTutari": iskonto_tutari})
+        return {"TeklifID": row[0], "FirmaAdi": row[1], "ToplamTutar": float(row[2]), "Durum": row[3],
+                "Tarih": str(row[4])[:10], "MusteriID": musteri_id, "OlusturanKullanici": row[6] or "-",
+                "Kalemler": kalemler}
     finally:
         conn.close()
 
@@ -9898,46 +10435,6 @@ def siparis_toplu_faturaya_cevir(veri: TopluFaturayaCevirRequest, user: dict = D
     finally:
         conn.close()
 
-@app.post("/siparis-ekle")
-def siparis_ekle(siparis: SiparisEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        toplam = siparis.Miktar * siparis.BirimFiyat
-        fiyat_politikasi_kontrol_et(cursor, siparis.StokKod, siparis.MusteriID, siparis.Miktar, siparis.BirimFiyat, user)
-
-        esik, zincir_id = onay_gerekli_mi(cursor, toplam, user)
-        if esik:
-            onay_id = onaya_gonder(cursor, "SiparisEkle", siparis.dict(), toplam,
-                                    f"Sipariş: {siparis.StokAdi} - {toplam:,.2f} TL", user, zincir_id)
-            conn.commit()
-            return {"mesaj": f"Sipariş tutarı ({toplam:,.2f} TL) onay eşiğini ({esik:,.2f} TL) aştığı için onaya gönderildi.",
-                    "OnayBekliyor": True, "OnayID": onay_id}
-
-        cursor.execute("""INSERT INTO Siparisler (MusteriID, StokKod, StokAdi, Miktar, BirimFiyat, ToplamTutar, SozVerilenTeslimTarihi)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                       (siparis.MusteriID, siparis.StokKod, siparis.StokAdi, siparis.Miktar, siparis.BirimFiyat, toplam, siparis.SozVerilenTeslimTarihi))
-        log_islem(cursor, f"Yeni sipariş alındı: {siparis.StokAdi}", user["username"])
-
-        # Stok Rezervasyonu: bu sipariş miktarını fiziksel olarak düşmeden "rezerve
-        # edilmiş" olarak işaretliyoruz - böylece başka bir sipariş aynı stoğu bir
-        # kez daha satamaz. Kullanılabilir miktar eksiye düşerse uyarı döndürülür.
-        uyari = None
-        if siparis.StokKod:
-            stok_rezerve_et(cursor, siparis.StokKod, siparis.Miktar)
-            kalan = stok_kullanilabilir_miktar(cursor, siparis.StokKod)
-            if kalan < 0:
-                uyari = f"⚠️ Bu sipariş sonrası '{siparis.StokKod}' kullanılabilir stoğu eksiye düştü ({kalan:g}) - tedarik/üretim planlaması gerekebilir."
-
-        conn.commit()
-        sonuc = {"mesaj": "Sipariş başarıyla alındı."}
-        if uyari:
-            sonuc["mesaj"] += f"\n{uyari}"
-            sonuc["StokUyarisi"] = uyari
-        return sonuc
-    finally:
-        conn.close()
-
 @app.post("/siparis-grup-ekle")
 def siparis_grup_ekle(veri: SiparisGrupEkleRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Satış"]))):
     """Tek bir sipariş içinde birden fazla ürün kalemi kabul eder (gerçek ERP'lerdeki çok
@@ -10196,14 +10693,20 @@ def alis_irsaliyesi_kes(req: AlisIrsaliyeKesRequest, user: dict = Depends(yetki_
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT INTO AlisIrsaliyeleri (TedarikciID, BelgeNo, Aciklama, KullaniciAdi, SozVerilenTeslimTarihi)
-            OUTPUT inserted.AlisIrsaliyeID VALUES (?, ?, ?, ?, ?)
-        """, (req.TedarikciID, req.BelgeNo, req.Aciklama, user["username"], req.SozVerilenTeslimTarihi))
+            INSERT INTO AlisIrsaliyeleri (TedarikciID, BelgeNo, FaturaNo, Aciklama, KullaniciAdi, SozVerilenTeslimTarihi)
+            OUTPUT inserted.AlisIrsaliyeID VALUES (?, ?, ?, ?, ?, ?)
+        """, (req.TedarikciID, req.BelgeNo, req.FaturaNo, req.Aciklama, user["username"], req.SozVerilenTeslimTarihi))
         alis_irsaliye_id = int(cursor.fetchone()[0])
 
+        toplam_tutar = 0.0
         for kalem in req.Kalemler:
-            cursor.execute("INSERT INTO AlisIrsaliyeKalemleri (AlisIrsaliyeID, StokKod, StokAdi, Miktar, KaliteSonucu) VALUES (?, ?, ?, ?, ?)",
-                           (alis_irsaliye_id, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.KaliteSonucu))
+            cursor.execute("INSERT INTO AlisIrsaliyeKalemleri (AlisIrsaliyeID, StokKod, StokAdi, Miktar, BirimFiyat, KaliteSonucu) VALUES (?, ?, ?, ?, ?, ?)",
+                           (alis_irsaliye_id, kalem.StokKod, kalem.StokAdi, kalem.Miktar, kalem.BirimFiyat, kalem.KaliteSonucu))
+            if kalem.BirimFiyat:
+                # Ortalama maliyet, StokKartlari.MevcutMiktar güncellenmeden ÖNCE hesaplanmalı
+                # (eski miktarı hâlâ doğru okuyabilmek için - bkz. stok_ortalama_maliyet_guncelle).
+                stok_ortalama_maliyet_guncelle(cursor, kalem.StokKod, kalem.Miktar, kalem.BirimFiyat)
+                toplam_tutar += kalem.Miktar * kalem.BirimFiyat
             cursor.execute("UPDATE StokKartlari SET MevcutMiktar = MevcutMiktar + ? WHERE StokKod = ?",
                            (kalem.Miktar, kalem.StokKod))
             depo_stok_guncelle(cursor, kalem.StokKod, (req.DepoID or varsayilan_depo_id(cursor)), kalem.Miktar)
@@ -10211,6 +10714,15 @@ def alis_irsaliyesi_kes(req: AlisIrsaliyeKesRequest, user: dict = Depends(yetki_
                                VALUES (?, 'GİRİŞ', ?, GETDATE(), ?)""",
                            (kalem.StokKod, kalem.Miktar, f"Alış İrsaliyesi #{alis_irsaliye_id} - Mal Kabul"))
             satinalma_talebi_teslim_alindi_isaretle(cursor, kalem.StokKod)
+
+        if toplam_tutar > 0:
+            # Fiyatı girilen kalemler için muhasebe fişi (153 Ticari Mallar borç / 320 Satıcılar alacak) -
+            # eskiden bu kayıt sadece ayrı bir "Alış Faturası" ekranından giriliyordu, artık tek
+            # ekranda (Alış İrsaliyesi Kes) fiyat girilirse otomatik oluşur.
+            yevmiye_fisi_olustur(cursor, f"Alış İrsaliyesi #{alis_irsaliye_id}", "AlisIrsaliyesi", alis_irsaliye_id, [
+                ("153", toplam_tutar, 0, "Ticari Mallar - alış"),
+                ("320", 0, toplam_tutar, "Satıcılar"),
+            ], user["username"])
 
         log_islem(cursor, f"Alış irsaliyesi (mal kabul) kesildi: #{alis_irsaliye_id}", user["username"])
         conn.commit()
@@ -10227,12 +10739,14 @@ def alis_irsaliyesi_listesi(user: dict = Depends(yetki_kontrol(["Yönetici", "De
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT ai.AlisIrsaliyeID, t.FirmaAdi, ai.BelgeNo, ai.Tarih, ai.Aciklama, ai.Durum
+            SELECT ai.AlisIrsaliyeID, t.FirmaAdi, ai.BelgeNo, ai.FaturaNo, ai.Tarih, ai.Aciklama, ai.Durum,
+                   ISNULL((SELECT SUM(k.Miktar * k.BirimFiyat) FROM AlisIrsaliyeKalemleri k
+                           WHERE k.AlisIrsaliyeID = ai.AlisIrsaliyeID AND k.BirimFiyat IS NOT NULL), 0)
             FROM AlisIrsaliyeleri ai JOIN Tedarikciler t ON ai.TedarikciID = t.TedarikciID
             ORDER BY ai.Tarih DESC
         """)
-        return {"irsaliyeler": [{"AlisIrsaliyeID": r[0], "FirmaAdi": r[1], "BelgeNo": r[2] or "-", "Tarih": str(r[3])[:16],
-                                  "Aciklama": r[4] or "", "Durum": r[5]} for r in cursor.fetchall()]}
+        return {"irsaliyeler": [{"AlisIrsaliyeID": r[0], "FirmaAdi": r[1], "BelgeNo": r[2] or "-", "FaturaNo": r[3] or "-",
+                                  "Tarih": str(r[4])[:16], "Aciklama": r[5] or "", "Durum": r[6], "ToplamTutar": float(r[7])} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -10241,8 +10755,8 @@ def alis_irsaliyesi_kalemleri(alis_irsaliye_id: int, user: dict = Depends(yetki_
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT StokKod, StokAdi, Miktar FROM AlisIrsaliyeKalemleri WHERE AlisIrsaliyeID=?", (alis_irsaliye_id,))
-        return {"kalemler": [{"StokKod": r[0], "StokAdi": r[1], "Miktar": r[2]} for r in cursor.fetchall()]}
+        cursor.execute("SELECT StokKod, StokAdi, Miktar, BirimFiyat FROM AlisIrsaliyeKalemleri WHERE AlisIrsaliyeID=?", (alis_irsaliye_id,))
+        return {"kalemler": [{"StokKod": r[0], "StokAdi": r[1], "Miktar": r[2], "BirimFiyat": float(r[3]) if r[3] is not None else None} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -10779,22 +11293,6 @@ def fatura_kes(veri: FaturaOlusturRequest, background_tasks: BackgroundTasks, us
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
-@app.post("/temizle")
-def veritabanini_temizle(user: dict = Depends(yetki_kontrol(["Yönetici"]))):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        # Eski hareketleri sil ve tüm bakiyeleri sıfırla
-        cursor.execute("DELETE FROM HesapHareketleri")
-        cursor.execute("UPDATE HesapPlani SET Bakiye = 0")
-        conn.commit()
-        return {"mesaj": "Veritabanı tertemiz oldu, Ahmet Bey gönderildi!"}
-    except Exception as e:
-        conn.rollback()
-        return {"hata": str(e)}
-    finally:
-        conn.close()
-
 @app.get("/fatura-xml-disa-aktar/{fatura_id}")
 def fatura_xml_disa_aktar(fatura_id: int, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
     conn = get_db_connection()
@@ -12602,11 +13100,20 @@ def banka_hesap_ekle(veri: BankaHesabiEkle, user: dict = Depends(yetki_kontrol([
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO BankaHesaplari (BankaAdi, SubeAdi, IbanNo, Bakiye) VALUES (?, ?, ?, ?)",
-                       (veri.BankaAdi, veri.SubeAdi, veri.IbanNo, veri.Bakiye))
+        # ÖNCEDEN Bakiye burada karşılıksız (herhangi bir yevmiye kaydı olmadan)
+        # girilebiliyordu - Mizan'da 102 Bankalar hesabıyla BankaHesaplari toplamı
+        # arasında açıklanamayan bir fark oluşuyordu. Açılış bakiyesi olan bir hesap
+        # eklemek isteyen kullanıcı, hesabı 0 bakiye ile açıp ardından bir "Kasa
+        # Hareketi" (Bankaya Yatırılan) veya "Banka Hareketi" (Gelen Havale) ile
+        # girmeli - bu yol zaten doğru, dengeli bir yevmiye kaydı atıyor.
+        ek_uyari = ""
+        if veri.Bakiye and abs(veri.Bakiye) > 0.01:
+            ek_uyari = " (Not: açılış bakiyesi karşılıksız kalmasın diye 0 ile açıldı - lütfen bir Kasa/Banka Hareketi ile girin.)"
+        cursor.execute("INSERT INTO BankaHesaplari (BankaAdi, SubeAdi, IbanNo, Bakiye) VALUES (?, ?, ?, 0)",
+                       (veri.BankaAdi, veri.SubeAdi, veri.IbanNo))
         log_islem(cursor, f"Yeni banka hesabı eklendi: {veri.BankaAdi}", user["username"])
         conn.commit()
-        return {"mesaj": "Banka hesabı eklendi."}
+        return {"mesaj": f"Banka hesabı eklendi.{ek_uyari}"}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -12625,6 +13132,12 @@ def banka_hesaplari_getir(user: dict = Depends(yetki_kontrol(["Yönetici", "Muha
 
 @app.post("/banka-hareket-ekle")
 def banka_hareket_ekle(veri: BankaHareketiEkle, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    # ÖNCEDEN IslemTuru "Gelen Havale"/"Giden Havale" dışında bir değer (ya da
+    # yazım hatası) gönderilirse aşağıdaki INSERT yine de çalışıyor, ama Bakiye
+    # güncellenmiyor ve yevmiye hiç yazılmıyordu - sessizce yarım bir kayıt
+    # oluşuyordu. Artık en baştan sıkı doğrulanıyor.
+    if veri.IslemTuru not in ("Gelen Havale", "Giden Havale"):
+        raise HTTPException(status_code=400, detail="IslemTuru 'Gelen Havale' veya 'Giden Havale' olmalı.")
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -12657,6 +13170,8 @@ def banka_hareket_ekle(veri: BankaHareketiEkle, user: dict = Depends(yetki_kontr
             cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye - ? WHERE HesapID = ?", (veri.Tutar, veri.HesapID))
             if veri.TedarikciID:
                 karsi_hesap, karsi_aciklama = "320", "Satıcılar - banka havalesi ile ödeme"
+                cursor.execute("INSERT INTO TedarikciOdemeleri (TedarikciID, Tutar, OdemeTuru, Aciklama, KullaniciAdi) VALUES (?, ?, 'Banka Havalesi', ?, ?)",
+                               (veri.TedarikciID, veri.Tutar, veri.Aciklama, user["username"]))
             elif veri.MusteriID:
                 karsi_hesap, karsi_aciklama = "120", "Alıcılar - müşteriye iade"
             else:
@@ -12669,6 +13184,57 @@ def banka_hareket_ekle(veri: BankaHareketiEkle, user: dict = Depends(yetki_kontr
         log_islem(cursor, f"Banka Hareketi: {veri.IslemTuru} - {veri.Tutar} TL", user["username"])
         conn.commit()
         return {"mesaj": "Banka hareketi işlendi."}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.put("/banka-hareket-iptal/{hareket_id}")
+def banka_hareket_iptal(hareket_id: int, veri: HareketIptalRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    """Kasa hareketi iptaliyle AYNI storno deseni (bkz. kasa_hareket_iptal main.py:9464).
+    Karşı hesap, hareket eklenirken kullanılan AYNI deterministik kurala göre
+    (MusteriID/TedarikciID varlığına bakarak) yeniden hesaplanır - ayrıca saklamaya
+    gerek yok, banka_hareket_ekle ile birebir aynı mantık."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama, ISNULL(Durum,'Aktif'), Tarih
+                           FROM BankaHareketleri WHERE HareketID=?""", (hareket_id,))
+        satir = cursor.fetchone()
+        if not satir:
+            raise HTTPException(status_code=404, detail="Banka hareketi bulunamadı.")
+        hesap_id, musteri_id, tedarikci_id, islem_turu, tutar, aciklama, durum, tarih = satir
+        if durum == "İptal":
+            raise HTTPException(status_code=400, detail="Bu banka hareketi zaten iptal edilmiş.")
+        if islem_turu not in ("Gelen Havale", "Giden Havale"):
+            raise HTTPException(status_code=400, detail=f"'{islem_turu}' türündeki eski bir kayıt otomatik iptal edilemez, elle düzeltilmeli.")
+
+        hareket_tarihi = tarih.date() if hasattr(tarih, "date") else tarih
+        if donem_kilitli_mi(cursor, hareket_tarihi.year, hareket_tarihi.month):
+            if not veri.DonemKilitSifresi or not _donem_kilit_sifresi_dogrula(cursor, veri.DonemKilitSifresi):
+                raise HTTPException(status_code=403, detail=f"{hareket_tarihi.year}-{hareket_tarihi.month:02d} dönemi kilitli - iptal için doğru dönem kilit şifresi gerekli.")
+
+        cursor.execute("UPDATE BankaHareketleri SET Durum='İptal', IptalTarihi=GETDATE(), IptalEden=?, IptalNedeni=? WHERE HareketID=?",
+                       (user["username"], veri.Neden, hareket_id))
+
+        if islem_turu == "Gelen Havale":
+            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye - ? WHERE HesapID = ?", (tutar, hesap_id))
+            karsi_hesap = "120" if musteri_id else ("320" if tedarikci_id else "649")
+            yevmiye_satirlari = [(karsi_hesap, tutar, 0, "Gelen havale iptali (storno)"), ("102", 0, tutar, "Bankalar çıkışı (storno)")]
+        else:
+            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID = ?", (tutar, hesap_id))
+            karsi_hesap = "320" if tedarikci_id else ("120" if musteri_id else "770")
+            yevmiye_satirlari = [("102", tutar, 0, "Bankalar girişi (storno)"), (karsi_hesap, 0, tutar, "Giden havale iptali (storno)")]
+
+        yevmiye_fisi_olustur(cursor, f"Banka Hareketi İptali: {islem_turu} - {veri.Neden}", "BankaHareketIptal", hareket_id,
+                             yevmiye_satirlari, user["username"])
+        log_islem(cursor, f"Banka hareketi iptal edildi: #{hareket_id} - {veri.Neden}", user["username"])
+        conn.commit()
+        return {"mesaj": "Banka hareketi iptal edildi, ters muhasebe kaydı atıldı."}
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -12825,11 +13391,16 @@ def cek_senet_ciro(veri: CekSenetCiro, user: dict = Depends(yetki_kontrol(["Yön
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT EvrakNo, Tutar FROM CekSenetKartlari WHERE EvrakID=?", (veri.EvrakID,))
+        cursor.execute("SELECT EvrakNo, Tutar, ISNULL(Durum,'Portföyde') FROM CekSenetKartlari WHERE EvrakID=?", (veri.EvrakID,))
         evrak = cursor.fetchone()
         if not evrak:
             raise HTTPException(status_code=404, detail="Evrak bulunamadı.")
-        evrak_no, tutar = evrak[0], float(evrak[1])
+        evrak_no, tutar, durum = evrak[0], float(evrak[1]), evrak[2]
+        # ÖNCEDEN Durum hiç kontrol edilmiyordu - aynı evrak birden fazla kez ciro
+        # edilebilir, ya da tahsil/karşılıksız işaretlenmiş bir evrak yine de ciro
+        # edilebilirdi (her ikisi de 101 hesabını gerçek dışı eksiye düşürür).
+        if durum != "Portföyde":
+            raise HTTPException(status_code=400, detail=f"Bu evrak zaten '{durum}' durumunda - sadece Portföyde olan evraklar ciro edilebilir.")
 
         cursor.execute("UPDATE CekSenetKartlari SET Durum = 'Ciro Edildi', VerilenTedarikciID = ? WHERE EvrakID = ?", (veri.VerilenTedarikciID, veri.EvrakID))
         # Elde tutulan bir çekin tedarikçiye ciro edilmesi (ödeme yerine devredilmesi):
@@ -12838,9 +13409,111 @@ def cek_senet_ciro(veri: CekSenetCiro, user: dict = Depends(yetki_kontrol(["Yön
             ("320", tutar, 0, f"Satıcılar - {evrak_no} ile ödeme"),
             ("101", 0, tutar, f"Alınan Çekler ve Senetler - {evrak_no} cirosu"),
         ], user["username"])
+        cursor.execute("INSERT INTO TedarikciOdemeleri (TedarikciID, Tutar, OdemeTuru, Aciklama, KullaniciAdi) VALUES (?, ?, 'Çek/Senet Cirosu', ?, ?)",
+                       (veri.VerilenTedarikciID, tutar, f"Ciro: {evrak_no}", user["username"]))
         log_islem(cursor, f"Evrak ciro edildi: #{veri.EvrakID}", user["username"])
         conn.commit()
         return {"mesaj": "Evrak ciro edildi."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+class CekSenetTahsil(BaseModel):
+    HedefTip: str  # "Kasa" veya "Banka"
+    HedefID: int
+
+class CekSenetKarsiliksiz(BaseModel):
+    Aciklama: Optional[str] = None
+
+@app.put("/cek-senet-tahsil/{evrak_id}")
+def cek_senet_tahsil(evrak_id: int, veri: CekSenetTahsil, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    """ÖNCEDEN elimizdeki bir çek/senetin vadesi geldiğinde bankaya/kasaya tahsil
+    edilmesinin HİÇBİR karşılığı yoktu - evrak sonsuza kadar 'Portföyde' kalırdı,
+    gerçekte tahsil edilip Kasa/Banka'ya geçse bile sistem bunu hiç bilmezdi.
+    101 Alınan Çekler ve Senetler'den çıkar, hedef Kasa/Banka'ya girer."""
+    if veri.HedefTip not in ("Kasa", "Banka"):
+        raise HTTPException(status_code=400, detail="HedefTip 'Kasa' veya 'Banka' olmalı.")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT EvrakNo, Tutar, ISNULL(Durum,'Portföyde') FROM CekSenetKartlari WHERE EvrakID=?", (evrak_id,))
+        evrak = cursor.fetchone()
+        if not evrak:
+            raise HTTPException(status_code=404, detail="Evrak bulunamadı.")
+        evrak_no, tutar, durum = evrak[0], float(evrak[1]), evrak[2]
+        if durum != "Portföyde":
+            raise HTTPException(status_code=400, detail=f"Bu evrak zaten '{durum}' durumunda - sadece Portföyde olan evraklar tahsil edilebilir.")
+
+        if veri.HedefTip == "Kasa":
+            cursor.execute("SELECT ParaBirimi FROM Kasalar WHERE KasaID=?", (veri.HedefID,))
+            kasa = cursor.fetchone()
+            if not kasa:
+                raise HTTPException(status_code=404, detail="Belirtilen kasa bulunamadı.")
+            tutar_tl, kur = tl_karsiligi_hesapla(tutar, kasa[0])
+            kur_kullanilan = kur if kasa[0].upper() != "TL" else None
+            tutar_tl_kayit = tutar_tl if kasa[0].upper() != "TL" else None
+            _kasa_hareket_isle(cursor, veri.HedefID, "Tahsilat", tutar, "Giriş", f"Çek/Senet Tahsili: {evrak_no}", evrak_no, user["username"],
+                               kur_kullanilan, tutar_tl_kayit)
+            hedef_hesap_kodu = "100"
+        else:
+            cursor.execute("SELECT 1 FROM BankaHesaplari WHERE HesapID=?", (veri.HedefID,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Belirtilen banka hesabı bulunamadı.")
+            cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID=?", (tutar, veri.HedefID))
+            cursor.execute("""INSERT INTO BankaHareketleri (HesapID, MusteriID, TedarikciID, IslemTuru, Tutar, Aciklama)
+                               VALUES (?, NULL, NULL, 'Gelen Havale', ?, ?)""",
+                           (veri.HedefID, tutar, f"Çek/Senet Tahsili: {evrak_no}"))
+            tutar_tl = tutar
+            hedef_hesap_kodu = "102"
+
+        cursor.execute("UPDATE CekSenetKartlari SET Durum = 'Tahsil Edildi' WHERE EvrakID = ?", (evrak_id,))
+        yevmiye_fisi_olustur(cursor, f"Çek/Senet Tahsili: {evrak_no}", "CekSenetTahsil", evrak_id, [
+            (hedef_hesap_kodu, tutar_tl, 0, f"{veri.HedefTip} girişi - {evrak_no} tahsili"),
+            ("101", 0, tutar_tl, f"Alınan Çekler ve Senetler - {evrak_no} tahsili"),
+        ], user["username"])
+        log_islem(cursor, f"Çek/Senet tahsil edildi: {evrak_no} ({veri.HedefTip})", user["username"])
+        conn.commit()
+        return {"mesaj": f"{evrak_no} tahsil edildi."}
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.put("/cek-senet-karsiliksiz/{evrak_id}")
+def cek_senet_karsiliksiz(evrak_id: int, veri: CekSenetKarsiliksiz, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe"]))):
+    """ÖNCEDEN karşılıksız çıkan bir çek/senedin HİÇBİR karşılığı yoktu - arayüzdeki
+    durum listesi 'Karşılıksız' seçeneğini gösteriyordu ama bunu üretecek hiçbir kod
+    yolu yoktu. Bu, orijinal kabul kaydının (101 borç / 120 alacak) TAM TERSİdir:
+    çek karşılıksız çıktığında aslında müşteriden tahsil edilmemiş olur, borcu
+    (120 Alıcılar) yeniden açılır ve elimizdeki 'alacak' (101) ortadan kalkar."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT EvrakNo, Tutar, AlinanMusteriID, ISNULL(Durum,'Portföyde') FROM CekSenetKartlari WHERE EvrakID=?", (evrak_id,))
+        evrak = cursor.fetchone()
+        if not evrak:
+            raise HTTPException(status_code=404, detail="Evrak bulunamadı.")
+        evrak_no, tutar, musteri_id, durum = evrak[0], float(evrak[1]), evrak[2], evrak[3]
+        if durum != "Portföyde":
+            raise HTTPException(status_code=400, detail=f"Bu evrak zaten '{durum}' durumunda - sadece Portföyde olan evraklar karşılıksız işaretlenebilir.")
+
+        cursor.execute("UPDATE CekSenetKartlari SET Durum = 'Karşılıksız' WHERE EvrakID = ?", (evrak_id,))
+        yevmiye_fisi_olustur(cursor, f"Çek/Senet Karşılıksız: {evrak_no} - {veri.Aciklama or ''}", "CekSenetKarsiliksiz", evrak_id, [
+            ("120", tutar, 0, f"Alıcılar - {evrak_no} karşılıksız, borç yeniden açıldı"),
+            ("101", 0, tutar, f"Alınan Çekler ve Senetler - {evrak_no} karşılıksız"),
+        ], user["username"])
+        log_islem(cursor, f"Çek/Senet karşılıksız işaretlendi: {evrak_no}", user["username"])
+        conn.commit()
+        return {"mesaj": f"{evrak_no} karşılıksız olarak işaretlendi, müşteri borcu yeniden açıldı."}
     except HTTPException:
         conn.rollback()
         raise
@@ -13400,9 +14073,6 @@ def onay_ver(onay_id: int, user: dict = Depends(get_current_user)):
         if islem_tipi == "EvrakIsleme":
             payload = EvrakPayload(**json.loads(veri_json))
             sonuc = evrak_isleme(data=payload, user=user)
-        elif islem_tipi == "SiparisEkle":
-            payload = SiparisEkleRequest(**json.loads(veri_json))
-            sonuc = siparis_ekle(siparis=payload, user=user)
         elif islem_tipi == "SiparisGrupEkle":
             payload = SiparisGrupEkleRequest(**json.loads(veri_json))
             sonuc = siparis_grup_ekle(veri=payload, user=user)
@@ -13855,11 +14525,11 @@ def personel_hareketlerini_getir(user: dict = Depends(yetki_kontrol(["Yönetici"
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            SELECT h.HareketID, p.AdSoyad, h.IslemTuru, h.Tutar, h.Aciklama, h.Tarih
+            SELECT h.HareketID, p.AdSoyad, h.IslemTuru, h.Tutar, h.Aciklama, h.Tarih, ISNULL(h.Durum,'Aktif')
             FROM PersonelHareketleri h JOIN Personeller p ON h.PersonelID = p.PersonelID
             ORDER BY h.Tarih DESC
         """)
-        return {"hareketler": [{"HareketID": r[0], "AdSoyad": r[1], "IslemTuru": r[2], "Tutar": r[3], "Aciklama": r[4], "Tarih": str(r[5])[:16]} for r in cursor.fetchall()]}
+        return {"hareketler": [{"HareketID": r[0], "AdSoyad": r[1], "IslemTuru": r[2], "Tutar": r[3], "Aciklama": r[4], "Tarih": str(r[5])[:16], "Durum": r[6]} for r in cursor.fetchall()]}
     finally:
         conn.close()
 
@@ -13887,13 +14557,21 @@ def personel_hareket_ekle(veri: PersonelHareketEkle, user: dict = Depends(yetki_
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO PersonelHareketleri (PersonelID, IslemTuru, Tutar, Aciklama) VALUES (?, ?, ?, ?)",
-                       (veri.PersonelID, veri.IslemTuru, veri.Tutar, veri.Aciklama))
-        
+        cursor.execute("INSERT INTO PersonelHareketleri (PersonelID, IslemTuru, Tutar, Aciklama, HesapID) VALUES (?, ?, ?, ?, ?)",
+                       (veri.PersonelID, veri.IslemTuru, veri.Tutar, veri.Aciklama, veri.HesapID))
+
         if veri.HesapID and veri.IslemTuru in ['Avans', 'Maaş Ödemesi']:
             cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye - ? WHERE HesapID = ?", (veri.Tutar, veri.HesapID))
             cursor.execute("INSERT INTO BankaHareketleri (HesapID, IslemTuru, Tutar, Aciklama) VALUES (?, 'Giden Havale', ?, ?)",
                            (veri.HesapID, veri.Tutar, f"IK İşlemi: {veri.Aciklama}"))
+        elif not veri.HesapID and veri.IslemTuru in ['Avans', 'Maaş Ödemesi']:
+            # HesapID verilmezse (nakit ödeme) yevmiyede "100 Kasa" yazılıyordu ama gerçek
+            # Kasalar.Bakiye/KasaHareketleri hiç güncellenmiyordu - Banka dalıyla tutarlı
+            # olması için burada da _kasa_hareket_isle çağrılır (varsayılan TL kasası).
+            cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi='TL'")
+            kasa = cursor.fetchone()
+            if kasa:
+                _kasa_hareket_isle(cursor, kasa[0], "Ödeme", veri.Tutar, "Çıkış", f"IK İşlemi: {veri.Aciklama}", None, user["username"])
 
         odeme_hesap_kodu = "102" if veri.HesapID else "100"
         yevmiye_haritasi = {
@@ -13908,6 +14586,63 @@ def personel_hareket_ekle(veri: PersonelHareketEkle, user: dict = Depends(yetki_
         log_islem(cursor, f"Personel Hareketi: {veri.IslemTuru} - {veri.Tutar} TL", user["username"])
         conn.commit()
         return {"mesaj": "İşlem kaydedildi."}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+@app.put("/personel-hareket-iptal/{hareket_id}")
+def personel_hareket_iptal(hareket_id: int, veri: HareketIptalRequest, user: dict = Depends(yetki_kontrol(["Yönetici", "Muhasebe", "İnsan Kaynakları"]))):
+    """Diğer iptal endpoint'leriyle AYNI storno deseni. Maaş Tahakkuku sadece 770/335
+    arası bir tahakkuk kaydıdır (kasa/banka çıkışı yok) - Avans/Maaş Ödemesi ise
+    gerçek bir kasa/banka çıkışıdır, HesapID kayıtlıysa (personel_hareket_ekle artık
+    saklıyor) o taraf da geri alınır."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""SELECT PersonelID, IslemTuru, Tutar, Aciklama, ISNULL(Durum,'Aktif'), Tarih, HesapID
+                           FROM PersonelHareketleri WHERE HareketID=?""", (hareket_id,))
+        satir = cursor.fetchone()
+        if not satir:
+            raise HTTPException(status_code=404, detail="Personel hareketi bulunamadı.")
+        personel_id, islem_turu, tutar, aciklama, durum, tarih, hesap_id = satir
+        if durum == "İptal":
+            raise HTTPException(status_code=400, detail="Bu personel hareketi zaten iptal edilmiş.")
+        if islem_turu not in ("Maaş Tahakkuku", "Avans", "Maaş Ödemesi"):
+            raise HTTPException(status_code=400, detail=f"'{islem_turu}' türündeki bir kayıt otomatik iptal edilemez.")
+
+        hareket_tarihi = tarih.date() if hasattr(tarih, "date") else tarih
+        if donem_kilitli_mi(cursor, hareket_tarihi.year, hareket_tarihi.month):
+            if not veri.DonemKilitSifresi or not _donem_kilit_sifresi_dogrula(cursor, veri.DonemKilitSifresi):
+                raise HTTPException(status_code=403, detail=f"{hareket_tarihi.year}-{hareket_tarihi.month:02d} dönemi kilitli - iptal için doğru dönem kilit şifresi gerekli.")
+
+        cursor.execute("UPDATE PersonelHareketleri SET Durum='İptal', IptalTarihi=GETDATE(), IptalEden=?, IptalNedeni=? WHERE HareketID=?",
+                       (user["username"], veri.Neden, hareket_id))
+
+        odeme_hesap_kodu = "102" if hesap_id else "100"
+        if islem_turu in ("Avans", "Maaş Ödemesi"):
+            if hesap_id:
+                cursor.execute("UPDATE BankaHesaplari SET Bakiye = Bakiye + ? WHERE HesapID=?", (tutar, hesap_id))
+                cursor.execute("INSERT INTO BankaHareketleri (HesapID, IslemTuru, Tutar, Aciklama) VALUES (?, 'Gelen Havale', ?, ?)",
+                               (hesap_id, tutar, f"Personel İptali: {islem_turu} - {veri.Neden}"))
+            else:
+                cursor.execute("SELECT KasaID FROM Kasalar WHERE ParaBirimi='TL'")
+                kasa = cursor.fetchone()
+                if kasa:
+                    _kasa_hareket_isle(cursor, kasa[0], "Tahsilat", tutar, "Giriş", f"Personel İptali: {islem_turu} - {veri.Neden}", None, user["username"])
+            yevmiye_satirlari = [(odeme_hesap_kodu, tutar, 0, f"{islem_turu} iptali (storno)"), ("335", 0, tutar, "Personele Borçlar (storno)")]
+        else:  # Maaş Tahakkuku
+            yevmiye_satirlari = [("335", tutar, 0, "Personele Borçlar (storno)"), ("770", 0, tutar, "Personel gideri tahakkuku iptali")]
+
+        yevmiye_fisi_olustur(cursor, f"Personel Hareketi İptali: {islem_turu} - {veri.Neden}", "PersonelIptal", hareket_id,
+                             yevmiye_satirlari, user["username"])
+        log_islem(cursor, f"Personel hareketi iptal edildi: #{hareket_id} - {veri.Neden}", user["username"])
+        conn.commit()
+        return {"mesaj": "Personel hareketi iptal edildi, ters muhasebe kaydı atıldı."}
+    except HTTPException:
+        conn.rollback()
+        raise
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=400, detail=str(e))
@@ -14084,6 +14819,25 @@ def guncel_kur_getir():
         return kurlar
     except Exception:
         return _kur_onbellek["kurlar"] or {"TL": 1.0}
+
+def tl_karsiligi_hesapla(tutar: float, para_birimi: str) -> tuple:
+    """Kasa/Masraf/Çek-Senet gibi döviz cinsinden girilebilen tutarları yevmiyeye
+    (HesapPlani'ndaki 100/102 hesapları TEK ve TL cinsinden olduğu için) doğru TL
+    karşılığıyla yazabilmek için ortak dönüşüm. ÖNCEDEN kasa_hareket_ekle/masraf_ekle
+    döviz tutarını hiç çevirmeden 1:1 TL gibi yevmiyeye yazıyordu (EUR/USD kasa
+    hareketleri muhasebe defterinde yanlış görünüyordu) - artık kur-farki-fisi-ekle
+    ile AYNI TCMB kaynağını (guncel_kur_getir, 10dk önbellekli) kullanıyor.
+    Döner: (tutar_tl, kullanilan_kur) - TL ise kur her zaman 1.0."""
+    para_birimi = (para_birimi or "TL").upper()
+    if para_birimi == "TL":
+        return tutar, 1.0
+    kur = guncel_kur_getir().get(para_birimi)
+    if not kur:
+        # TCMB'den kur alınamadıysa TL'ye SESSİZCE 1:1 çevirmek yerine hata verilir -
+        # yanlış (1:1) bir tutarla sessizce yanlış yevmiye kaydı atmaktansa, kullanıcının
+        # işlemi kısa süre sonra tekrar denemesi çok daha güvenli.
+        raise HTTPException(status_code=502, detail=f"'{para_birimi}' için güncel kur alınamadı, işlem muhasebeleştirilemedi. Lütfen kısa süre sonra tekrar deneyin.")
+    return tutar * kur, kur
 
 def excel_olustur(baslik, kolonlar, satirlar):
     """Verilen kolon başlıkları ve satırlarla şık, biçimlendirilmiş bir .xlsx dosyası

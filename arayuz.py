@@ -1,4 +1,23 @@
 import customtkinter as ctk
+
+# --- customtkinter CTkEntry.delete() placeholder hatası için yama ---
+# Bilinen bir customtkinter davranışı: bir CTkEntry şu an placeholder metnini
+# gösteriyorken .delete(0, "end") çağrılırsa (örn. "formu temizle" akışlarında),
+# placeholder metni geri gelmiyor - kutu hem gerçek değersiz hem placeholder'sız,
+# tamamen boş kalıyor (kullanıcıya "alanlar bozuk/görünmüyor" gibi geliyor).
+# CTkEntry'nin kendi _activate_placeholder() metodunu delete() sonrası elle
+# tetikleyerek düzeltiyoruz - tüm uygulamadaki CTkEntry'leri kapsayan tek, güvenli
+# bir noktadan yapılan düzeltme.
+_ctk_entry_delete_orijinal = ctk.CTkEntry.delete
+def _ctk_entry_delete_yamali(self, first_index, last_index=None):
+    _ctk_entry_delete_orijinal(self, first_index, last_index)
+    if hasattr(self, "_activate_placeholder"):
+        try:
+            self._activate_placeholder()
+        except Exception:
+            pass
+ctk.CTkEntry.delete = _ctk_entry_delete_yamali
+
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import requests
@@ -88,12 +107,13 @@ ctk.set_default_color_theme("blue")
 # PDF (reportlab) ve grafik (matplotlib) renkleri de kasıtlı dokunulmadı,
 # onlar her zaman kağıda/rapora basılacağı için temadan etkilenmemeli.
 # ================================================================
-RENK_TABAN = ("#f4f4f5", "#0f0f11")       # en dış pencere / girdi kutuları
-RENK_PANEL = ("#eeeef0", "#141416")       # sidebar / içerik paneli
+RENK_TABAN = ("#eaedf2", "#0f0f11")       # en dış pencere / girdi kutuları
+RENK_PANEL = ("#e2e6ed", "#141416")       # sidebar / içerik paneli
 RENK_KART = ("#ffffff", "#18181b")        # kart, form, tablo arka planı
-RENK_IKINCIL = ("#e4e4e7", "#27272a")     # ikincil panel / hover rengi
-RENK_KENARLIK = ("#d4d4d8", "#3f3f46")    # kenarlık / nötr buton
-RENK_STATUSBAR = ("#e4e4e7", "#09090b")   # en alt durum çubuğu
+RENK_IKINCIL = ("#dfe3ea", "#27272a")     # ikincil panel / hover rengi
+RENK_KENARLIK = ("#cbd1db", "#3f3f46")    # kenarlık / nötr buton
+RENK_STATUSBAR = ("#dfe3ea", "#09090b")   # en alt durum çubuğu
+RENK_ZEBRA = ("#f4f6f9", "#1e1e22")       # tablolarda bir satır atlamalı hafif ton
 
 RENK_METIN = ("#18181b", "#e4e4e7")       # ana metin
 RENK_METIN_SOLUK = ("#52525b", "#a1a1aa") # ikincil / soluk metin
@@ -152,9 +172,9 @@ def treeview_stilini_ayarla():
     style.theme_use("default")
     style.configure("Kurumsal.Treeview",
                      background=gecerli_renk(RENK_KART), foreground=gecerli_renk(RENK_METIN), fieldbackground=gecerli_renk(RENK_KART),
-                     rowheight=28, font=("Segoe UI", 10), borderwidth=0)
+                     rowheight=32, font=("Segoe UI", 10), borderwidth=0)
     style.configure("Kurumsal.Treeview.Heading",
-                     background=gecerli_renk(RENK_IKINCIL), foreground="#76CCE1", font=("Segoe UI", 10, "bold"),
+                     background=gecerli_renk(RENK_KART), foreground=gecerli_renk(RENK_METIN_SOLUK), font=("Segoe UI", 9),
                      borderwidth=0, relief="flat")
     style.map("Kurumsal.Treeview.Heading", background=[("active", gecerli_renk(RENK_KENARLIK))])
     style.map("Kurumsal.Treeview", background=[("selected", "#5585EF")], foreground=[("selected", "white")])
@@ -198,11 +218,280 @@ def _agac_excel_aktar(tree, kolonlar):
     except Exception as e:
         messagebox.showerror("Hata", f"Excel'e aktarılamadı:\n{e}")
 
+# Durum metni -> (dolgu rengi, yazı rengi) - "pill" rozetlerde kullanılıyor.
+_PILL_RENKLERI = {
+    "Kritik": ("#FCEBEB", "#A32D2D"), "Düşük": ("#FAEEDA", "#854F0B"), "Yeterli": ("#EAF3DE", "#3B6D11"),
+    "Bekliyor": ("#FAEEDA", "#854F0B"), "Onaylandı": ("#EAF3DE", "#3B6D11"), "İptal": ("#FCEBEB", "#A32D2D"),
+    "Tamamlandı": ("#EAF3DE", "#3B6D11"), "Reddedildi": ("#FCEBEB", "#A32D2D"),
+}
+
+
+class OzelTablo(ctk.CTkFrame):
+    """ttk.Treeview yerine TAMAMEN CTk widget'larından kurulu bir liste - bu
+    sayede gerçek yuvarlak köşeli kart, grid çizgisiz satırlar ve "Durum"
+    sütununda renkli pill rozetler mümkün oluyor (ttk.Treeview'ın hücre içine
+    şekil/rozet çizme imkanı yok - bu değişikliğin asıl sebebi bu).
+
+    Ekranın geri kalanı (örn. stok_duzenle_ac, stok_sil_islem) hiç değişmeden
+    çalışmaya devam etsin diye, bu sınıf ttk.Treeview'ın BU UYGULAMADA fiilen
+    kullanılan minimal alt kümesini taklit eder: get_children, insert, delete,
+    item, selection, selection_set, see, tag_configure. Ayrıca tablo_olustur'un
+    otomatik sağladığı 3 özelliği de taşır: başlığa tıkla-sırala, sağ tık
+    Excel'e aktar, ve genel event yönlendirme (bind() - bkz. aşağıdaki not)."""
+
+    def __init__(self, parent, kolonlar, genislikler=None, height=10, durum_kolonu=None):
+        super().__init__(parent, fg_color=RENK_KART, corner_radius=12)
+        self.kolonlar = kolonlar
+        self.genislikler = genislikler or [120] * len(kolonlar)
+        self.durum_kolonu = durum_kolonu
+        self._satirlar = {}
+        self._sira = []
+        self._secili_iid = None
+        self._tag_stilleri = {}
+        self._sirala_durumu = {"kolon": None, "ters": False}
+        # ttk.Treeview'daki gibi tree.bind("<Double-Button-1>", handler) çağrısı
+        # BU sınıfta işe yaramaz: her satır ayrı bir CTkFrame/CTkLabel olduğundan
+        # (Tk'de event'ler DOM gibi üst widget'a taşınmaz), self'e bind etmek
+        # satırlardaki tıklamaları YAKALAMAZ. Bunun yerine bind() override
+        # edilip kaydedilen her sequence, insert() içinde o satırın TÜM alt
+        # widget'larına da ayrıca bağlanıyor - 19 ekranın çift-tıklama detay
+        # popup'ı bu sayede sessizce bozulmadan çalışmaya devam ediyor.
+        self._bind_kayitlari = {}
+        self._baslik_etiketleri = {}
+
+        # Tema değiştirme butonu (tema_degistir_ve_yenile) bu listeyi gezip
+        # tema_yenile() çağırır - satır fg_color'ları .configure() ile SONRADAN
+        # atandığından customtkinter'ın otomatik açık/koyu geçişi buraya kadar
+        # güvenilir ulaşmıyor (ttk.Treeview'ın treeview_stilini_ayarla() ile
+        # elle yenilenmesiyle AYNI sebep/çözüm).
+        try:
+            uygulama = self.winfo_toplevel()
+            if hasattr(uygulama, "_ozel_tablolar"):
+                uygulama._ozel_tablolar.append(self)
+        except Exception:
+            pass
+
+        baslik = ctk.CTkFrame(self, fg_color="transparent")
+        baslik.pack(fill="x", padx=10, pady=(10, 6))
+        for i, kol in enumerate(kolonlar):
+            etiket = ctk.CTkLabel(baslik, text=kol.upper(), font=("Segoe UI", 11, "bold"), text_color=("#3f3f46", "#a1a1aa"),
+                                   width=self.genislikler[i], anchor="w", cursor="hand2")
+            etiket.pack(side="left", padx=6)
+            etiket.bind("<Button-1>", lambda e, k=kol: self._sirala(k))
+            self._baslik_etiketleri[kol] = etiket
+        ctk.CTkFrame(self, height=1, fg_color=RENK_KENARLIK).pack(fill="x", padx=10)
+
+        self._govde = ctk.CTkScrollableFrame(self, fg_color="transparent", height=height * 34)
+        self._govde.pack(fill="both", expand=True, padx=6, pady=(2, 8))
+
+        # --- sağ tık Excel'e aktar (tablo_olustur ile aynı davranış - otomatik) ---
+        self._sag_tik_menu = tk.Menu(self, tearoff=0)
+        self._sag_tik_menu.add_command(label="📊 Excel'e Aktar", command=lambda: _agac_excel_aktar(self, self.kolonlar))
+        self.bind("<Button-3>", self._sag_tik_goster)
+
+    def _sag_tik_goster(self, event):
+        try:
+            self._sag_tik_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._sag_tik_menu.grab_release()
+
+    def bind(self, sequence=None, func=None, add=None):
+        # bkz. __init__ notu: self'e bind etmek satır widget'larındaki
+        # tıklamaları yakalamaz, bu yüzden kaydedip insert() sırasında her
+        # satırın alt widget'larına ayrıca bağlıyoruz.
+        if sequence is None or func is None:
+            return super().bind(sequence, func, add)
+        self._bind_kayitlari[sequence] = func
+        for iid in self._sira:
+            self._satira_event_bagla(iid, sequence, func)
+        return None
+
+    def _satira_event_bagla(self, iid, sequence, func):
+        kayit = self._satirlar.get(iid)
+        if not kayit:
+            return
+        hedefler = [kayit["frame"]] + [w for pair in kayit["widgetlar"] for w in pair if w is not None]
+        for w in hedefler:
+            w.bind(sequence, func)
+
+    def _sirala(self, kolon):
+        ters = not self._sirala_durumu["ters"] if self._sirala_durumu["kolon"] == kolon else False
+
+        def _anahtar(iid):
+            i = self.kolonlar.index(kolon)
+            degerler = self._satirlar[iid]["values"]
+            deger = str(degerler[i]).strip() if i < len(degerler) else ""
+            temiz = deger.replace("TL", "").replace("%", "").replace(".", "").replace(",", ".").strip()
+            try:
+                return (0, float(temiz))
+            except ValueError:
+                return (1, deger.lower())
+
+        self._sira.sort(key=_anahtar, reverse=ters)
+        self._sirala_durumu["kolon"] = kolon
+        self._sirala_durumu["ters"] = ters
+        for i, iid in enumerate(self._sira):
+            self._satirlar[iid]["sira_no"] = i
+            self._satirlar[iid]["frame"].pack_forget()
+            self._satirlar[iid]["frame"].pack(fill="x", pady=1)
+            self._satir_yeniden_ciz(iid)
+        for kol, etiket in self._baslik_etiketleri.items():
+            ok = " ▼" if kol == kolon and ters else (" ▲" if kol == kolon else "")
+            etiket.configure(text=kol.upper() + ok)
+
+    def tag_configure(self, tag, foreground=None, background=None):
+        stil = self._tag_stilleri.setdefault(tag, {})
+        if foreground is not None:
+            stil["foreground"] = foreground
+        if background is not None:
+            stil["background"] = background
+        for iid in self._sira:
+            self._satir_yeniden_ciz(iid)
+
+    def get_children(self, parent=""):
+        return list(self._sira)
+
+    def insert(self, parent="", index="end", iid=None, tags=(), values=()):
+        if isinstance(tags, str):
+            tags = (tags,)
+        if iid is None:
+            iid = f"_satir_{len(self._sira)}"
+        satir = ctk.CTkFrame(self._govde, corner_radius=6, cursor="hand2")
+        satir.pack(fill="x", pady=1)
+        widgetlar = []
+        for i, kol in enumerate(self.kolonlar):
+            deger = values[i] if i < len(values) else ""
+            if kol == self.durum_kolonu and str(deger) in _PILL_RENKLERI:
+                bg, fg = _PILL_RENKLERI[str(deger)]
+                pill = ctk.CTkFrame(satir, corner_radius=12, fg_color=bg, width=self.genislikler[i] - 10, height=26)
+                pill.pack(side="left", padx=6, pady=4)
+                pill.pack_propagate(False)
+                lbl = ctk.CTkLabel(pill, text=str(deger), font=("Segoe UI", 11, "bold"), text_color=fg)
+                lbl.pack(expand=True)
+                widgetlar.append((pill, lbl))
+            else:
+                kalin = (i == 0)  # ilk sütun (Stok Kod) kalın - satırın "başlığı" gibi göz gezdirmeyi kolaylaştırır
+                lbl = ctk.CTkLabel(satir, text=str(deger), font=("Segoe UI", 12, "bold" if kalin else "normal"),
+                                    width=self.genislikler[i], anchor="w")
+                lbl.pack(side="left", padx=6, pady=7)
+                widgetlar.append((None, lbl))
+        self._satirlar[iid] = {"values": tuple(values), "tags": tags, "frame": satir,
+                                "widgetlar": widgetlar, "sira_no": len(self._sira)}
+        self._sira.append(iid)
+        tiklanabilirler = [satir] + [w for pair in widgetlar for w in pair if w is not None]
+        for w in tiklanabilirler:
+            w.bind("<Button-1>", lambda e, i=iid: self.selection_set(i))
+            w.bind("<Button-3>", self._sag_tik_goster)
+        for sequence, func in self._bind_kayitlari.items():
+            self._satira_event_bagla(iid, sequence, func)
+        self._satir_yeniden_ciz(iid)
+        return iid
+
+    def _satir_yeniden_ciz(self, iid):
+        kayit = self._satirlar.get(iid)
+        if not kayit:
+            return
+        secili = (iid == self._secili_iid)
+        zemin = RENK_KART if kayit["sira_no"] % 2 == 0 else RENK_ZEBRA
+        for t in kayit["tags"]:
+            stil = self._tag_stilleri.get(t, {})
+            if "background" in stil:
+                zemin = stil["background"]
+        kayit["frame"].configure(fg_color="#5585EF" if secili else zemin)
+        yazi_rengi = "#ffffff" if secili else None
+        for i, (pill, lbl) in enumerate(kayit["widgetlar"]):
+            if pill is not None:
+                continue  # pill rengi sabit kalır (durum anlamı taşıyor, seçimde değişmemeli)
+            renk = yazi_rengi or RENK_METIN
+            if not secili:
+                for t in kayit["tags"]:
+                    stil = self._tag_stilleri.get(t, {})
+                    if "foreground" in stil:
+                        renk = stil["foreground"]
+            lbl.configure(text_color=renk)
+
+    def tema_yenile(self):
+        """Açık/Koyu tema değiştirildiğinde tema_degistir_ve_yenile tarafından
+        çağrılır - satır renkleri .configure() ile sonradan atandığı için
+        otomatik geçişe güvenmek yerine hepsini elle yeniden çiziyoruz."""
+        for iid in self._sira:
+            self._satir_yeniden_ciz(iid)
+
+    def delete(self, iid):
+        kayit = self._satirlar.pop(iid, None)
+        if kayit:
+            kayit["frame"].destroy()
+            self._sira.remove(iid)
+            if self._secili_iid == iid:
+                self._secili_iid = None
+
+    def item(self, iid):
+        return {"values": self._satirlar[iid]["values"]}
+
+    def selection(self):
+        return (self._secili_iid,) if self._secili_iid is not None else ()
+
+    def selection_set(self, iid):
+        onceki = self._secili_iid
+        self._secili_iid = iid
+        if onceki is not None:
+            self._satir_yeniden_ciz(onceki)
+        self._satir_yeniden_ciz(iid)
+        # ttk.Treeview'a özel "<<TreeviewSelect>>" sanal event'ini taklit eder
+        # (yevmiye_fis_tree bu event'e bind ediyor - bkz. bind() notu)
+        handler = self._bind_kayitlari.get("<<TreeviewSelect>>")
+        if handler:
+            try:
+                handler(None)
+            except Exception:
+                pass
+
+    def see(self, iid):
+        kayit = self._satirlar.get(iid)
+        if not kayit or not self._sira:
+            return
+        oran = kayit["sira_no"] / max(1, len(self._sira) - 1)
+        try:
+            self._govde._parent_canvas.yview_moveto(max(0.0, min(1.0, oran)))
+        except Exception:
+            pass
+
+
 def tablo_olustur(parent, kolonlar, genislikler=None, height=10):
     cerceve = ctk.CTkFrame(parent, fg_color=RENK_KART, corner_radius=12)
     tree = ttk.Treeview(cerceve, columns=kolonlar, show="headings", height=height, style="Kurumsal.Treeview")
+
+    # --- HER TABLODA OTOMATİK TIKLA-SIRALA (başlığa tıklama) ---
+    # ERPNext/Logo gibi kurumsal ERP'lerde standart olan bir davranış - önceden
+    # HİÇBİR tabloda yoktu, kullanıcı büyüyen listelerde (örn. 1000+ sipariş)
+    # istediği sütuna göre sıralayamıyordu. Tek bir ortak fonksiyonda eklenip
+    # uygulamadaki TÜM tablolara (40'tan fazla ekran) otomatik uygulanır - her
+    # ekrana ayrı ayrı dokunmaya gerek yok.
+    _sirala_durumu = {"kolon": None, "ters": False}
+
+    def _sirala(kolon):
+        satirlar = [(tree.set(k, kolon), k) for k in tree.get_children("")]
+        ters = not _sirala_durumu["ters"] if _sirala_durumu["kolon"] == kolon else False
+
+        def _anahtar(oge):
+            deger = oge[0].strip()
+            temiz = deger.replace("TL", "").replace("%", "").replace(".", "").replace(",", ".").strip()
+            try:
+                return (0, float(temiz))
+            except ValueError:
+                return (1, deger.lower())
+
+        satirlar.sort(key=_anahtar, reverse=ters)
+        for index, (_, k) in enumerate(satirlar):
+            tree.move(k, "", index)
+        _sirala_durumu["kolon"] = kolon
+        _sirala_durumu["ters"] = ters
+        for kol in kolonlar:
+            ok = " ▼" if kol == kolon and ters else (" ▲" if kol == kolon else "")
+            tree.heading(kol, text=kol + ok)
+
     for i, kol in enumerate(kolonlar):
-        tree.heading(kol, text=kol)
+        tree.heading(kol, text=kol.upper(), command=lambda k=kol: _sirala(k))
         w = genislikler[i] if genislikler else 120
         tree.column(kol, width=w, anchor="center")
     vsb = ttk.Scrollbar(cerceve, orient="vertical", command=tree.yview)
@@ -211,6 +500,36 @@ def tablo_olustur(parent, kolonlar, genislikler=None, height=10):
     vsb.pack(side="right", fill="y", pady=2)
     for renk_adi, renk in DURUM_RENK.items():
         tree.tag_configure(renk_adi, foreground=renk)
+
+    # --- HER TABLODA OTOMATİK ZEBRA (bir satır atlamalı hafif ton) ---
+    # Önceden tek tek ekranlarda elle 'cift'/'tek' etiketi basılıp hiç
+    # tag_configure edilmediğinden (yani fiilen görünmüyordu) - artık
+    # tree.insert SARMALANARAK her tabloya otomatik uygulanıyor. Bir ekran
+    # zaten kendi 'cift'/'tek' etiketini basıyorsa (örn. Stok & Log) o
+    # etiketler burada YENİDEN kullanılıyor, çakışma olmuyor.
+    tree.tag_configure("cift", background=gecerli_renk(RENK_KART))
+    tree.tag_configure("tek", background=gecerli_renk(RENK_ZEBRA))
+    # Bu zebra renkleri gecerli_renk() ile ANDA çözülmüş düz string - tema
+    # sonradan değişince customtkinter'ın aksine ttk.Treeview KENDİLİĞİNDEN
+    # güncellenmez. tema_degistir_ve_yenile bu ağacı bulup yeniden boyayabilsin
+    # diye MainApp'e (parent'ın en üstteki penceresi) kaydediyoruz.
+    try:
+        uygulama = parent.winfo_toplevel()
+        if hasattr(uygulama, "_tum_agaclar"):
+            uygulama._tum_agaclar.append(tree)
+    except Exception:
+        pass
+    _orijinal_insert = tree.insert
+
+    def _zebra_insert(parent="", index="end", **kwargs):
+        mevcut_etiketler = kwargs.get("tags", ())
+        if isinstance(mevcut_etiketler, str):
+            mevcut_etiketler = (mevcut_etiketler,)
+        if "cift" not in mevcut_etiketler and "tek" not in mevcut_etiketler:
+            zebra = "cift" if len(tree.get_children(parent)) % 2 == 0 else "tek"
+            kwargs["tags"] = tuple(mevcut_etiketler) + (zebra,)
+        return _orijinal_insert(parent, index, **kwargs)
+    tree.insert = _zebra_insert
 
     # --- HER TABLODA OTOMATİK EXCEL'E AKTAR (sağ tık menüsü) ---
     # Tek tek her ekrana buton eklemek yerine, bu ortak fonksiyonda TEK SEFERDE
@@ -240,14 +559,14 @@ def duzenleme_penceresi(parent, baslik, alanlar, mevcut_degerler, kaydet_callbac
     win.grab_set()
     win.transient(parent)
 
-    ctk.CTkLabel(win, text=baslik, font=("Arial", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+    ctk.CTkLabel(win, text=baslik, font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
 
     kaydirmali_alan = ctk.CTkScrollableFrame(win, fg_color="transparent")
     kaydirmali_alan.pack(fill="both", expand=True, padx=5, pady=(0, 5))
 
     girdiler = {}
     for anahtar, etiket, salt_okunur in alanlar:
-        ctk.CTkLabel(kaydirmali_alan, text=etiket, font=("Arial", 11)).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kaydirmali_alan, text=etiket, font=("Segoe UI", 11)).pack(anchor="w", padx=20)
         e = ctk.CTkEntry(kaydirmali_alan, width=320)
         e.insert(0, str(mevcut_degerler.get(anahtar, "") or ""))
         if salt_okunur:
@@ -309,32 +628,32 @@ class LoginWindow(ctk.CTk):
             rozet = ctk.CTkFrame(ic_alan, width=76, height=76, corner_radius=38, fg_color="#76CCE1")
             rozet.pack(pady=(10, 18))
             rozet.pack_propagate(False)
-            ctk.CTkLabel(rozet, text="NP", font=("Arial", 26, "bold"), text_color=RENK_KART).pack(expand=True)
+            ctk.CTkLabel(rozet, text="NP", font=("Segoe UI", 26, "bold"), text_color=RENK_KART).pack(expand=True)
         
 
-        ctk.CTkLabel(ic_alan, text="Nisan Plastik ERP", font=("Arial", 25, "bold"), text_color=RENK_METIN_VURGU).pack()
-        ctk.CTkLabel(ic_alan, text="Geliştirici: Kerem Karaca", font=("Arial", 12), text_color=RENK_ETIKET).pack(pady=(4, 34))
+        ctk.CTkLabel(ic_alan, text="Nisan Plastik ERP", font=("Segoe UI", 25, "bold"), text_color=RENK_METIN_VURGU).pack()
+        ctk.CTkLabel(ic_alan, text="Geliştirici: Kerem Karaca", font=("Segoe UI", 12), text_color=RENK_ETIKET).pack(pady=(4, 34))
 
-        ctk.CTkLabel(ic_alan, text="KULLANICI ADI", font=("Arial", 10, "bold"), text_color=RENK_ETIKET, anchor="w").pack(fill="x")
+        ctk.CTkLabel(ic_alan, text="KULLANICI ADI", font=("Segoe UI", 10, "bold"), text_color=RENK_ETIKET, anchor="w").pack(fill="x")
         self.user_entry = ctk.CTkEntry(ic_alan, height=42, corner_radius=12, fg_color=RENK_TABAN,
-                                        border_color=RENK_KENARLIK, border_width=1, font=("Arial", 13))
+                                        border_color=RENK_KENARLIK, border_width=1, font=("Segoe UI", 13))
         self.user_entry.pack(fill="x", pady=(6, 18))
         self.user_entry.insert(0, "admin")
 
-        ctk.CTkLabel(ic_alan, text="ŞİFRE", font=("Arial", 10, "bold"), text_color=RENK_ETIKET, anchor="w").pack(fill="x")
+        ctk.CTkLabel(ic_alan, text="ŞİFRE", font=("Segoe UI", 10, "bold"), text_color=RENK_ETIKET, anchor="w").pack(fill="x")
         self.pass_entry = ctk.CTkEntry(ic_alan, height=42, corner_radius=12, fg_color=RENK_TABAN,
-                                        border_color=RENK_KENARLIK, border_width=1, font=("Arial", 13), show="●")
+                                        border_color=RENK_KENARLIK, border_width=1, font=("Segoe UI", 13), show="●")
         self.pass_entry.pack(fill="x", pady=(6, 6))
         self.pass_entry.insert(0, "123")
 
-        ctk.CTkLabel(ic_alan, text="Demo erişim: admin / 123", font=("Arial", 10), text_color=RENK_METIN_SOLUK, anchor="w").pack(fill="x", pady=(0, 24))
+        ctk.CTkLabel(ic_alan, text="Demo erişim: admin / 123", font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, anchor="w").pack(fill="x", pady=(0, 24))
 
         ctk.CTkButton(ic_alan, text="Güvenli Giriş Yap", fg_color="#49B772", hover_color="#3E9C61",
-                      height=44, corner_radius=12, font=("Arial", 14, "bold"),
+                      height=44, corner_radius=12, font=("Segoe UI", 14, "bold"),
                       command=self.check_login).pack(fill="x")
 
         ctk.CTkLabel(ic_alan, text="🔒 Yalnızca yerel ağ üzerinden erişim  ·  v9.0",
-                     font=("Arial", 10), text_color=RENK_KENARLIK).pack(pady=(28, 0))
+                     font=("Segoe UI", 10), text_color=RENK_KENARLIK).pack(pady=(28, 0))
 
         # Pencerenin HERHANGİ BİR YERİNDE (hiçbir kutuya tıklamadan bile) Enter'a
         # basınca giriş denensin - önceden sadece kullanıcı adı/şifre kutusuna
@@ -391,11 +710,11 @@ class FaturaMerkezi(ctk.CTkFrame):
         header_frame = ctk.CTkFrame(pencere, fg_color="transparent")
         header_frame.pack(fill="x", padx=20, pady=(20, 10))
 
-        ctk.CTkLabel(header_frame, text="📦 Ürün Kataloğu", font=("Arial", 18, "bold"), text_color=RENK_METIN).pack(anchor="w")
-        ctk.CTkLabel(header_frame, text="Depodan ürün seçin veya arayın", font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
+        ctk.CTkLabel(header_frame, text="📦 Ürün Kataloğu", font=("Segoe UI", 18, "bold"), text_color=RENK_METIN).pack(anchor="w")
+        ctk.CTkLabel(header_frame, text="Depodan ürün seçin veya arayın", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
 
         # Arama Kutusu
-        arama_kutu = ctk.CTkEntry(pencere, placeholder_text="🔍 Ürün veya kod ara...", height=42, font=("Arial", 14),
+        arama_kutu = ctk.CTkEntry(pencere, placeholder_text="🔍 Ürün veya kod ara...", height=42, font=("Segoe UI", 14),
                                   fg_color=RENK_IKINCIL, border_color=RENK_KENARLIK, text_color=RENK_METIN)
         arama_kutu.pack(fill="x", padx=20, pady=(10, 15))
 
@@ -453,11 +772,11 @@ class FaturaMerkezi(ctk.CTkFrame):
                     info_frame.pack(fill="x", padx=15, pady=12)
                     info_frame.bind("<Button-1>", secildi)
 
-                    lbl_ad = ctk.CTkLabel(info_frame, text=f"{ad} ({kod})", font=("Arial", 14, "bold"), text_color=RENK_METIN, anchor="w")
+                    lbl_ad = ctk.CTkLabel(info_frame, text=f"{ad} ({kod})", font=("Segoe UI", 14, "bold"), text_color=RENK_METIN, anchor="w")
                     lbl_ad.pack(fill="x")
                     lbl_ad.bind("<Button-1>", secildi)
 
-                    lbl_detay = ctk.CTkLabel(info_frame, text=f"Depo Miktarı: {stok_miktari} | Fiyat: {fiyat} TL", font=("Arial", 12), text_color=RENK_METIN_SOLUK, anchor="w")
+                    lbl_detay = ctk.CTkLabel(info_frame, text=f"Depo Miktarı: {stok_miktari} | Fiyat: {fiyat} TL", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK, anchor="w")
                     lbl_detay.pack(fill="x")
                     lbl_detay.bind("<Button-1>", lbl_detay.bind("<Button-1>", secildi))
 
@@ -469,7 +788,7 @@ class FaturaMerkezi(ctk.CTkFrame):
         ust_frame = ctk.CTkFrame(self, fg_color="transparent")
         ust_frame.pack(fill="x", padx=20, pady=10)
         
-        ctk.CTkLabel(ust_frame, text="🧾 Dinamik Fatura & Evrak Merkezi", font=("Arial", 18, "bold"), text_color="#64CCFA").pack(anchor="w")
+        ctk.CTkLabel(ust_frame, text="🧾 Dinamik Fatura & Evrak Merkezi", font=("Segoe UI", 18, "bold"), text_color="#64CCFA").pack(anchor="w")
         
         form_frame = ctk.CTkFrame(self, corner_radius=12)
         form_frame.pack(fill="x", padx=20, pady=5)
@@ -505,7 +824,7 @@ class FaturaMerkezi(ctk.CTkFrame):
         self.tarih.insert(0, datetime.datetime.now().strftime("%d.%m.%Y"))
         self.tarih.pack(side="left", padx=(0, 10))
 
-        ctk.CTkLabel(bilgi_frame, text="Depo:", font=("Arial", 11)).pack(side="left", padx=(0, 5))
+        ctk.CTkLabel(bilgi_frame, text="Depo:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 5))
         self.depo_secim = ctk.CTkOptionMenu(bilgi_frame, values=["Merkez Depo"], width=140)
         self.depo_secim.pack(side="left")
         self._depolar_cache_fm = []
@@ -513,12 +832,12 @@ class FaturaMerkezi(ctk.CTkFrame):
 
         # Müşteri Anlaşması iskonto bilgisi - cari seçilince doldurulur (bkz. cari_aktar)
         self._fm_aktif_anlasma = None
-        self.fm_anlasma_bilgi_etiket = ctk.CTkLabel(form_frame, text="", font=("Arial", 11, "bold"), text_color="#9965F1")
+        self.fm_anlasma_bilgi_etiket = ctk.CTkLabel(form_frame, text="", font=("Segoe UI", 11, "bold"), text_color="#9965F1")
         self.fm_anlasma_bilgi_etiket.pack(anchor="w", padx=15, pady=(0, 5))
 
         siparis_frame = ctk.CTkFrame(form_frame, fg_color="transparent")
         siparis_frame.pack(fill="x", padx=15, pady=(0, 15))
-        self.siparis_etiket = ctk.CTkLabel(siparis_frame, text="Bağlı Sipariş: Yok", font=("Arial", 12), text_color=RENK_METIN_SOLUK)
+        self.siparis_etiket = ctk.CTkLabel(siparis_frame, text="Bağlı Sipariş: Yok", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK)
         self.siparis_etiket.pack(side="left", padx=(0, 10))
         ctk.CTkButton(siparis_frame, text="🔑 Siparişten Seç", width=140, fg_color="#9965F1", hover_color="#8256CD",
                       command=self.siparis_sec_penceresi).pack(side="left", padx=(0, 8))
@@ -528,7 +847,7 @@ class FaturaMerkezi(ctk.CTkFrame):
         # 3. KALEMLER (ÜRÜNLER)
         kalem_baslik = ctk.CTkFrame(self, fg_color="transparent")
         kalem_baslik.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(kalem_baslik, text="Ürün / Hizmet Kalemleri", font=("Arial", 13, "bold")).pack(side="left")
+        ctk.CTkLabel(kalem_baslik, text="Ürün / Hizmet Kalemleri", font=("Segoe UI", 13, "bold")).pack(side="left")
         ctk.CTkButton(kalem_baslik, text="+ Kalem Ekle", width=110, fg_color="#45C89D", hover_color="#3BAA85", command=self.kalem_ekle).pack(side="right")
 
         self.kalemler_frame = ctk.CTkScrollableFrame(self, height=200, corner_radius=12)
@@ -538,7 +857,7 @@ class FaturaMerkezi(ctk.CTkFrame):
         alt_frame = ctk.CTkFrame(self, fg_color="transparent")
         alt_frame.pack(fill="x", padx=20, pady=15)
 
-        ctk.CTkButton(alt_frame, text="💾 Evrakı İşle & Kaydet", font=("Arial", 14, "bold"),
+        ctk.CTkButton(alt_frame, text="💾 Evrakı İşle & Kaydet", font=("Segoe UI", 14, "bold"),
                       fg_color="#5585EF", hover_color="#4871CB", height=45, width=200,
                       command=self.evrak_kaydet).pack(side="left", pady=10)
 
@@ -551,7 +870,7 @@ class FaturaMerkezi(ctk.CTkFrame):
         self.lbl_kdv_toplam = ctk.CTkLabel(toplam_frame, text="KDV Toplam: 0.00 TL", text_color="#d1d5db")
         self.lbl_kdv_toplam.pack(anchor="e", padx=10, pady=2)
 
-        self.lbl_genel_toplam = ctk.CTkLabel(toplam_frame, text="Genel Toplam: 0.00 TL", font=("Arial", 16, "bold"), text_color="#45C89D")
+        self.lbl_genel_toplam = ctk.CTkLabel(toplam_frame, text="Genel Toplam: 0.00 TL", font=("Segoe UI", 16, "bold"), text_color="#45C89D")
         self.lbl_genel_toplam.pack(anchor="e", padx=10, pady=(5, 5))
 
         self.kalem_ekle()
@@ -618,7 +937,7 @@ class FaturaMerkezi(ctk.CTkFrame):
         tevkifat.set("Yok")
         tevkifat.pack(side="left", padx=(0, 8))
 
-        satir_toplam_lbl = ctk.CTkLabel(satir, text="0.00 TL", font=("Arial", 11, "bold"), text_color="#64CCFA", width=90)
+        satir_toplam_lbl = ctk.CTkLabel(satir, text="0.00 TL", font=("Segoe UI", 11, "bold"), text_color="#64CCFA", width=90)
         satir_toplam_lbl.pack(side="left", padx=(0, 8))
 
         sil_btn = ctk.CTkButton(satir, text="✕", width=32, height=32, fg_color="#F36D6D", hover_color="#CF5D5D",
@@ -793,19 +1112,19 @@ class FaturaMerkezi(ctk.CTkFrame):
         header_frame.pack(fill="x", padx=20, pady=(20, 10))
 
         # Turuncu İkon
-        icon_label = ctk.CTkLabel(header_frame, text="🏢", font=("Arial", 22), width=48, height=48,
+        icon_label = ctk.CTkLabel(header_frame, text="🏢", font=("Segoe UI", 22), width=48, height=48,
                                   fg_color="#76CCE1", text_color=RENK_TABAN, corner_radius=16)
         icon_label.pack(side="left", padx=(0, 15))
 
         text_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         text_frame.pack(side="left", fill="both", expand=True)
 
-        ctk.CTkLabel(text_frame, text="Müşteri Seç", font=("Arial", 18, "bold"), text_color=RENK_METIN).pack(anchor="w")
-        ctk.CTkLabel(text_frame, text="Listeden seçin veya arayın", font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
+        ctk.CTkLabel(text_frame, text="Müşteri Seç", font=("Segoe UI", 18, "bold"), text_color=RENK_METIN).pack(anchor="w")
+        ctk.CTkLabel(text_frame, text="Listeden seçin veya arayın", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
 
         # --- 2. ARAMA KUTUSU ---
         arama_kutu = ctk.CTkEntry(pencere, placeholder_text="🔍 Firma adına göre ara...",
-                                  height=42, font=("Arial", 14), corner_radius=12,
+                                  height=42, font=("Segoe UI", 14), corner_radius=12,
                                   fg_color=RENK_IKINCIL, border_color=RENK_KENARLIK, text_color=RENK_METIN)
         arama_kutu.pack(fill="x", padx=20, pady=(10, 15))
 
@@ -814,7 +1133,7 @@ class FaturaMerkezi(ctk.CTkFrame):
         liste_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
         # --- 4. İPTAL BUTONU ---
-        btn_iptal = ctk.CTkButton(pencere, text="İptal", font=("Arial", 14), corner_radius=12,
+        btn_iptal = ctk.CTkButton(pencere, text="İptal", font=("Segoe UI", 14), corner_radius=12,
                                   fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, height=42,
                                   command=pencere.destroy)
         btn_iptal.pack(fill="x", padx=20, pady=(0, 20))
@@ -852,7 +1171,7 @@ class FaturaMerkezi(ctk.CTkFrame):
                     # Sol Yuvarlak Avatar
                     ilk_harf = ad[0].upper() if ad else "?"
                     avatar_renk = renkler[len(ad) % len(renkler)] # İsme göre sabit bir renk ata
-                    avatar = ctk.CTkLabel(kart, text=ilk_harf, font=("Arial", 16, "bold"),
+                    avatar = ctk.CTkLabel(kart, text=ilk_harf, font=("Segoe UI", 16, "bold"),
                                           width=44, height=44, corner_radius=22,
                                           fg_color=avatar_renk, text_color=RENK_METIN)
                     avatar.pack(side="left", padx=15, pady=12)
@@ -863,16 +1182,16 @@ class FaturaMerkezi(ctk.CTkFrame):
                     bilgi_kutu.pack(side="left", fill="both", expand=True, pady=12)
                     bilgi_kutu.bind("<Button-1>", kart_tiklandi)
 
-                    ad_lbl = ctk.CTkLabel(bilgi_kutu, text=ad, font=("Arial", 15, "bold"), text_color=RENK_METIN, anchor="w")
+                    ad_lbl = ctk.CTkLabel(bilgi_kutu, text=ad, font=("Segoe UI", 15, "bold"), text_color=RENK_METIN, anchor="w")
                     ad_lbl.pack(fill="x")
                     ad_lbl.bind("<Button-1>", kart_tiklandi)
 
-                    id_lbl = ctk.CTkLabel(bilgi_kutu, text=f"Müşteri ID: {m_id}", font=("Arial", 12), text_color=RENK_METIN_SOLUK, anchor="w")
+                    id_lbl = ctk.CTkLabel(bilgi_kutu, text=f"Müşteri ID: {m_id}", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK, anchor="w")
                     id_lbl.pack(fill="x")
                     id_lbl.bind("<Button-1>", kart_tiklandi)
 
                     # Sağ Ok Simgesi
-                    ok_lbl = ctk.CTkLabel(kart, text="›", font=("Arial", 24), text_color="#71717a")
+                    ok_lbl = ctk.CTkLabel(kart, text="›", font=("Segoe UI", 24), text_color="#71717a")
                     ok_lbl.pack(side="right", padx=15)
                     ok_lbl.bind("<Button-1>", kart_tiklandi)
 
@@ -961,23 +1280,23 @@ class FaturaMerkezi(ctk.CTkFrame):
 
         header_frame = ctk.CTkFrame(pencere, fg_color="transparent")
         header_frame.pack(fill="x", padx=20, pady=(20, 10))
-        icon_label = ctk.CTkLabel(header_frame, text="🏭", font=("Arial", 22), width=48, height=48,
+        icon_label = ctk.CTkLabel(header_frame, text="🏭", font=("Segoe UI", 22), width=48, height=48,
                                   fg_color="#76CCE1", text_color=RENK_TABAN, corner_radius=16)
         icon_label.pack(side="left", padx=(0, 15))
         text_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         text_frame.pack(side="left", fill="both", expand=True)
-        ctk.CTkLabel(text_frame, text="Tedarikçi Seç", font=("Arial", 18, "bold"), text_color=RENK_METIN).pack(anchor="w")
-        ctk.CTkLabel(text_frame, text="Listeden seçin veya arayın", font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
+        ctk.CTkLabel(text_frame, text="Tedarikçi Seç", font=("Segoe UI", 18, "bold"), text_color=RENK_METIN).pack(anchor="w")
+        ctk.CTkLabel(text_frame, text="Listeden seçin veya arayın", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
 
         arama_kutu = ctk.CTkEntry(pencere, placeholder_text="🔍 Firma adına göre ara...",
-                                  height=42, font=("Arial", 14), corner_radius=12,
+                                  height=42, font=("Segoe UI", 14), corner_radius=12,
                                   fg_color=RENK_IKINCIL, border_color=RENK_KENARLIK, text_color=RENK_METIN)
         arama_kutu.pack(fill="x", padx=20, pady=(10, 15))
 
         liste_frame = ctk.CTkScrollableFrame(pencere, fg_color="transparent")
         liste_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
-        btn_iptal = ctk.CTkButton(pencere, text="İptal", font=("Arial", 14), corner_radius=12,
+        btn_iptal = ctk.CTkButton(pencere, text="İptal", font=("Segoe UI", 14), corner_radius=12,
                                   fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, height=42,
                                   command=pencere.destroy)
         btn_iptal.pack(fill="x", padx=20, pady=(0, 20))
@@ -1006,7 +1325,7 @@ class FaturaMerkezi(ctk.CTkFrame):
                     kart.bind("<Button-1>", kart_tiklandi)
                     ilk_harf = ad[0].upper() if ad else "?"
                     avatar_renk = renkler[len(ad) % len(renkler)]
-                    avatar = ctk.CTkLabel(kart, text=ilk_harf, font=("Arial", 16, "bold"),
+                    avatar = ctk.CTkLabel(kart, text=ilk_harf, font=("Segoe UI", 16, "bold"),
                                           width=44, height=44, corner_radius=22,
                                           fg_color=avatar_renk, text_color=RENK_METIN)
                     avatar.pack(side="left", padx=15, pady=12)
@@ -1015,14 +1334,14 @@ class FaturaMerkezi(ctk.CTkFrame):
                     bilgi_kutu = ctk.CTkFrame(kart, fg_color="transparent")
                     bilgi_kutu.pack(side="left", fill="both", expand=True, pady=12)
                     bilgi_kutu.bind("<Button-1>", kart_tiklandi)
-                    ad_lbl = ctk.CTkLabel(bilgi_kutu, text=ad, font=("Arial", 15, "bold"), text_color=RENK_METIN, anchor="w")
+                    ad_lbl = ctk.CTkLabel(bilgi_kutu, text=ad, font=("Segoe UI", 15, "bold"), text_color=RENK_METIN, anchor="w")
                     ad_lbl.pack(fill="x")
                     ad_lbl.bind("<Button-1>", kart_tiklandi)
-                    id_lbl = ctk.CTkLabel(bilgi_kutu, text=f"Tedarikçi ID: {t_id}", font=("Arial", 12), text_color=RENK_METIN_SOLUK, anchor="w")
+                    id_lbl = ctk.CTkLabel(bilgi_kutu, text=f"Tedarikçi ID: {t_id}", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK, anchor="w")
                     id_lbl.pack(fill="x")
                     id_lbl.bind("<Button-1>", kart_tiklandi)
 
-                    ok_lbl = ctk.CTkLabel(kart, text="›", font=("Arial", 24), text_color="#71717a")
+                    ok_lbl = ctk.CTkLabel(kart, text="›", font=("Segoe UI", 24), text_color="#71717a")
                     ok_lbl.pack(side="right", padx=15)
                     ok_lbl.bind("<Button-1>", kart_tiklandi)
 
@@ -1046,9 +1365,9 @@ class FaturaMerkezi(ctk.CTkFrame):
         pencere.grab_set()
         pencere.focus()
 
-        ctk.CTkLabel(pencere, text="📦 Açık Siparişler", font=("Arial", 18, "bold"), text_color=RENK_METIN).pack(anchor="w", padx=20, pady=(20, 5))
+        ctk.CTkLabel(pencere, text="📦 Açık Siparişler", font=("Segoe UI", 18, "bold"), text_color=RENK_METIN).pack(anchor="w", padx=20, pady=(20, 5))
         ctk.CTkLabel(pencere, text="Seçtiğiniz sipariş bu evraka bağlanır; cari ve kalemler otomatik doldurulur.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20, pady=(0, 10))
 
         liste_frame = ctk.CTkScrollableFrame(pencere, fg_color="transparent")
         liste_frame.pack(fill="both", expand=True, padx=20, pady=(0, 10))
@@ -1076,11 +1395,11 @@ class FaturaMerkezi(ctk.CTkFrame):
             ic = ctk.CTkFrame(kart, fg_color="transparent")
             ic.pack(fill="x", padx=15, pady=10)
             ic.bind("<Button-1>", secildi)
-            ust = ctk.CTkLabel(ic, text=f"#{s['SiparisID']} — {s['FirmaAdi']}", font=("Arial", 14, "bold"), text_color=RENK_METIN, anchor="w")
+            ust = ctk.CTkLabel(ic, text=f"#{s['SiparisID']} — {s['FirmaAdi']}", font=("Segoe UI", 14, "bold"), text_color=RENK_METIN, anchor="w")
             ust.pack(fill="x")
             ust.bind("<Button-1>", secildi)
             alt = ctk.CTkLabel(ic, text=f"{s['StokAdi']} · Toplam: {s['Miktar']:g} · Kalan: {kalan:g} · {s['Durum']}",
-                                font=("Arial", 11), text_color="#45C89D" if kalan < s['Miktar'] else RENK_METIN_SOLUK, anchor="w")
+                                font=("Segoe UI", 11), text_color="#45C89D" if kalan < s['Miktar'] else RENK_METIN_SOLUK, anchor="w")
             alt.pack(fill="x")
             alt.bind("<Button-1>", secildi)
 
@@ -1129,14 +1448,14 @@ class MainApp(ctk.CTkToplevel):
         y = self.winfo_y() + (self.winfo_height() // 2) - (520 // 2)
         win.geometry(f"+{x}+{y}")
 
-        ctk.CTkLabel(win, text="📋 Kayıtlı Demirbaşlar ve Sabit Kıymetler", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=15)
+        ctk.CTkLabel(win, text="📋 Kayıtlı Demirbaşlar ve Sabit Kıymetler", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=15)
 
         liste_frame = ctk.CTkScrollableFrame(win, fg_color=RENK_KART, corner_radius=16, border_width=1, border_color=RENK_IKINCIL)
         liste_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         basliklar = ["Demirbaş Adı", "Kategori", "Alış Tutarı", "Seri No", "Açıklama"]
         for col_idx, baslik in enumerate(basliklar):
-            lbl = ctk.CTkLabel(liste_frame, text=baslik, font=("Arial", 12, "bold"), text_color="#76CCE1")
+            lbl = ctk.CTkLabel(liste_frame, text=baslik, font=("Segoe UI", 12, "bold"), text_color="#76CCE1")
             lbl.grid(row=0, column=col_idx, padx=15, pady=10, sticky="w")
 
         try:
@@ -1147,15 +1466,15 @@ class MainApp(ctk.CTkToplevel):
                     ctk.CTkLabel(liste_frame, text="Henüz kayıtlı demirbaş bulunamadı.", text_color=RENK_METIN_SOLUK).grid(row=1, column=0, columnspan=5, pady=20)
                 else:
                     for row_idx, item in enumerate(demirbaslar, start=1):
-                        ctk.CTkLabel(liste_frame, text=item.get("DemirbasAdi", ""), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=0, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(liste_frame, text=item.get("Kategori", ""), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=1, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=item.get("DemirbasAdi", ""), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=0, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=item.get("Kategori", ""), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=1, padx=15, pady=8, sticky="w")
                         
                         tutar = item.get("AlisTutari", 0)
                         tutar_str = f"{tutar:,.2f} TL" if isinstance(tutar, (int, float)) else f"{tutar} TL"
-                        ctk.CTkLabel(liste_frame, text=tutar_str, font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=2, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=tutar_str, font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=2, padx=15, pady=8, sticky="w")
                         
-                        ctk.CTkLabel(liste_frame, text=item.get("SeriNo", "-"), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=3, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(liste_frame, text=item.get("Aciklama", "-"), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=4, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=item.get("SeriNo", "-"), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=3, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=item.get("Aciklama", "-"), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=4, padx=15, pady=8, sticky="w")
             else:
                 self.api_hata_goster(res)
         except Exception as e:
@@ -1169,14 +1488,14 @@ class MainApp(ctk.CTkToplevel):
         win.transient(self)
         win.attributes("-topmost", True)
 
-        ctk.CTkLabel(win, text=f"📊 {hesap_kodu} Numaralı Hesap Ekstresi", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=15)
+        ctk.CTkLabel(win, text=f"📊 {hesap_kodu} Numaralı Hesap Ekstresi", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=15)
 
         liste = ctk.CTkScrollableFrame(win, fg_color=RENK_KART, corner_radius=16)
         liste.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         basliklar = ["Tarih", "Fiş No", "Açıklama", "Borç (Giren)", "Alacak (Çıkan)"]
         for c, b in enumerate(basliklar):
-            ctk.CTkLabel(liste, text=b, font=("Arial", 12, "bold"), text_color="#76CCE1").grid(row=0, column=c, padx=15, pady=10, sticky="w")
+            ctk.CTkLabel(liste, text=b, font=("Segoe UI", 12, "bold"), text_color="#76CCE1").grid(row=0, column=c, padx=15, pady=10, sticky="w")
 
         # Backend'den hesap detaylarını çekiyoruz
         try:
@@ -1187,15 +1506,15 @@ class MainApp(ctk.CTkToplevel):
                     ctk.CTkLabel(liste, text="Bu hesapta henüz hiçbir hareket yok.", text_color="gray").grid(row=1, column=0, columnspan=5, pady=20)
                 else:
                     for i, h in enumerate(hareketler, start=1):
-                        ctk.CTkLabel(liste, text=h["Tarih"], font=("Arial", 11)).grid(row=i, column=0, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(liste, text=h["FisNo"], font=("Arial", 11)).grid(row=i, column=1, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(liste, text=h["Aciklama"], font=("Arial", 11)).grid(row=i, column=2, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste, text=h["Tarih"], font=("Segoe UI", 11)).grid(row=i, column=0, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste, text=h["FisNo"], font=("Segoe UI", 11)).grid(row=i, column=1, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste, text=h["Aciklama"], font=("Segoe UI", 11)).grid(row=i, column=2, padx=15, pady=8, sticky="w")
                         
                         b_str = f"{h['Borc']:,.2f} TL" if h['Borc'] > 0 else "-"
                         a_str = f"{h['Alacak']:,.2f} TL" if h['Alacak'] > 0 else "-"
                         
-                        ctk.CTkLabel(liste, text=b_str, font=("Arial", 11, "bold"), text_color="#45C89D").grid(row=i, column=3, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(liste, text=a_str, font=("Arial", 11, "bold"), text_color="#F36D6D").grid(row=i, column=4, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste, text=b_str, font=("Segoe UI", 11, "bold"), text_color="#45C89D").grid(row=i, column=3, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste, text=a_str, font=("Segoe UI", 11, "bold"), text_color="#F36D6D").grid(row=i, column=4, padx=15, pady=8, sticky="w")
             else:
                 messagebox.showerror("Hata", "Hareketler çekilemedi.")
         except Exception as e:
@@ -1211,39 +1530,39 @@ class MainApp(ctk.CTkToplevel):
         win.transient(self)
         win.attributes("-topmost", True)
 
-        ctk.CTkLabel(win, text="📜 Genel Yevmiye Fişi (Tahsil / Tediye / Mahsup)", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=15)
+        ctk.CTkLabel(win, text="📜 Genel Yevmiye Fişi (Tahsil / Tediye / Mahsup)", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=15)
 
         # Üst Bilgi Alanı (Fiş Türü, Fiş No, Açıklama)
         form_frame = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=14)
         form_frame.pack(fill="x", padx=20, pady=(0, 15))
 
-        ctk.CTkLabel(form_frame, text="Fiş Türü:", font=("Arial", 11, "bold"), text_color=RENK_METIN).grid(row=0, column=0, padx=15, pady=10, sticky="w")
+        ctk.CTkLabel(form_frame, text="Fiş Türü:", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN).grid(row=0, column=0, padx=15, pady=10, sticky="w")
         turu_cb = ctk.CTkComboBox(form_frame, values=["Tahsil Fişi", "Tediye Fişi", "Mahsup Fişi"], width=150)
         turu_cb.grid(row=0, column=1, padx=15, pady=10, sticky="w")
         turu_cb.set("Mahsup Fişi")
 
-        ctk.CTkLabel(form_frame, text="Fiş No:", font=("Arial", 11, "bold"), text_color=RENK_METIN).grid(row=0, column=2, padx=15, pady=10, sticky="w")
+        ctk.CTkLabel(form_frame, text="Fiş No:", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN).grid(row=0, column=2, padx=15, pady=10, sticky="w")
         otomatik_fis_no = f"YEV-{datetime.now().strftime('%m%d%H%M')}"
         fisno_entry = ctk.CTkEntry(form_frame, width=150)
         fisno_entry.grid(row=0, column=3, padx=15, pady=10, sticky="w")
         fisno_entry.insert(0, otomatik_fis_no)
 
-        ctk.CTkLabel(form_frame, text="Genel Açıklama:", font=("Arial", 11, "bold"), text_color=RENK_METIN).grid(row=1, column=0, padx=15, pady=(0, 10), sticky="w")
+        ctk.CTkLabel(form_frame, text="Genel Açıklama:", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN).grid(row=1, column=0, padx=15, pady=(0, 10), sticky="w")
         genel_ack_entry = ctk.CTkEntry(form_frame, width=450)
         genel_ack_entry.grid(row=1, column=1, columnspan=3, padx=15, pady=(0, 10), sticky="w")
         genel_ack_entry.insert(0, "Genel yevmiye fişi kaydı")
 
         # Fiş Satırları Alanı
-        ctk.CTkLabel(win, text="Fiş Satırları (Borç ve Alacak toplamı eşit olmalıdır)", font=("Arial", 12, "bold"), text_color="#76CCE1").pack(anchor="w", padx=20, pady=(0, 5))
+        ctk.CTkLabel(win, text="Fiş Satırları (Borç ve Alacak toplamı eşit olmalıdır)", font=("Segoe UI", 12, "bold"), text_color="#76CCE1").pack(anchor="w", padx=20, pady=(0, 5))
         
         satir_scroll = ctk.CTkScrollableFrame(win, fg_color=RENK_KART, corner_radius=14, height=250)
         satir_scroll.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
         # Başlıklar
-        ctk.CTkLabel(satir_scroll, text="Hesap Kodu", font=("Arial", 11, "bold"), text_color="gray").grid(row=0, column=0, padx=10, pady=5)
-        ctk.CTkLabel(satir_scroll, text="Satır Açıklaması", font=("Arial", 11, "bold"), text_color="gray").grid(row=0, column=1, padx=10, pady=5)
-        ctk.CTkLabel(satir_scroll, text="Borç (TL)", font=("Arial", 11, "bold"), text_color="#45C89D").grid(row=0, column=2, padx=10, pady=5)
-        ctk.CTkLabel(satir_scroll, text="Alacak (TL)", font=("Arial", 11, "bold"), text_color="#F36D6D").grid(row=0, column=3, padx=10, pady=5)
+        ctk.CTkLabel(satir_scroll, text="Hesap Kodu", font=("Segoe UI", 11, "bold"), text_color="gray").grid(row=0, column=0, padx=10, pady=5)
+        ctk.CTkLabel(satir_scroll, text="Satır Açıklaması", font=("Segoe UI", 11, "bold"), text_color="gray").grid(row=0, column=1, padx=10, pady=5)
+        ctk.CTkLabel(satir_scroll, text="Borç (TL)", font=("Segoe UI", 11, "bold"), text_color="#45C89D").grid(row=0, column=2, padx=10, pady=5)
+        ctk.CTkLabel(satir_scroll, text="Alacak (TL)", font=("Segoe UI", 11, "bold"), text_color="#F36D6D").grid(row=0, column=3, padx=10, pady=5)
 
         satir_girisleri = []
         for i in range(1, 6):
@@ -1267,7 +1586,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(
             win, text="✅ Yevmiye Fişini Onayla ve Muhasebeye İşle", 
             fg_color="#45C89D", hover_color="#3BAA85", text_color=RENK_METIN,
-            font=("Arial", 13, "bold"), height=42,
+            font=("Segoe UI", 13, "bold"), height=42,
             command=lambda: self.yevmiye_gonder(turu_cb, fisno_entry, genel_ack_entry, satir_girisleri, win)
         ).pack(fill="x", padx=20, pady=(0, 20))
 
@@ -1352,7 +1671,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(
             ust_frame, text="📋 Cari Ekstre",
             fg_color="#9965F1", hover_color="#8256CD", text_color=RENK_METIN,
-            font=("Arial", 12, "bold"), height=35,
+            font=("Segoe UI", 12, "bold"), height=35,
             command=self.cari_ekstre_penceresi_ac
         ).pack(side="right", padx=(0, 10))
 
@@ -1360,7 +1679,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(
             ust_frame, text="🎯 Müşteri 360°",
             fg_color="#76CCE1", hover_color="#64ADBF", text_color=RENK_TABAN,
-            font=("Arial", 12, "bold"), height=35,
+            font=("Segoe UI", 12, "bold"), height=35,
             command=self.musteri_360_penceresi_ac
         ).pack(side="right", padx=(0, 10))
 
@@ -1368,7 +1687,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(
             ust_frame, text="📦 Tedarikçi Ekstresi", 
             fg_color="#64CCFA", hover_color="#55ADD5", text_color=RENK_METIN,
-            font=("Arial", 12, "bold"), height=35,
+            font=("Segoe UI", 12, "bold"), height=35,
             command=self.tedarikci_ekstre_penceresi_ac
         ).pack(side="right", padx=(0, 10))
 
@@ -1376,7 +1695,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(
             ust_frame, text="📈 Kâr / Zarar Tablosu", 
             fg_color="#45C89D", hover_color="#3BAA85", text_color=RENK_METIN,
-            font=("Arial", 12, "bold"), height=35,
+            font=("Segoe UI", 12, "bold"), height=35,
             command=self.kar_zarar_penceresi_ac
         ).pack(side="right", padx=(0, 10))
 
@@ -1384,7 +1703,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(
             ust_frame, text="📊 Mizan Raporu", 
             fg_color="#5585EF", hover_color="#4871CB", text_color=RENK_METIN,
-            font=("Arial", 12, "bold"), height=35,
+            font=("Segoe UI", 12, "bold"), height=35,
             command=self.mizan_raporu_ac
         ).pack(side="right", padx=(0, 10))
 
@@ -1392,27 +1711,27 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(
             ust_frame, text="📜 Yevmiye Fişi Kes", 
             fg_color="#9965F1", hover_color="#8256CD", text_color=RENK_METIN, 
-            font=("Arial", 12, "bold"), height=35,
+            font=("Segoe UI", 12, "bold"), height=35,
             command=self.yevmiye_fisi_penceresi_ac
         ).pack(side="right", padx=(0, 10))
         
         # Başlık Etiketi
-        ctk.CTkLabel(ust_frame, text="📚 Tek Düzen Hesap Planı (TDHP)", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust_frame, text="📚 Tek Düzen Hesap Planı (TDHP)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         
         # 5. Yenile Butonu
         ctk.CTkButton(
             ust_frame, text="🔄 Yenile", 
             fg_color="#5585EF", hover_color="#4871CB", text_color=RENK_METIN, 
-            font=("Arial", 12, "bold"), height=35,
+            font=("Segoe UI", 12, "bold"), height=35,
             command=self.hesap_planini_yenile
         ).pack(side="right", padx=(10, 0))
 
         # 6. Yeni Hesap Ekle Butonu
         ctk.CTkButton(
-            ust_frame, text="➕ Yeni Hesap Ekle", 
-            fg_color="#45C89D", hover_color="#3BAA85", text_color=RENK_METIN, 
-            font=("Arial", 12, "bold"), height=35,
-            command=lambda: messagebox.showinfo("Bilgi", "Yeni hesap açma penceresi eklenecek.")
+            ust_frame, text="➕ Yeni Hesap Ekle",
+            fg_color="#45C89D", hover_color="#3BAA85", text_color=RENK_METIN,
+            font=("Segoe UI", 12, "bold"), height=35,
+            command=self.hesap_plani_ekle_penceresi_ac
         ).pack(side="right")
 
         # Tablo Alanı
@@ -1430,13 +1749,13 @@ class MainApp(ctk.CTkToplevel):
         win.transient(self)
         win.attributes("-topmost", True)
 
-        ctk.CTkLabel(win, text="📦 Tedarikçi Cari Hesap ve Borç Ekstresi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=15)
+        ctk.CTkLabel(win, text="📦 Tedarikçi Cari Hesap ve Borç Ekstresi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=15)
 
         # Üst Arama Alanı
         top_frame = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=14)
         top_frame.pack(fill="x", padx=20, pady=(0, 15))
 
-        ctk.CTkLabel(top_frame, text="Tedarikçi ID:", font=("Arial", 11, "bold"), text_color=RENK_METIN).pack(side="left", padx=15, pady=12)
+        ctk.CTkLabel(top_frame, text="Tedarikçi ID:", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN).pack(side="left", padx=15, pady=12)
         
         id_entry = ctk.CTkEntry(top_frame, placeholder_text="Örn: 1", width=100)
         id_entry.pack(side="left", padx=5, pady=12)
@@ -1463,28 +1782,28 @@ class MainApp(ctk.CTkToplevel):
                     info_frame = ctk.CTkFrame(sonuc_scroll, fg_color=RENK_TABAN, corner_radius=12, height=50)
                     info_frame.pack(fill="x", padx=10, pady=10)
                     
-                    ctk.CTkLabel(info_frame, text=f"Tedarikçi: {ted.get('FirmaAdi', '')} (ID: {ted.get('TedarikciID')})", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(side="left", padx=15, pady=12)
-                    ctk.CTkLabel(info_frame, text=f"Kalan Borcumuz: {ted.get('Bakiye', 0):,.2f} TL", font=("Arial", 13, "bold"), text_color="#F36D6D").pack(side="right", padx=15, pady=12)
+                    ctk.CTkLabel(info_frame, text=f"Tedarikçi: {ted.get('FirmaAdi', '')} (ID: {ted.get('TedarikciID')})", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(side="left", padx=15, pady=12)
+                    ctk.CTkLabel(info_frame, text=f"Kalan Borcumuz: {ted.get('Bakiye', 0):,.2f} TL", font=("Segoe UI", 13, "bold"), text_color="#F36D6D").pack(side="right", padx=15, pady=12)
 
-                    ctk.CTkLabel(sonuc_scroll, text="📄 Alış Faturaları (Mal Alışları)", font=("Arial", 13, "bold"), text_color="#F36D6D").pack(anchor="w", padx=10, pady=(15, 5))
+                    ctk.CTkLabel(sonuc_scroll, text="📄 Alış Faturaları (Mal Alışları)", font=("Segoe UI", 13, "bold"), text_color="#F36D6D").pack(anchor="w", padx=10, pady=(15, 5))
                     if not alislar:
                         ctk.CTkLabel(sonuc_scroll, text="Bu tedarikçiye ait alış faturası bulunmuyor.", text_color="gray").pack(anchor="w", padx=20, pady=5)
                     else:
                         for f in alislar:
                             f_fr = ctk.CTkFrame(sonuc_scroll, fg_color=RENK_TABAN, height=35)
                             f_fr.pack(fill="x", padx=10, pady=3)
-                            ctk.CTkLabel(f_fr, text=f"Fatura #{f['FaturaID']} - Durum: {f['Durum']}", font=("Arial", 11), text_color=RENK_METIN).pack(side="left", padx=10)
-                            ctk.CTkLabel(f_fr, text=f"Tarih: {f['Tarih'][:10] if f['Tarih'] else ''} | Tutar: {f['ToplamTutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#F36D6D").pack(side="right", padx=10)
+                            ctk.CTkLabel(f_fr, text=f"Fatura #{f['FaturaID']} - Durum: {f['Durum']}", font=("Segoe UI", 11), text_color=RENK_METIN).pack(side="left", padx=10)
+                            ctk.CTkLabel(f_fr, text=f"Tarih: {f['Tarih'][:10] if f['Tarih'] else ''} | Tutar: {f['ToplamTutar']:,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#F36D6D").pack(side="right", padx=10)
 
-                    ctk.CTkLabel(sonuc_scroll, text="💰 Yapılan Ödemeler", font=("Arial", 13, "bold"), text_color="#5585EF").pack(anchor="w", padx=10, pady=(20, 5))
+                    ctk.CTkLabel(sonuc_scroll, text="💰 Yapılan Ödemeler", font=("Segoe UI", 13, "bold"), text_color="#5585EF").pack(anchor="w", padx=10, pady=(20, 5))
                     if not odemeler:
                         ctk.CTkLabel(sonuc_scroll, text="Bu tedarikçiye ait ödeme kaydı bulunmuyor.", text_color="gray").pack(anchor="w", padx=20, pady=5)
                     else:
                         for t in odemeler:
                             t_fr = ctk.CTkFrame(sonuc_scroll, fg_color=RENK_TABAN, height=35)
                             t_fr.pack(fill="x", padx=10, pady=3)
-                            ctk.CTkLabel(t_fr, text=f"Ödeme #{t['OdemeID']} ({t['OdemeTuru']}) - {t['Aciklama']}", font=("Arial", 11), text_color=RENK_METIN).pack(side="left", padx=10)
-                            ctk.CTkLabel(t_fr, text=f"Tarih: {t['Tarih'][:10] if t['Tarih'] else ''} | Tutar: {t['Tutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#5585EF").pack(side="right", padx=10)
+                            ctk.CTkLabel(t_fr, text=f"Ödeme #{t['OdemeID']} ({t['OdemeTuru']}) - {t['Aciklama']}", font=("Segoe UI", 11), text_color=RENK_METIN).pack(side="left", padx=10)
+                            ctk.CTkLabel(t_fr, text=f"Tarih: {t['Tarih'][:10] if t['Tarih'] else ''} | Tutar: {t['Tutar']:,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#5585EF").pack(side="right", padx=10)
 
                 else:
                     try:
@@ -1505,8 +1824,8 @@ class MainApp(ctk.CTkToplevel):
 
             baslik_kart = ctk.CTkFrame(sec_win, fg_color=RENK_KART, corner_radius=14, height=70)
             baslik_kart.pack(fill="x", padx=15, pady=15)
-            ctk.CTkLabel(baslik_kart, text="📦 Tedarikçi Seç", font=("Arial", 14, "bold"), text_color="#64CCFA").pack(anchor="w", padx=15, pady=(10, 2))
-            ctk.CTkLabel(baslik_kart, text="Listeden seçin veya arayın", font=("Arial", 11), text_color="gray").pack(anchor="w", padx=15, pady=(0, 10))
+            ctk.CTkLabel(baslik_kart, text="📦 Tedarikçi Seç", font=("Segoe UI", 14, "bold"), text_color="#64CCFA").pack(anchor="w", padx=15, pady=(10, 2))
+            ctk.CTkLabel(baslik_kart, text="Listeden seçin veya arayın", font=("Segoe UI", 11), text_color="gray").pack(anchor="w", padx=15, pady=(0, 10))
 
             arama_entry = ctk.CTkEntry(sec_win, placeholder_text="Firma adına göre ara...", width=420, height=38)
             arama_entry.pack(padx=15, pady=(0, 10))
@@ -1533,11 +1852,11 @@ class MainApp(ctk.CTkToplevel):
                                 
                                 harf = firma[0].upper() if firma else "T"
                                 avatar_renk = renkler[i % len(renkler)]
-                                avatar = ctk.CTkLabel(kart, text=harf, font=("Arial", 14, "bold"), fg_color=avatar_renk, text_color=RENK_METIN, corner_radius=8, width=36, height=36)
+                                avatar = ctk.CTkLabel(kart, text=harf, font=("Segoe UI", 14, "bold"), fg_color=avatar_renk, text_color=RENK_METIN, corner_radius=8, width=36, height=36)
                                 avatar.place(x=12, y=12)
 
-                                ctk.CTkLabel(kart, text=firma, font=("Arial", 12, "bold"), text_color=RENK_METIN).place(x=60, y=10)
-                                ctk.CTkLabel(kart, text=f"Tedarikçi ID: {tid}", font=("Arial", 10), text_color="gray").place(x=60, y=32)
+                                ctk.CTkLabel(kart, text=firma, font=("Segoe UI", 12, "bold"), text_color=RENK_METIN).place(x=60, y=10)
+                                ctk.CTkLabel(kart, text=f"Tedarikçi ID: {tid}", font=("Segoe UI", 10), text_color="gray").place(x=60, y=32)
 
                                 def sec(t_id=tid):
                                     id_entry.delete(0, "end")
@@ -1546,7 +1865,7 @@ class MainApp(ctk.CTkToplevel):
                                     ekstre_getir()
 
                                 btn = ctk.CTkButton(
-                                    kart, text="›", font=("Arial", 16, "bold"),
+                                    kart, text="›", font=("Segoe UI", 16, "bold"),
                                     fg_color="#334155", hover_color="#475569", text_color=RENK_METIN,
                                     width=35, height=35, corner_radius=8,
                                     command=sec
@@ -1560,21 +1879,21 @@ class MainApp(ctk.CTkToplevel):
 
             ctk.CTkButton(
                 sec_win, text="İptal", fg_color="#334155", hover_color="#475569", text_color=RENK_METIN,
-                font=("Arial", 12, "bold"), height=35, command=sec_win.destroy
+                font=("Segoe UI", 12, "bold"), height=35, command=sec_win.destroy
             ).pack(padx=15, pady=15, fill="x")
 
         # Üst bar butonları
         ctk.CTkButton(
             top_frame, text="🔍 Tedarikçi Seç", 
             fg_color="#64CCFA", hover_color="#55ADD5", text_color=RENK_METIN,
-            font=("Arial", 11, "bold"), height=32,
+            font=("Segoe UI", 11, "bold"), height=32,
             command=TedarikciSecModal
         ).pack(side="left", padx=10, pady=12)
 
         ctk.CTkButton(
             top_frame, text="🔍 Ekstre Getir", 
             fg_color="#9965F1", hover_color="#8256CD", text_color=RENK_METIN,
-            font=("Arial", 11, "bold"), height=32,
+            font=("Segoe UI", 11, "bold"), height=32,
             command=ekstre_getir
         ).pack(side="left", padx=5, pady=12)
 
@@ -1586,13 +1905,13 @@ class MainApp(ctk.CTkToplevel):
         win.transient(self)
         win.attributes("-topmost", True)
 
-        ctk.CTkLabel(win, text="📋 Müşteri Cari Hesap ve Hareket Ekstresi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=15)
+        ctk.CTkLabel(win, text="📋 Müşteri Cari Hesap ve Hareket Ekstresi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=15)
 
         # Üst Arama Alanı
         top_frame = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=14)
         top_frame.pack(fill="x", padx=20, pady=(0, 15))
 
-        ctk.CTkLabel(top_frame, text="Müşteri ID:", font=("Arial", 11, "bold"), text_color=RENK_METIN).pack(side="left", padx=15, pady=12)
+        ctk.CTkLabel(top_frame, text="Müşteri ID:", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN).pack(side="left", padx=15, pady=12)
         id_entry = ctk.CTkEntry(top_frame, placeholder_text="Örn: 1", width=100)
         id_entry.pack(side="left", padx=5, pady=12)
 
@@ -1619,28 +1938,28 @@ class MainApp(ctk.CTkToplevel):
                     info_frame = ctk.CTkFrame(sonuc_scroll, fg_color=RENK_TABAN, corner_radius=12, height=50)
                     info_frame.pack(fill="x", padx=10, pady=10)
                     
-                    ctk.CTkLabel(info_frame, text=f"Firma: {mus.get('FirmaAdi', '')} (ID: {mus.get('MusteriID')})", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(side="left", padx=15, pady=12)
-                    ctk.CTkLabel(info_frame, text=f"Güncel Bakiye: {mus.get('Bakiye', 0):,.2f} TL", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(side="right", padx=15, pady=12)
+                    ctk.CTkLabel(info_frame, text=f"Firma: {mus.get('FirmaAdi', '')} (ID: {mus.get('MusteriID')})", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(side="left", padx=15, pady=12)
+                    ctk.CTkLabel(info_frame, text=f"Güncel Bakiye: {mus.get('Bakiye', 0):,.2f} TL", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(side="right", padx=15, pady=12)
 
-                    ctk.CTkLabel(sonuc_scroll, text="📄 Kesilen Satış Faturaları", font=("Arial", 13, "bold"), text_color="#45C89D").pack(anchor="w", padx=10, pady=(15, 5))
+                    ctk.CTkLabel(sonuc_scroll, text="📄 Kesilen Satış Faturaları", font=("Segoe UI", 13, "bold"), text_color="#45C89D").pack(anchor="w", padx=10, pady=(15, 5))
                     if not faturalar:
                         ctk.CTkLabel(sonuc_scroll, text="Bu müşteriye ait fatura kaydı bulunmuyor.", text_color="gray").pack(anchor="w", padx=20, pady=5)
                     else:
                         for f in faturalar:
                             f_fr = ctk.CTkFrame(sonuc_scroll, fg_color=RENK_TABAN, height=35)
                             f_fr.pack(fill="x", padx=10, pady=3)
-                            ctk.CTkLabel(f_fr, text=f"Fatura #{f['FaturaID']} - Durum: {f['Durum']}", font=("Arial", 11), text_color=RENK_METIN).pack(side="left", padx=10)
-                            ctk.CTkLabel(f_fr, text=f"Tarih: {f['Tarih'][:10] if f['Tarih'] else ''} | Tutar: {f['ToplamTutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#45C89D").pack(side="right", padx=10)
+                            ctk.CTkLabel(f_fr, text=f"Fatura #{f['FaturaID']} - Durum: {f['Durum']}", font=("Segoe UI", 11), text_color=RENK_METIN).pack(side="left", padx=10)
+                            ctk.CTkLabel(f_fr, text=f"Tarih: {f['Tarih'][:10] if f['Tarih'] else ''} | Tutar: {f['ToplamTutar']:,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#45C89D").pack(side="right", padx=10)
 
-                    ctk.CTkLabel(sonuc_scroll, text="💰 Alınan Tahsilatlar ve Ödemeler", font=("Arial", 13, "bold"), text_color="#5585EF").pack(anchor="w", padx=10, pady=(20, 5))
+                    ctk.CTkLabel(sonuc_scroll, text="💰 Alınan Tahsilatlar ve Ödemeler", font=("Segoe UI", 13, "bold"), text_color="#5585EF").pack(anchor="w", padx=10, pady=(20, 5))
                     if not tahsilatlar:
                         ctk.CTkLabel(sonuc_scroll, text="Bu müşteriye ait tahsilat kaydı bulunmuyor.", text_color="gray").pack(anchor="w", padx=20, pady=5)
                     else:
                         for t in tahsilatlar:
                             t_fr = ctk.CTkFrame(sonuc_scroll, fg_color=RENK_TABAN, height=35)
                             t_fr.pack(fill="x", padx=10, pady=3)
-                            ctk.CTkLabel(t_fr, text=f"Tahsilat #{t['TahsilatID']} ({t['OdemeTuru']}) - {t['Aciklama']}", font=("Arial", 11), text_color=RENK_METIN).pack(side="left", padx=10)
-                            ctk.CTkLabel(t_fr, text=f"Tarih: {t['Tarih'][:10] if t['Tarih'] else ''} | Tutar: {t['Tutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#5585EF").pack(side="right", padx=10)
+                            ctk.CTkLabel(t_fr, text=f"Tahsilat #{t['TahsilatID']} ({t['OdemeTuru']}) - {t['Aciklama']}", font=("Segoe UI", 11), text_color=RENK_METIN).pack(side="left", padx=10)
+                            ctk.CTkLabel(t_fr, text=f"Tarih: {t['Tarih'][:10] if t['Tarih'] else ''} | Tutar: {t['Tutar']:,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#5585EF").pack(side="right", padx=10)
 
                 else:
                     try:
@@ -1661,8 +1980,8 @@ class MainApp(ctk.CTkToplevel):
 
             baslik_kart = ctk.CTkFrame(sec_win, fg_color=RENK_KART, corner_radius=14, height=70)
             baslik_kart.pack(fill="x", padx=15, pady=15)
-            ctk.CTkLabel(baslik_kart, text="🏢 Müşteri Seç", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=15, pady=(10, 2))
-            ctk.CTkLabel(baslik_kart, text="Listeden seçin veya arayın", font=("Arial", 11), text_color="gray").pack(anchor="w", padx=15, pady=(0, 10))
+            ctk.CTkLabel(baslik_kart, text="🏢 Müşteri Seç", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=15, pady=(10, 2))
+            ctk.CTkLabel(baslik_kart, text="Listeden seçin veya arayın", font=("Segoe UI", 11), text_color="gray").pack(anchor="w", padx=15, pady=(0, 10))
 
             arama_entry = ctk.CTkEntry(sec_win, placeholder_text="Firma adına göre ara...", width=420, height=38)
             arama_entry.pack(padx=15, pady=(0, 10))
@@ -1689,11 +2008,11 @@ class MainApp(ctk.CTkToplevel):
                                 
                                 harf = firma[0].upper() if firma else "M"
                                 avatar_renk = renkler[i % len(renkler)]
-                                avatar = ctk.CTkLabel(kart, text=harf, font=("Arial", 14, "bold"), fg_color=avatar_renk, text_color=RENK_METIN, corner_radius=8, width=36, height=36)
+                                avatar = ctk.CTkLabel(kart, text=harf, font=("Segoe UI", 14, "bold"), fg_color=avatar_renk, text_color=RENK_METIN, corner_radius=8, width=36, height=36)
                                 avatar.place(x=12, y=12)
 
-                                ctk.CTkLabel(kart, text=firma, font=("Arial", 12, "bold"), text_color=RENK_METIN).place(x=60, y=10)
-                                ctk.CTkLabel(kart, text=f"Müşteri ID: {mid}", font=("Arial", 10), text_color="gray").place(x=60, y=32)
+                                ctk.CTkLabel(kart, text=firma, font=("Segoe UI", 12, "bold"), text_color=RENK_METIN).place(x=60, y=10)
+                                ctk.CTkLabel(kart, text=f"Müşteri ID: {mid}", font=("Segoe UI", 10), text_color="gray").place(x=60, y=32)
 
                                 def sec(m_id=mid):
                                     id_entry.delete(0, "end")
@@ -1702,7 +2021,7 @@ class MainApp(ctk.CTkToplevel):
                                     ekstre_getir()
 
                                 btn = ctk.CTkButton(
-                                    kart, text="›", font=("Arial", 16, "bold"),
+                                    kart, text="›", font=("Segoe UI", 16, "bold"),
                                     fg_color="#334155", hover_color="#475569", text_color=RENK_METIN,
                                     width=35, height=35, corner_radius=8,
                                     command=sec
@@ -1716,21 +2035,21 @@ class MainApp(ctk.CTkToplevel):
 
             ctk.CTkButton(
                 sec_win, text="İptal", fg_color="#334155", hover_color="#475569", text_color=RENK_METIN,
-                font=("Arial", 12, "bold"), height=35, command=sec_win.destroy
+                font=("Segoe UI", 12, "bold"), height=35, command=sec_win.destroy
             ).pack(padx=15, pady=15, fill="x")
 
         # Üst bar butonları (id_entry tanımlandıktan sonra hemen buraya ekleniyor)
         ctk.CTkButton(
             top_frame, text="🔍 Müşteri Seç", 
             fg_color="#5585EF", hover_color="#4871CB", text_color=RENK_METIN,
-            font=("Arial", 11, "bold"), height=32,
+            font=("Segoe UI", 11, "bold"), height=32,
             command=MusteriSecModal
         ).pack(side="left", padx=10, pady=12)
 
         ctk.CTkButton(
             top_frame, text="🔍 Ekstre Getir",
             fg_color="#9965F1", hover_color="#8256CD", text_color=RENK_METIN,
-            font=("Arial", 11, "bold"), height=32,
+            font=("Segoe UI", 11, "bold"), height=32,
             command=ekstre_getir
         ).pack(side="left", padx=5, pady=12)
 
@@ -1746,7 +2065,7 @@ class MainApp(ctk.CTkToplevel):
 
         ust = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=14)
         ust.pack(fill="x", padx=20, pady=(20, 10))
-        ctk.CTkLabel(ust, text="Müşteri ID:", font=("Arial", 11, "bold")).pack(side="left", padx=(15, 5), pady=12)
+        ctk.CTkLabel(ust, text="Müşteri ID:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(15, 5), pady=12)
         m360_id_entry = ctk.CTkEntry(ust, width=90)
         m360_id_entry.pack(side="left", padx=(0, 8), pady=12)
         ctk.CTkButton(ust, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(m360_id_entry)).pack(side="left", padx=(0, 8), pady=12)
@@ -1807,13 +2126,13 @@ class MainApp(ctk.CTkToplevel):
             baslik_fr.pack(fill="x", padx=10, pady=(10, 15))
             ust_satir = ctk.CTkFrame(baslik_fr, fg_color="transparent")
             ust_satir.pack(fill="x")
-            ctk.CTkLabel(ust_satir, text=f"🏢 {mus['FirmaAdi']}", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+            ctk.CTkLabel(ust_satir, text=f"🏢 {mus['FirmaAdi']}", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
             ctk.CTkButton(ust_satir, text="📄 Özet PDF", width=110, fg_color="#5585EF", hover_color="#4871CB",
                           command=lambda: self.musteri_360_ozet_pdf_ac(musteri_id)).pack(side="right", padx=(6, 0))
             ctk.CTkButton(ust_satir, text="📱 WhatsApp'ta Paylaş", width=160, fg_color="#49B772", hover_color="#3E9C61",
                           command=lambda: self.musteri_360_whatsapp_paylas(mus, d)).pack(side="right")
             ctk.CTkLabel(baslik_fr, text=f"Yetkili: {mus.get('YetkiliKisi') or '-'}  |  Tel: {mus.get('Telefon') or '-'}  |  E-posta: {mus.get('EPosta') or '-'}",
-                         font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(2, 0))
+                         font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(2, 0))
 
             kart_alani = ctk.CTkFrame(icerik, fg_color="transparent")
             kart_alani.pack(fill="x", padx=10, pady=(0, 15))
@@ -1833,32 +2152,118 @@ class MainApp(ctk.CTkToplevel):
                 kart = ctk.CTkFrame(kart_alani, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=12, border_width=2, border_color=renk)
                 kart.grid(row=satir, column=sutun, padx=6, pady=6, sticky="nsew")
                 kart_alani.grid_columnconfigure(sutun, weight=1)
-                ctk.CTkLabel(kart, text=baslik, font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(pady=(10, 2), padx=10)
-                ctk.CTkLabel(kart, text=deger, font=("Arial", 14, "bold"), text_color=renk).pack(pady=(0, 10), padx=10)
+                lbl_baslik = ctk.CTkLabel(kart, text=baslik, font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK)
+                lbl_baslik.pack(pady=(10, 2), padx=10)
+                lbl_deger = ctk.CTkLabel(kart, text=deger, font=("Segoe UI", 14, "bold"), text_color=renk)
+                lbl_deger.pack(pady=(0, 10), padx=10)
+                if baslik == "🎁 Puan Bakiyesi":
+                    for w in (kart, lbl_baslik, lbl_deger):
+                        w.bind("<Button-1>", lambda e: self.musteri_puan_gecmisi_penceresi_ac(musteri_id))
+                        w.configure(cursor="hand2")
 
-            if d["RiskLimiti"] and d["AcikBakiye"] > d["RiskLimiti"]:
-                ctk.CTkLabel(icerik, text=f"⚠️ Açık bakiye risk limitini ({d['RiskLimiti']:,.2f} TL) aşıyor!",
-                             font=("Arial", 11, "bold"), text_color="#F36D6D").pack(anchor="w", padx=10, pady=(0, 10))
+            risk_limiti = mus.get("RiskLimiti") or 0
+            if risk_limiti and d["AcikBakiye"] > risk_limiti:
+                ctk.CTkLabel(icerik, text=f"⚠️ Açık bakiye risk limitini ({risk_limiti:,.2f} TL) aşıyor!",
+                             font=("Segoe UI", 11, "bold"), text_color="#F36D6D").pack(anchor="w", padx=10, pady=(0, 10))
 
-            ctk.CTkLabel(icerik, text="📄 Son 5 Fatura", font=("Arial", 13, "bold"), text_color="#45C89D").pack(anchor="w", padx=10, pady=(5, 5))
+            ctk.CTkLabel(icerik, text="📄 Son 5 Fatura", font=("Segoe UI", 13, "bold"), text_color="#45C89D").pack(anchor="w", padx=10, pady=(5, 5))
             if not d["SonFaturalar"]:
                 ctk.CTkLabel(icerik, text="Fatura kaydı yok.", text_color="gray").pack(anchor="w", padx=20, pady=(0, 10))
             for f in d["SonFaturalar"]:
                 fr = ctk.CTkFrame(icerik, fg_color=gecerli_renk(RENK_TABAN))
                 fr.pack(fill="x", padx=10, pady=2)
-                ctk.CTkLabel(fr, text=f"Fatura #{f['FaturaID']}  ({f['Tarih']})", font=("Arial", 11)).pack(side="left", padx=10, pady=6)
-                ctk.CTkLabel(fr, text=f"{f['ToplamTutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#45C89D").pack(side="right", padx=10)
+                ctk.CTkLabel(fr, text=f"Fatura #{f['FaturaID']}  ({f['Tarih']})", font=("Segoe UI", 11)).pack(side="left", padx=10, pady=6)
+                ctk.CTkLabel(fr, text=f"{f['ToplamTutar']:,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#45C89D").pack(side="right", padx=10)
 
-            ctk.CTkLabel(icerik, text="💰 Son 5 Tahsilat", font=("Arial", 13, "bold"), text_color="#5585EF").pack(anchor="w", padx=10, pady=(15, 5))
+            ctk.CTkLabel(icerik, text="💰 Son 5 Tahsilat", font=("Segoe UI", 13, "bold"), text_color="#5585EF").pack(anchor="w", padx=10, pady=(15, 5))
             if not d["SonTahsilatlar"]:
                 ctk.CTkLabel(icerik, text="Tahsilat kaydı yok.", text_color="gray").pack(anchor="w", padx=20, pady=(0, 10))
             for t in d["SonTahsilatlar"]:
                 fr = ctk.CTkFrame(icerik, fg_color=gecerli_renk(RENK_TABAN))
                 fr.pack(fill="x", padx=10, pady=2)
-                ctk.CTkLabel(fr, text=f"#{t['TahsilatID']} ({t['OdemeTuru']})  ({t['Tarih']})", font=("Arial", 11)).pack(side="left", padx=10, pady=6)
-                ctk.CTkLabel(fr, text=f"{t['Tutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#5585EF").pack(side="right", padx=10)
+                ctk.CTkLabel(fr, text=f"#{t['TahsilatID']} ({t['OdemeTuru']})  ({t['Tarih']})", font=("Segoe UI", 11)).pack(side="left", padx=10, pady=6)
+                ctk.CTkLabel(fr, text=f"{t['Tutar']:,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#5585EF").pack(side="right", padx=10)
+
+            aktivite_baslik = ctk.CTkLabel(icerik, text="🗒️ Son Aktiviteler", font=("Segoe UI", 13, "bold"), text_color="#9965F1")
+            aktivite_baslik.pack(anchor="w", padx=10, pady=(15, 5))
+            aktivite_alani = ctk.CTkFrame(icerik, fg_color="transparent")
+            aktivite_alani.pack(fill="x", padx=10, pady=(0, 10))
+            self._musteri_360_aktiviteleri_yukle(musteri_id, aktivite_alani)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def _musteri_360_aktiviteleri_yukle(self, musteri_id, aktivite_alani):
+        for w in aktivite_alani.winfo_children():
+            w.destroy()
+        try:
+            res = requests.get(f"{API}/aktivite-listesi", params={"musteri_id": musteri_id}, headers=self.req_headers(), timeout=6)
+            if res.status_code != 200:
+                ctk.CTkLabel(aktivite_alani, text="Aktiviteler yüklenemedi.", text_color="gray").pack(anchor="w", padx=10)
+                return
+            aktiviteler = res.json().get("aktiviteler", [])
+        except requests.exceptions.RequestException:
+            ctk.CTkLabel(aktivite_alani, text="Aktiviteler yüklenemedi.", text_color="gray").pack(anchor="w", padx=10)
+            return
+        if not aktiviteler:
+            ctk.CTkLabel(aktivite_alani, text="Aktivite kaydı yok.", text_color="gray").pack(anchor="w", padx=10)
+            return
+        for a in aktiviteler:
+            fr = ctk.CTkFrame(aktivite_alani, fg_color=gecerli_renk(RENK_TABAN))
+            fr.pack(fill="x", pady=2)
+            tamam_mi = a.get("TamamlandiMi")
+            ctk.CTkLabel(fr, text=f"{a['AktiviteTipi']}: {a['Aciklama']}  ({a['Tarih']})", font=("Segoe UI", 11)).pack(side="left", padx=10, pady=6)
+            if tamam_mi:
+                ctk.CTkLabel(fr, text="✅", font=("Segoe UI", 12)).pack(side="right", padx=10)
+            else:
+                ctk.CTkButton(fr, text="Tamamla", width=80, fg_color="#49B772", hover_color="#3E9C61",
+                              command=lambda aid=a["AktiviteID"]: self._musteri_360_aktivite_tamamla(aid, musteri_id, aktivite_alani)
+                              ).pack(side="right", padx=10, pady=4)
+
+    def _musteri_360_aktivite_tamamla(self, aktivite_id, musteri_id, aktivite_alani):
+        try:
+            res = requests.put(f"{API}/aktivite-tamamla/{aktivite_id}", headers=self.req_headers(), timeout=6)
+            if res.status_code == 200:
+                self._musteri_360_aktiviteleri_yukle(musteri_id, aktivite_alani)
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def musteri_puan_gecmisi_penceresi_ac(self, musteri_id):
+        try:
+            res = requests.get(f"{API}/musteri-puan/{musteri_id}", headers=self.req_headers(), timeout=6)
+            if res.status_code != 200:
+                self.api_hata_goster(res)
+                return
+            veri = res.json()
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+            return
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Puan Geçmişi")
+        self._pencere_ortala(pencere, 460, 520)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+        pencere.configure(fg_color=gecerli_renk(RENK_TABAN))
+
+        ctk.CTkLabel(pencere, text="🎁 Puan Geçmişi", font=("Segoe UI", 15, "bold"), text_color="#F7B341").pack(pady=(15, 5))
+        ctk.CTkLabel(pencere, text=f"Toplam Bakiye: {veri.get('Bakiye', 0):g} puan",
+                     font=("Segoe UI", 13, "bold"), text_color="#45C89D").pack(pady=(0, 10))
+
+        scroll = ctk.CTkScrollableFrame(pencere, fg_color=gecerli_renk(RENK_KART), corner_radius=14, border_width=1, border_color=RENK_IKINCIL)
+        scroll.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        hareketler = veri.get("Hareketler", [])
+        if not hareketler:
+            ctk.CTkLabel(scroll, text="Hareket kaydı yok.", text_color="gray").pack(anchor="w", padx=10, pady=10)
+        for h in hareketler:
+            fr = ctk.CTkFrame(scroll, fg_color=gecerli_renk(RENK_TABAN))
+            fr.pack(fill="x", pady=2)
+            ctk.CTkLabel(fr, text=f"{h['Tur']}: {h.get('Aciklama') or '-'}  ({h['Tarih']})", font=("Segoe UI", 11)).pack(side="left", padx=10, pady=6)
+            renk = "#45C89D" if h["Puan"] >= 0 else "#F36D6D"
+            ctk.CTkLabel(fr, text=f"{h['Puan']:+g}", font=("Segoe UI", 11, "bold"), text_color=renk).pack(side="right", padx=10)
 
     def mizan_raporu_ac(self):
         win = ctk.CTkToplevel(self)
@@ -1868,7 +2273,7 @@ class MainApp(ctk.CTkToplevel):
         win.transient(self)
         win.attributes("-topmost", True)
 
-        ctk.CTkLabel(win, text="📊 Şirket Kesin Mizan Raporu", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=15)
+        ctk.CTkLabel(win, text="📊 Şirket Kesin Mizan Raporu", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=15)
         
         scroll = ctk.CTkScrollableFrame(win, fg_color=RENK_KART, corner_radius=16, border_width=1, border_color=RENK_IKINCIL)
         scroll.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -1881,20 +2286,20 @@ class MainApp(ctk.CTkToplevel):
                 # Tablo Başlıkları
                 head_f = ctk.CTkFrame(scroll, fg_color=RENK_TABAN, height=40)
                 head_f.pack(fill="x", padx=10, pady=5)
-                ctk.CTkLabel(head_f, text="Hesap Kodu", font=("Arial", 11, "bold"), text_color=RENK_METIN, width=90).pack(side="left", padx=5)
-                ctk.CTkLabel(head_f, text="Hesap Adı", font=("Arial", 11, "bold"), text_color=RENK_METIN, width=220).pack(side="left", padx=5)
-                ctk.CTkLabel(head_f, text="Dönem Borç", font=("Arial", 11, "bold"), text_color="#45C89D", width=120).pack(side="left", padx=5)
-                ctk.CTkLabel(head_f, text="Dönem Alacak", font=("Arial", 11, "bold"), text_color="#F36D6D", width=120).pack(side="left", padx=5)
-                ctk.CTkLabel(head_f, text="Güncel Bakiye", font=("Arial", 11, "bold"), text_color="#76CCE1", width=120).pack(side="left", padx=5)
+                ctk.CTkLabel(head_f, text="Hesap Kodu", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN, width=90).pack(side="left", padx=5)
+                ctk.CTkLabel(head_f, text="Hesap Adı", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN, width=220).pack(side="left", padx=5)
+                ctk.CTkLabel(head_f, text="Dönem Borç", font=("Segoe UI", 11, "bold"), text_color="#45C89D", width=120).pack(side="left", padx=5)
+                ctk.CTkLabel(head_f, text="Dönem Alacak", font=("Segoe UI", 11, "bold"), text_color="#F36D6D", width=120).pack(side="left", padx=5)
+                ctk.CTkLabel(head_f, text="Güncel Bakiye", font=("Segoe UI", 11, "bold"), text_color="#76CCE1", width=120).pack(side="left", padx=5)
 
                 for r in veriler:
                     row_f = ctk.CTkFrame(scroll, fg_color=RENK_TABAN, height=35)
                     row_f.pack(fill="x", padx=10, pady=2)
-                    ctk.CTkLabel(row_f, text=str(r.get("HesapKodu","")), font=("Arial", 11), text_color=RENK_METIN, width=90).pack(side="left", padx=5)
-                    ctk.CTkLabel(row_f, text=str(r.get("HesapAdi","")), font=("Arial", 11), text_color=RENK_METIN, width=220, anchor="w").pack(side="left", padx=5)
-                    ctk.CTkLabel(row_f, text=f"{r.get('Borc', 0):,.2f} TL", font=("Arial", 11), text_color="#45C89D", width=120).pack(side="left", padx=5)
-                    ctk.CTkLabel(row_f, text=f"{r.get('Alacak', 0):,.2f} TL", font=("Arial", 11), text_color="#F36D6D", width=120).pack(side="left", padx=10)
-                    ctk.CTkLabel(row_f, text=f"{r.get('Bakiye', 0):,.2f} TL", font=("Arial", 11, "bold"), text_color="#76CCE1", width=120).pack(side="left", padx=5)
+                    ctk.CTkLabel(row_f, text=str(r.get("HesapKodu","")), font=("Segoe UI", 11), text_color=RENK_METIN, width=90).pack(side="left", padx=5)
+                    ctk.CTkLabel(row_f, text=str(r.get("HesapAdi","")), font=("Segoe UI", 11), text_color=RENK_METIN, width=220, anchor="w").pack(side="left", padx=5)
+                    ctk.CTkLabel(row_f, text=f"{r.get('Borc', 0):,.2f} TL", font=("Segoe UI", 11), text_color="#45C89D", width=120).pack(side="left", padx=5)
+                    ctk.CTkLabel(row_f, text=f"{r.get('Alacak', 0):,.2f} TL", font=("Segoe UI", 11), text_color="#F36D6D", width=120).pack(side="left", padx=10)
+                    ctk.CTkLabel(row_f, text=f"{r.get('Bakiye', 0):,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#76CCE1", width=120).pack(side="left", padx=5)
             else:
                 messagebox.showerror("Hata", "Mizan raporu alınamadı.")
         except Exception as e:
@@ -1910,7 +2315,7 @@ class MainApp(ctk.CTkToplevel):
         win.transient(self)
         win.attributes("-topmost", True)
 
-        ctk.CTkLabel(win, text="📈 Şirket Kâr / Zarar ve Faaliyet Raporu", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=15)
+        ctk.CTkLabel(win, text="📈 Şirket Kâr / Zarar ve Faaliyet Raporu", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=15)
 
         # Ana İçerik Scroll Alanı
         main_scroll = ctk.CTkScrollableFrame(win, fg_color=RENK_KART, corner_radius=16, border_width=1, border_color=RENK_IKINCIL)
@@ -1927,7 +2332,7 @@ class MainApp(ctk.CTkToplevel):
                 net_kz = data.get("NetKarZarar", 0.0)
 
                 # --- GELİRLER BÖLÜMÜ ---
-                ctk.CTkLabel(main_scroll, text="🟢 GELİR HESAPLARI (Brüt Satışlar)", font=("Arial", 14, "bold"), text_color="#45C89D").pack(anchor="w", padx=10, pady=(10, 5))
+                ctk.CTkLabel(main_scroll, text="🟢 GELİR HESAPLARI (Brüt Satışlar)", font=("Segoe UI", 14, "bold"), text_color="#45C89D").pack(anchor="w", padx=10, pady=(10, 5))
                 
                 if not gelirler:
                     ctk.CTkLabel(main_scroll, text="Henüz gelir kaydı bulunmuyor.", text_color="gray").pack(anchor="w", padx=20, pady=5)
@@ -1935,11 +2340,11 @@ class MainApp(ctk.CTkToplevel):
                     for g in gelirler:
                         f_frame = ctk.CTkFrame(main_scroll, fg_color=RENK_TABAN, height=35)
                         f_frame.pack(fill="x", padx=10, pady=3)
-                        ctk.CTkLabel(f_frame, text=f"{g['HesapKodu']} - {g['HesapAdi']}", font=("Arial", 11), text_color=RENK_METIN).pack(side="left", padx=10)
-                        ctk.CTkLabel(f_frame, text=f"{g['Tutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#45C89D").pack(side="right", padx=10)
+                        ctk.CTkLabel(f_frame, text=f"{g['HesapKodu']} - {g['HesapAdi']}", font=("Segoe UI", 11), text_color=RENK_METIN).pack(side="left", padx=10)
+                        ctk.CTkLabel(f_frame, text=f"{g['Tutar']:,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#45C89D").pack(side="right", padx=10)
 
                 # --- GİDERLER BÖLÜMÜ ---
-                ctk.CTkLabel(main_scroll, text="🔴 GİDER HESAPLARI (Maliyetler ve Giderler)", font=("Arial", 14, "bold"), text_color="#F36D6D").pack(anchor="w", padx=10, pady=(20, 5))
+                ctk.CTkLabel(main_scroll, text="🔴 GİDER HESAPLARI (Maliyetler ve Giderler)", font=("Segoe UI", 14, "bold"), text_color="#F36D6D").pack(anchor="w", padx=10, pady=(20, 5))
                 
                 if not giderler:
                     ctk.CTkLabel(main_scroll, text="Henüz gider kaydı bulunmuyor.", text_color="gray").pack(anchor="w", padx=20, pady=5)
@@ -1947,8 +2352,8 @@ class MainApp(ctk.CTkToplevel):
                     for gi in giderler:
                         g_frame = ctk.CTkFrame(main_scroll, fg_color=RENK_TABAN, height=35)
                         g_frame.pack(fill="x", padx=10, pady=3)
-                        ctk.CTkLabel(g_frame, text=f"{gi['HesapKodu']} - {gi['HesapAdi']}", font=("Arial", 11), text_color=RENK_METIN).pack(side="left", padx=10)
-                        ctk.CTkLabel(g_frame, text=f"{gi['Tutar']:,.2f} TL", font=("Arial", 11, "bold"), text_color="#F36D6D").pack(side="right", padx=10)
+                        ctk.CTkLabel(g_frame, text=f"{gi['HesapKodu']} - {gi['HesapAdi']}", font=("Segoe UI", 11), text_color=RENK_METIN).pack(side="left", padx=10)
+                        ctk.CTkLabel(g_frame, text=f"{gi['Tutar']:,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#F36D6D").pack(side="right", padx=10)
 
                 # --- ÖZET / NET KÂR-ZARAR KUTUSU ---
                 footer_frame = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=16, height=70)
@@ -1957,9 +2362,9 @@ class MainApp(ctk.CTkToplevel):
                 durum_renk = "#45C89D" if net_kz >= 0 else "#F36D6D"
                 durum_baslik = "🟢 NET DÖNEM KÂRI:" if net_kz >= 0 else "🔴 NET DÖNEM ZARARI:"
 
-                ctk.CTkLabel(footer_frame, text=f"Toplam Gelir: {t_gelir:,.2f} TL", font=("Arial", 12, "bold"), text_color="#45C89D").pack(side="left", padx=20, pady=15)
-                ctk.CTkLabel(footer_frame, text=f"Toplam Gider: {t_gider:,.2f} TL", font=("Arial", 12, "bold"), text_color="#F36D6D").pack(side="left", padx=20, pady=15)
-                ctk.CTkLabel(footer_frame, text=f"{durum_baslik} {net_kz:,.2f} TL", font=("Arial", 13, "bold"), text_color=durum_renk).pack(side="right", padx=20, pady=15)
+                ctk.CTkLabel(footer_frame, text=f"Toplam Gelir: {t_gelir:,.2f} TL", font=("Segoe UI", 12, "bold"), text_color="#45C89D").pack(side="left", padx=20, pady=15)
+                ctk.CTkLabel(footer_frame, text=f"Toplam Gider: {t_gider:,.2f} TL", font=("Segoe UI", 12, "bold"), text_color="#F36D6D").pack(side="left", padx=20, pady=15)
+                ctk.CTkLabel(footer_frame, text=f"{durum_baslik} {net_kz:,.2f} TL", font=("Segoe UI", 13, "bold"), text_color=durum_renk).pack(side="right", padx=20, pady=15)
 
             else:
                 self.api_hata_goster(res)
@@ -1974,7 +2379,7 @@ class MainApp(ctk.CTkToplevel):
         win.transient(self)
         win.attributes("-topmost", True)
 
-        ctk.CTkLabel(win, text="📊 Şirket Kesin Mizan Raporu", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=15)
+        ctk.CTkLabel(win, text="📊 Şirket Kesin Mizan Raporu", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=15)
 
         # Tablo Alanı
         liste_frame = ctk.CTkScrollableFrame(win, fg_color=RENK_KART, corner_radius=16, border_width=1, border_color=RENK_IKINCIL)
@@ -1982,7 +2387,7 @@ class MainApp(ctk.CTkToplevel):
 
         basliklar = ["Hesap Kodu", "Hesap Adı", "Dönem Borç", "Dönem Alacak", "Güncel Bakiye"]
         for c, b in enumerate(basliklar):
-            ctk.CTkLabel(liste_frame, text=b, font=("Arial", 12, "bold"), text_color="#76CCE1").grid(row=0, column=c, padx=15, pady=10, sticky="w")
+            ctk.CTkLabel(liste_frame, text=b, font=("Segoe UI", 12, "bold"), text_color="#76CCE1").grid(row=0, column=c, padx=15, pady=10, sticky="w")
 
         # Alt Özet Bilgi Çubuğu (Footer)
         footer_frame = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=14, height=50)
@@ -2003,7 +2408,7 @@ class MainApp(ctk.CTkToplevel):
                     for i, item in enumerate(satirlar, start=1):
                         kodu = item.get("HesapKodu", "")
                         renk = "white" if len(kodu) == 3 else "gray"
-                        font_tipi = ("Arial", 11, "bold") if len(kodu) == 3 else ("Arial", 11)
+                        font_tipi = ("Segoe UI", 11, "bold") if len(kodu) == 3 else ("Segoe UI", 11)
                         
                         ctk.CTkLabel(liste_frame, text=kodu, font=font_tipi, text_color=renk).grid(row=i, column=0, padx=15, pady=8, sticky="w")
                         ctk.CTkLabel(liste_frame, text=item.get("HesapAdi", ""), font=font_tipi, text_color=renk).grid(row=i, column=1, padx=15, pady=8, sticky="w")
@@ -2015,14 +2420,57 @@ class MainApp(ctk.CTkToplevel):
                 durum_metni = "🟢 Mizan Mutabık (Borç = Alacak)" if mutabakat else "🔴 DİKKAT: Mizan Mutabık Değil!"
                 durum_renk = "#45C89D" if mutabakat else "#F36D6D"
 
-                ctk.CTkLabel(footer_frame, text=f"Toplam Borç: {g_borc:,.2f} TL", font=("Arial", 12, "bold"), text_color="#45C89D").pack(side="left", padx=20, pady=12)
-                ctk.CTkLabel(footer_frame, text=f"Toplam Alacak: {g_alacak:,.2f} TL", font=("Arial", 12, "bold"), text_color="#F36D6D").pack(side="left", padx=20, pady=12)
-                ctk.CTkLabel(footer_frame, text=durum_metni, font=("Arial", 12, "bold"), text_color=durum_renk).pack(side="right", padx=20, pady=12)
+                ctk.CTkLabel(footer_frame, text=f"Toplam Borç: {g_borc:,.2f} TL", font=("Segoe UI", 12, "bold"), text_color="#45C89D").pack(side="left", padx=20, pady=12)
+                ctk.CTkLabel(footer_frame, text=f"Toplam Alacak: {g_alacak:,.2f} TL", font=("Segoe UI", 12, "bold"), text_color="#F36D6D").pack(side="left", padx=20, pady=12)
+                ctk.CTkLabel(footer_frame, text=durum_metni, font=("Segoe UI", 12, "bold"), text_color=durum_renk).pack(side="right", padx=20, pady=12)
 
             else:
                 self.api_hata_goster(res)
         except Exception as e:
             messagebox.showerror("Hata", f"Bağlantı sorunu: {str(e)}")
+
+    def hesap_plani_ekle_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Hesap Aç")
+        self._pencere_ortala(pencere, 440, 360)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="➕ Yeni Hesap Aç", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        hp_kod = ctk.CTkEntry(pencere, placeholder_text="Hesap Kodu (örn: 159)", width=320)
+        hp_kod.pack(pady=5)
+        hp_ad = ctk.CTkEntry(pencere, placeholder_text="Hesap Adı", width=320)
+        hp_ad.pack(pady=5)
+        hp_acilis = ctk.CTkEntry(pencere, placeholder_text="Açılış Bakiyesi (opsiyonel, boşsa 0)", width=320)
+        hp_acilis.pack(pady=5)
+
+        def kaydet():
+            kod = hp_kod.get().strip()
+            ad = hp_ad.get().strip()
+            if not kod or not ad:
+                messagebox.showwarning("Eksik Bilgi", "Hesap Kodu ve Hesap Adı zorunludur.")
+                return
+            try:
+                acilis = float(hp_acilis.get()) if hp_acilis.get().strip() else 0
+            except ValueError:
+                messagebox.showwarning("Hatalı Değer", "Açılış bakiyesi sayısal olmalıdır.")
+                return
+            data = {"HesapKodu": kod, "HesapAdi": ad, "AcilisBakiyesi": acilis}
+            try:
+                res = requests.post(f"{API}/hesap-plani-ekle", json=data, headers=self.req_headers(), timeout=5)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.hesap_planini_yenile()
+                    messagebox.showinfo("Başarılı", "Hesap eklendi.")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="+ Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
 
     def hesap_planini_yenile(self):
         # Önce tabloyu temizle
@@ -2031,7 +2479,7 @@ class MainApp(ctk.CTkToplevel):
 
         basliklar = ["Hesap Kodu", "Hesap Adı", "Güncel Bakiye", "Durum"]
         for col_idx, baslik in enumerate(basliklar):
-            lbl = ctk.CTkLabel(self.hesap_liste_frame, text=baslik, font=("Arial", 12, "bold"), text_color="#76CCE1")
+            lbl = ctk.CTkLabel(self.hesap_liste_frame, text=baslik, font=("Segoe UI", 12, "bold"), text_color="#76CCE1")
             lbl.grid(row=0, column=col_idx, padx=20, pady=10, sticky="w")
 
         # Backend'den verileri çekiyoruz
@@ -2045,7 +2493,7 @@ class MainApp(ctk.CTkToplevel):
                     for row_idx, item in enumerate(hesaplar, start=1):
                         kodu = item.get("HesapKodu", "")
                         renk = "white" if len(kodu) == 3 else "gray" 
-                        font_tipi = ("Arial", 12, "bold") if len(kodu) == 3 else ("Arial", 11)
+                        font_tipi = ("Segoe UI", 12, "bold") if len(kodu) == 3 else ("Segoe UI", 11)
                         bakiye = item.get("Bakiye", 0)
                         
                         lbl_kod = ctk.CTkLabel(self.hesap_liste_frame, text=kodu, font=font_tipi, text_color=renk, cursor="hand2")
@@ -2057,7 +2505,7 @@ class MainApp(ctk.CTkToplevel):
                         lbl_bak = ctk.CTkLabel(self.hesap_liste_frame, text=f"{bakiye:,.2f} TL", font=font_tipi, text_color="#76CCE1", cursor="hand2")
                         lbl_bak.grid(row=row_idx, column=2, padx=20, pady=8, sticky="w")
                         
-                        lbl_dur = ctk.CTkLabel(self.hesap_liste_frame, text="🟢 Aktif", font=("Arial", 11), text_color="#45C89D", cursor="hand2")
+                        lbl_dur = ctk.CTkLabel(self.hesap_liste_frame, text="🟢 Aktif", font=("Segoe UI", 11), text_color="#45C89D", cursor="hand2")
                         lbl_dur.grid(row=row_idx, column=3, padx=20, pady=8, sticky="w")
 
                         for lbl in [lbl_kod, lbl_ad, lbl_bak, lbl_dur]:
@@ -2070,19 +2518,19 @@ class MainApp(ctk.CTkToplevel):
     def init_belgeler(self):
         ust = ctk.CTkFrame(self.tab_belgeler, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📁 Doküman / Sözleşme Arşivi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📁 Doküman / Sözleşme Arşivi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.belgeleri_yukle).pack(side="right")
 
         yukle_cerceve = ctk.CTkFrame(self.tab_belgeler, fg_color=RENK_KART, corner_radius=12)
         yukle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(yukle_cerceve, text="Yeni Belge Yükle", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(yukle_cerceve, text="Yeni Belge Yükle", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         satir1 = ctk.CTkFrame(yukle_cerceve, fg_color="transparent")
         satir1.pack(fill="x", padx=10, pady=(0, 5))
         self.bg_dosya_yolu = ctk.StringVar(value="")
         ctk.CTkButton(satir1, text="📎 Dosya Seç", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.bg_dosya_sec).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(satir1, textvariable=self.bg_dosya_yolu, font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=300).pack(side="left")
+        ctk.CTkLabel(satir1, textvariable=self.bg_dosya_yolu, font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=300).pack(side="left")
         satir2 = ctk.CTkFrame(yukle_cerceve, fg_color="transparent")
         satir2.pack(fill="x", padx=10, pady=(0, 5))
         self.bg_tip = ctk.CTkOptionMenu(satir2, values=["Genel", "Müşteri", "Tedarikçi", "Sipariş"], width=120,
@@ -2101,11 +2549,11 @@ class MainApp(ctk.CTkToplevel):
                       command=self.belge_yukle_islem).pack(side="left")
 
         ctk.CTkLabel(self.tab_belgeler, text="Bir belgeye çift tıklayarak indirebilirsiniz. Bitiş tarihi girilen belgeler, süresi dolmaya 30 gün kala Alarm Yönetimi'nde otomatik uyarı üretir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=900).pack(anchor="w", padx=22, pady=(0, 5))
-        liste_cerceve, self.belge_tree = tablo_olustur(
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900).pack(anchor="w", padx=22, pady=(0, 5))
+        self.belge_tree = OzelTablo(
             self.tab_belgeler, ["ID", "Dosya Adı", "Tip", "İlişkili", "Açıklama", "Bitiş Tarihi", "Tarih", "Kullanıcı"],
             [40, 190, 90, 140, 190, 100, 120, 90], height=13)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+        self.belge_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
         self.belge_tree.bind("<Double-Button-1>", lambda e: self.belge_indir_islem())
         ctk.CTkButton(self.tab_belgeler, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
                       command=self.belge_sil_islem).pack(anchor="w", padx=20, pady=(0, 20))
@@ -2214,11 +2662,11 @@ class MainApp(ctk.CTkToplevel):
 
         ust = ctk.CTkFrame(self.tab_hizli_satis, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🛒 Hızlı Satış (POS)", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🛒 Hızlı Satış (POS)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
 
-        musteri_cerceve = ctk.CTkFrame(self.tab_hizli_satis, fg_color=RENK_KART, corner_radius=12)
+        musteri_cerceve = ctk.CTkFrame(self.tab_hizli_satis, fg_color=RENK_PANEL, corner_radius=12)
         musteri_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(musteri_cerceve, text="👤 Müşteri (opsiyonel — puan kazanımı için):", font=("Arial", 12, "bold")).pack(side="left", padx=(12, 8), pady=10)
+        ctk.CTkLabel(musteri_cerceve, text="👤 Müşteri (opsiyonel — puan kazanımı için):", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(12, 8), pady=10)
         self.pos_musteri_id = ctk.CTkEntry(musteri_cerceve, width=70, placeholder_text="ID")
         self.pos_musteri_id.pack(side="left", padx=(0, 6), pady=10)
         self.pos_musteri_ad = ctk.CTkEntry(musteri_cerceve, width=200, placeholder_text="Perakende Müşteri")
@@ -2226,16 +2674,16 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(musteri_cerceve, text="🔍", width=32,
                       command=lambda: self.musteri_secim_penceresi(self.pos_musteri_id, self.pos_musteri_ad)).pack(side="left", padx=(0, 6), pady=10)
 
-        barkod_cerceve = ctk.CTkFrame(self.tab_hizli_satis, fg_color=RENK_KART, corner_radius=12)
+        barkod_cerceve = ctk.CTkFrame(self.tab_hizli_satis, fg_color=RENK_PANEL, corner_radius=12)
         barkod_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(barkod_cerceve, text="📷 Barkod Okut / Stok Kodu Yaz:", font=("Arial", 13, "bold")).pack(side="left", padx=(12, 8), pady=12)
-        self.pos_barkod_entry = ctk.CTkEntry(barkod_cerceve, placeholder_text="Barkod okuyucuyla okutun veya yazıp Enter'a basın", width=400, height=36, font=("Arial", 13))
+        ctk.CTkLabel(barkod_cerceve, text="📷 Barkod Okut / Stok Kodu Yaz:", font=("Segoe UI", 13, "bold")).pack(side="left", padx=(12, 8), pady=12)
+        self.pos_barkod_entry = ctk.CTkEntry(barkod_cerceve, placeholder_text="Barkod okuyucuyla okutun veya yazıp Enter'a basın", width=400, height=36, font=("Segoe UI", 13))
         self.pos_barkod_entry.pack(side="left", padx=(0, 10), pady=12)
         self.pos_barkod_entry.bind("<Return>", lambda e: self.pos_urun_ekle())
 
-        sepet_cerceve, self.pos_tree = tablo_olustur(
+        self.pos_tree = OzelTablo(
             self.tab_hizli_satis, ["Stok Kod", "Ürün", "Miktar", "Birim Fiyat", "Satır Toplamı"], [100, 260, 90, 110, 120], height=13)
-        sepet_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+        self.pos_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
 
         alt_cerceve = ctk.CTkFrame(self.tab_hizli_satis, fg_color=RENK_KART, corner_radius=12)
         alt_cerceve.pack(fill="x", padx=20, pady=(0, 20))
@@ -2252,10 +2700,10 @@ class MainApp(ctk.CTkToplevel):
 
         alt_satiri = ctk.CTkFrame(alt_cerceve, fg_color="transparent")
         alt_satiri.pack(fill="x", padx=10, pady=(5, 10))
-        self.pos_toplam_label = ctk.CTkLabel(alt_satiri, text="TOPLAM: 0,00 TL", font=("Arial", 20, "bold"), text_color="#45C89D")
+        self.pos_toplam_label = ctk.CTkLabel(alt_satiri, text="TOPLAM: 0,00 TL", font=("Segoe UI", 20, "bold"), text_color="#45C89D")
         self.pos_toplam_label.pack(side="left")
         ctk.CTkButton(alt_satiri, text="💵 Nakit/Kart - Satışı Tamamla", fg_color="#49B772", hover_color="#3E9C61",
-                      height=44, font=("Arial", 14, "bold"), command=self.pos_satisi_tamamla).pack(side="right")
+                      height=44, font=("Segoe UI", 14, "bold"), command=self.pos_satisi_tamamla).pack(side="right")
 
         self.pos_barkod_entry.focus_set()
 
@@ -2357,12 +2805,12 @@ class MainApp(ctk.CTkToplevel):
     def init_mobil_erisim(self):
         ust = ctk.CTkFrame(self.tab_mobil_erisim, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📱 Mobil/Uzaktan Erişim", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📱 Mobil/Uzaktan Erişim", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
 
         bilgi_cerceve = ctk.CTkFrame(self.tab_mobil_erisim, fg_color=RENK_KART, corner_radius=12)
         bilgi_cerceve.pack(fill="x", padx=20, pady=(0, 20))
         ctk.CTkLabel(bilgi_cerceve, text="Telefonunuzdan/tabletinizden ya da başka bir bilgisayardan salt-okunur bir özet paneline erişebilirsiniz.",
-                     font=("Arial", 12, "bold"), wraplength=850, justify="left").pack(anchor="w", padx=14, pady=(14, 10))
+                     font=("Segoe UI", 12, "bold"), wraplength=850, justify="left").pack(anchor="w", padx=14, pady=(14, 10))
 
         try:
             import socket
@@ -2396,7 +2844,7 @@ class MainApp(ctk.CTkToplevel):
                           "Duvarı bir izin penceresi çıkarırsa 'İzin Ver / Allow Access' deyin - aksi halde bağlantı reddedilir.\n"
                           "• Ofis dışından (internetten) erişim için router'ınızda port yönlendirme ya da bir VPN kurulumu gerekir - "
                           "bu bir ağ/internet ayarı olduğundan, isterseniz bu konuda size adım adım yardımcı olabilirim.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=850, justify="left").pack(anchor="w", padx=14, pady=(0, 14))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=850, justify="left").pack(anchor="w", padx=14, pady=(0, 14))
 
     def panoya_kopyala(self, metin):
         self.clipboard_clear()
@@ -2406,60 +2854,74 @@ class MainApp(ctk.CTkToplevel):
     def init_alarm_yonetimi(self):
         ust = ctk.CTkFrame(self.tab_alarm_yonetimi, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔔 Alarm/Uyarı Yönetimi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔔 Alarm/Uyarı Yönetimi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔍 Şimdi Kontrol Et", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.alarm_kontrol_et_islem).pack(side="right")
 
         kural_cerceve = ctk.CTkFrame(self.tab_alarm_yonetimi, fg_color=RENK_KART, corner_radius=12)
         kural_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(kural_cerceve, text="Alarm Kuralları", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        ekle_satiri = ctk.CTkFrame(kural_cerceve, fg_color="transparent")
-        ekle_satiri.pack(fill="x", padx=10, pady=(0, 5))
-        self.al_kural_adi = ctk.CTkEntry(ekle_satiri, placeholder_text="Kural Adı", width=220)
-        self.al_kural_adi.pack(side="left", padx=(0, 8))
-        self.al_kural_tipi = ctk.CTkOptionMenu(ekle_satiri, values=["KritikStok", "RiskLimitiAsimi", "VadeYaklasan",
-                                                                     "SozlesmeSuresiDoluyor", "AnormalIslem", "TeslimTarihiYaklasiyor",
-                                                                     "HammaddeFiyatArtisi"], width=160)
-        self.al_kural_tipi.pack(side="left", padx=(0, 8))
-        self.al_esik = ctk.CTkEntry(ekle_satiri, placeholder_text="Eşik (VadeYaklasan için gün sayısı)", width=200)
-        self.al_esik.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(ekle_satiri, text="+ Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.alarm_kural_ekle_islem).pack(side="left")
-        kural_liste_cerceve, self.alarm_kural_tree = tablo_olustur(kural_cerceve, ["ID", "Kural Adı", "Tip", "Eşik", "Aktif"], [40, 220, 130, 80, 60], height=5)
-        kural_liste_cerceve.pack(fill="x", padx=10, pady=(0, 10))
+        kural_ust = ctk.CTkFrame(kural_cerceve, fg_color="transparent")
+        kural_ust.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(kural_ust, text="Alarm Kuralları", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkButton(kural_ust, text="+ Yeni Kural", fg_color="#49B772", hover_color="#3E9C61", width=110,
+                      command=self.alarm_kural_penceresi_ac).pack(side="right")
+        self.alarm_kural_tree = OzelTablo(kural_cerceve, ["ID", "Kural Adı", "Tip", "Eşik", "Aktif"], [40, 220, 130, 80, 60], height=5)
+        self.alarm_kural_tree.pack(fill="x", padx=10, pady=(0, 10))
         self.alarm_kural_tree.bind("<Double-Button-1>", self.alarm_kural_aktif_degistir)
 
         ctk.CTkLabel(self.tab_alarm_yonetimi, text="Uyarı Geçmişi (bir kurala çift tıklayarak aktif/pasif yapabilirsiniz)",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 5))
-        gecmis_cerceve, self.alarm_gecmis_tree = tablo_olustur(self.tab_alarm_yonetimi, ["ID", "Kural", "Mesaj", "Tarih", "Okundu"], [40, 150, 350, 130, 60], height=12)
-        gecmis_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 5))
+        self.alarm_gecmis_tree = OzelTablo(self.tab_alarm_yonetimi, ["ID", "Kural", "Mesaj", "Tarih", "Okundu"], [40, 150, 350, 130, 60], height=12)
+        self.alarm_gecmis_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
         self.alarm_gecmis_tree.bind("<Double-Button-1>", self.alarm_okundu_isaretle)
         ctk.CTkLabel(self.tab_alarm_yonetimi, text="Bir uyarıya çift tıklayarak okundu olarak işaretleyebilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 20))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 20))
 
         self.alarm_kurallarini_yukle()
         self.alarm_gecmisini_yukle()
 
-    def alarm_kural_ekle_islem(self):
-        if not self.al_kural_adi.get().strip():
-            messagebox.showwarning("Eksik Bilgi", "Kural adı zorunludur.")
-            return
-        try:
-            esik = float(self.al_esik.get()) if self.al_esik.get().strip() else None
-        except ValueError:
-            messagebox.showwarning("Hatalı Değer", "Eşik sayısal olmalıdır.")
-            return
-        data = {"KuralAdi": self.al_kural_adi.get().strip(), "KuralTipi": self.al_kural_tipi.get(), "Esik": esik}
-        try:
-            res = requests.post(f"{API}/alarm-kural-ekle", json=data, headers=self.req_headers(), timeout=5)
-            if res.status_code == 200:
-                self.al_kural_adi.delete(0, "end")
-                self.al_esik.delete(0, "end")
-                self.alarm_kurallarini_yukle()
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+    def alarm_kural_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Alarm Kuralı")
+        self._pencere_ortala(pencere, 440, 380)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="🔔 Yeni Alarm Kuralı", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        al_kural_adi = ctk.CTkEntry(pencere, placeholder_text="Kural Adı", width=320)
+        al_kural_adi.pack(pady=5)
+        al_kural_tipi = ctk.CTkOptionMenu(pencere, values=["KritikStok", "RiskLimitiAsimi", "VadeYaklasan",
+                                                             "SozlesmeSuresiDoluyor", "AnormalIslem", "TeslimTarihiYaklasiyor",
+                                                             "HammaddeFiyatArtisi"], width=320)
+        al_kural_tipi.pack(pady=5)
+        al_esik = ctk.CTkEntry(pencere, placeholder_text="Eşik (VadeYaklasan için gün sayısı)", width=320)
+        al_esik.pack(pady=5)
+
+        def kaydet():
+            if not al_kural_adi.get().strip():
+                messagebox.showwarning("Eksik Bilgi", "Kural adı zorunludur.")
+                return
+            try:
+                esik = float(al_esik.get()) if al_esik.get().strip() else None
+            except ValueError:
+                messagebox.showwarning("Hatalı Değer", "Eşik sayısal olmalıdır.")
+                return
+            data = {"KuralAdi": al_kural_adi.get().strip(), "KuralTipi": al_kural_tipi.get(), "Esik": esik}
+            try:
+                res = requests.post(f"{API}/alarm-kural-ekle", json=data, headers=self.req_headers(), timeout=5)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.alarm_kurallarini_yukle()
+                    messagebox.showinfo("Başarılı", "Alarm kuralı eklendi.")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="+ Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
 
     def alarm_kurallarini_yukle(self):
         try:
@@ -2519,23 +2981,23 @@ class MainApp(ctk.CTkToplevel):
     def init_kar_marji(self):
         ust = ctk.CTkFrame(self.tab_kar_marji, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="💹 Ürün Bazında Kâr Marjı Analizi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="💹 Ürün Bazında Kâr Marjı Analizi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=lambda: self.kar_marjini_yukle()).pack(side="right")
         ctk.CTkLabel(self.tab_kar_marji, text="Maliyet, StokKartlari.OrtalamaMaliyet üzerinden TAHMİNİ hesaplanır. Başlığa tıklayarak Ciro/Kâr'a göre sıralayabilirsiniz.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
 
         sirala_satiri = ctk.CTkFrame(self.tab_kar_marji, fg_color="transparent")
         sirala_satiri.pack(fill="x", padx=20, pady=(0, 5))
-        ctk.CTkLabel(sirala_satiri, text="Sırala:", font=("Arial", 11)).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(sirala_satiri, text="Sırala:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
         self.km_sirala_secim = ctk.CTkOptionMenu(sirala_satiri, values=["En Çok Kâr", "En Yüksek Ciro", "En Yüksek Marj %"],
                                                   width=170, command=lambda _: self.kar_marjini_yukle())
         self.km_sirala_secim.pack(side="left")
 
-        liste_cerceve, self.kar_marji_tree = tablo_olustur(
+        self.kar_marji_tree = OzelTablo(
             self.tab_kar_marji, ["Stok Kod", "Ürün", "Miktar", "Ciro", "Tahmini Maliyet", "Tahmini Kâr", "Marj %"],
             [100, 220, 80, 110, 120, 110, 80], height=18)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.kar_marji_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self._km_veri_cache = []
         self.kar_marjini_yukle()
@@ -2567,25 +3029,25 @@ class MainApp(ctk.CTkToplevel):
     def init_siparis_kar_analizi(self):
         ust = ctk.CTkFrame(self.tab_siparis_kar, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="💹 Sipariş Bazında Kâr Analizi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="💹 Sipariş Bazında Kâr Analizi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=lambda: self.siparis_kar_analizini_yukle()).pack(side="right")
         ctk.CTkLabel(self.tab_siparis_kar,
                      text="'Kâr Marjı Analizi' ürün ORTALAMASI üzerinden çalışır - aynı ürünü farklı fiyat/iskontoyla satan siparişler arasındaki farkı gizler. "
                           "Burada HER siparişin kendi kârı ayrı gösterilir. Maliyet, StokKartlari.OrtalamaMaliyet üzerinden TAHMİNİdir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         sirala_satiri = ctk.CTkFrame(self.tab_siparis_kar, fg_color="transparent")
         sirala_satiri.pack(fill="x", padx=20, pady=(0, 5))
-        ctk.CTkLabel(sirala_satiri, text="Sırala:", font=("Arial", 11)).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(sirala_satiri, text="Sırala:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
         self.sk_sirala_secim = ctk.CTkOptionMenu(sirala_satiri, values=["En Çok Kâr", "En Çok Zarar", "En Yüksek Tutar", "En Düşük Marj %"],
                                                   width=170, command=lambda _: self.siparis_kar_analizini_yukle())
         self.sk_sirala_secim.pack(side="left")
 
-        liste_cerceve, self.siparis_kar_tree = tablo_olustur(
+        self.siparis_kar_tree = OzelTablo(
             self.tab_siparis_kar, ["Sipariş No", "Müşteri", "Ürün", "Miktar", "Tutar", "Tahmini Maliyet", "Tahmini Kâr", "Marj %", "Durum", "Tarih"],
-            [80, 160, 180, 80, 100, 110, 100, 70, 90, 90], height=18)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+            [80, 160, 180, 80, 100, 110, 100, 70, 90, 90], height=18, durum_kolonu="Durum")
+        self.siparis_kar_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self._sk_veri_cache = []
         self.siparis_kar_analizini_yukle()
@@ -2625,28 +3087,28 @@ class MainApp(ctk.CTkToplevel):
     def init_fiyat_onerisi(self):
         ust = ctk.CTkFrame(self.tab_fiyat_onerisi, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🧮 Otomatik Fiyat Önerisi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🧮 Otomatik Fiyat Önerisi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
 
         form = ctk.CTkFrame(self.tab_fiyat_onerisi, fg_color=RENK_KART, corner_radius=12)
         form.pack(fill="x", padx=20, pady=(0, 15))
         ctk.CTkLabel(form, text="Maliyet + istediğiniz kâr marjını girin, önerilen satış fiyatı hesaplansın.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=850).pack(anchor="w", padx=14, pady=(14, 8))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=850).pack(anchor="w", padx=14, pady=(14, 8))
 
         satir1 = ctk.CTkFrame(form, fg_color="transparent")
         satir1.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkLabel(satir1, text="Maliyet (TL):", font=("Arial", 11), width=140, anchor="w").pack(side="left")
+        ctk.CTkLabel(satir1, text="Maliyet (TL):", font=("Segoe UI", 11), width=140, anchor="w").pack(side="left")
         self.fo_maliyet = ctk.CTkEntry(satir1, placeholder_text="Örn: 45.50", width=160)
         self.fo_maliyet.pack(side="left")
 
         satir2 = ctk.CTkFrame(form, fg_color="transparent")
         satir2.pack(fill="x", padx=14, pady=(0, 8))
-        ctk.CTkLabel(satir2, text="İstenilen Kâr Marjı (%):", font=("Arial", 11), width=140, anchor="w").pack(side="left")
+        ctk.CTkLabel(satir2, text="İstenilen Kâr Marjı (%):", font=("Segoe UI", 11), width=140, anchor="w").pack(side="left")
         self.fo_marj = ctk.CTkEntry(satir2, placeholder_text="Örn: 30", width=160)
         self.fo_marj.pack(side="left")
 
         satir3 = ctk.CTkFrame(form, fg_color="transparent")
         satir3.pack(fill="x", padx=14, pady=(0, 14))
-        ctk.CTkLabel(satir3, text="Rakip Fiyatı (opsiyonel):", font=("Arial", 11), width=140, anchor="w").pack(side="left")
+        ctk.CTkLabel(satir3, text="Rakip Fiyatı (opsiyonel):", font=("Segoe UI", 11), width=140, anchor="w").pack(side="left")
         self.fo_rakip = ctk.CTkEntry(satir3, placeholder_text="Karşılaştırma için", width=160)
         self.fo_rakip.pack(side="left", padx=(0, 10))
         ctk.CTkButton(satir3, text="Hesapla", fg_color="#9965F1", hover_color="#8256CD",
@@ -2654,7 +3116,7 @@ class MainApp(ctk.CTkToplevel):
 
         self.fo_sonuc_cerceve = ctk.CTkFrame(self.tab_fiyat_onerisi, fg_color=RENK_KART, corner_radius=12)
         self.fo_sonuc_cerceve.pack(fill="x", padx=20, pady=(0, 20))
-        self.fo_sonuc_label = ctk.CTkLabel(self.fo_sonuc_cerceve, text="Sonuç burada görünecek.", font=("Arial", 13), justify="left",
+        self.fo_sonuc_label = ctk.CTkLabel(self.fo_sonuc_cerceve, text="Sonuç burada görünecek.", font=("Segoe UI", 13), justify="left",
                                             text_color=RENK_METIN_SOLUK, wraplength=850)
         self.fo_sonuc_label.pack(anchor="w", padx=14, pady=14)
 
@@ -2685,24 +3147,24 @@ class MainApp(ctk.CTkToplevel):
     def init_siparis_fatura_tutarlilik(self):
         ust = ctk.CTkFrame(self.tab_siparis_fatura_tutarlilik, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔍 Sipariş-Fatura Tutarlılık Kontrolü", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔍 Sipariş-Fatura Tutarlılık Kontrolü", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.siparis_fatura_tutarsizliklarini_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_siparis_fatura_tutarlilik,
                      text="Bir sipariş faturaya/irsaliyeye dönüştüğünde, fatura fiyatı sipariş anında anlaşılan fiyattan %1'den fazla "
                           "farklıysa burada otomatik listelenir. Bu her zaman bir hata anlamına gelmez (son dakika iskontosu, kur "
                           "güncellemesi gibi meşru sebepler de olabilir) - amaç görünür kılmaktır.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 8))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 8))
 
         self.sft_sadece_incelenmemis = ctk.BooleanVar(value=True)
         ctk.CTkCheckBox(self.tab_siparis_fatura_tutarlilik, text="Sadece incelenmemiş kayıtları göster", variable=self.sft_sadece_incelenmemis,
                          command=self.siparis_fatura_tutarsizliklarini_yukle).pack(anchor="w", padx=20, pady=(0, 8))
 
-        liste_cerceve, self.sft_tree = tablo_olustur(
+        self.sft_tree = OzelTablo(
             self.tab_siparis_fatura_tutarlilik,
             ["ID", "Sipariş", "Fatura", "Ürün", "Sipariş Fiyatı", "Fatura Fiyatı", "Fark %", "Tarih", "Durum"],
-            [40, 80, 80, 180, 110, 110, 70, 130, 100], height=16)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+            [40, 80, 80, 180, 110, 110, 70, 130, 100], height=16, durum_kolonu="Durum")
+        self.sft_tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
         self.sft_tree.tag_configure("buyuk_fark", foreground="#F36D6D")
 
         ctk.CTkButton(self.tab_siparis_fatura_tutarlilik, text="✅ Seçileni İncelendi Olarak İşaretle", fg_color="#49B772", hover_color="#3E9C61",
@@ -2747,18 +3209,18 @@ class MainApp(ctk.CTkToplevel):
     def init_musteri_segment(self):
         ust = ctk.CTkFrame(self.tab_musteri_segment, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🎯 Müşteri Segmentasyonu (RFM Analizi)", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🎯 Müşteri Segmentasyonu (RFM Analizi)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.musteri_segmentasyonunu_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_musteri_segment, text="Otomatik hesaplanır (Yakınlık/Sıklık/Tutar bazında). 🔑 işaretli satırlar elle atanmıştır ve otomatik hesaplamayı geçersiz kılar.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 8))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 8))
 
         self.ms_ozet_alani = ctk.CTkFrame(self.tab_musteri_segment, fg_color="transparent")
         self.ms_ozet_alani.pack(fill="x", padx=20, pady=(0, 10))
 
         elle_atama_cerceve = ctk.CTkFrame(self.tab_musteri_segment, fg_color=RENK_KART, corner_radius=12)
         elle_atama_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(elle_atama_cerceve, text="🔑 Seçili Müşterinin Segmentini Elle Ata:", font=("Arial", 11, "bold")).pack(side="left", padx=(12, 10), pady=12)
+        ctk.CTkLabel(elle_atama_cerceve, text="🔑 Seçili Müşterinin Segmentini Elle Ata:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(12, 10), pady=12)
         self.ms_segment_secim = ctk.CTkOptionMenu(elle_atama_cerceve, values=["VIP", "Sadık Müşteri", "Risk Altında", "Kayıp Müşteri", "Yeni Müşteri", "Normal"], width=160)
         self.ms_segment_secim.pack(side="left", padx=(0, 8))
         ctk.CTkButton(elle_atama_cerceve, text="🔑 Ata", fg_color="#F7B341", hover_color="#D29837", width=90,
@@ -2766,10 +3228,10 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(elle_atama_cerceve, text="↩️ Elle Atamayı Kaldır (Otomatiğe Dön)", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
                       command=self.musteri_segment_sifirla_islem).pack(side="left")
 
-        liste_cerceve, self.musteri_segment_tree = tablo_olustur(
+        self.musteri_segment_tree = OzelTablo(
             self.tab_musteri_segment, ["Müşteri", "Segment", "Fatura Sayısı", "Toplam Harcama", "Son Alışveriş (gün önce)"],
             [200, 170, 100, 130, 170], height=15)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.musteri_segment_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self.musteri_segmentasyonunu_yukle()
 
@@ -2792,7 +3254,7 @@ class MainApp(ctk.CTkToplevel):
         for segment, adet in sorted(veri.get("SegmentOzeti", {}).items(), key=lambda x: -x[1]):
             rozet = ctk.CTkFrame(self.ms_ozet_alani, fg_color=SEGMENT_RENK.get(segment, "#6b7280"), corner_radius=12)
             rozet.pack(side="left", padx=(0, 8))
-            ctk.CTkLabel(rozet, text=f"{segment}: {adet}", font=("Arial", 11, "bold"), text_color=RENK_METIN).pack(padx=12, pady=6)
+            ctk.CTkLabel(rozet, text=f"{segment}: {adet}", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN).pack(padx=12, pady=6)
 
         for i in self.musteri_segment_tree.get_children():
             self.musteri_segment_tree.delete(i)
@@ -2839,19 +3301,19 @@ class MainApp(ctk.CTkToplevel):
     def init_satis_tahmini(self):
         ust = ctk.CTkFrame(self.tab_satis_tahmini, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📈 Satış Tahmini", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📈 Satış Tahmini", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.satis_tahminini_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_satis_tahmini,
                      text="Son 3 ayın ağırlıklı ortalamasına göre önümüzdeki ay için beklenen talep tahmin edilir. "
                           "Kırmızı satırlar, mevcut stoğun tahmini talebi KARŞILAMADIĞI ürünleri gösterir - üretim/satınalma planlamasında öncelik verin. "
                           "Bu istatistiksel bir yaklaşık tahmindir, kesin bir taahhüt değildir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        liste_cerceve, self.satis_tahmini_tree = tablo_olustur(
+        self.satis_tahmini_tree = OzelTablo(
             self.tab_satis_tahmini, ["Stok Kod", "Ürün", "Mevcut Stok", "Tahmini Aylık Talep", "Trend", "Eksik Miktar"],
             [100, 220, 110, 150, 70, 110], height=18)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.satis_tahmini_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self.satis_tahminini_yukle()
 
@@ -2876,72 +3338,249 @@ class MainApp(ctk.CTkToplevel):
     def init_fiyat_listeleri(self):
         ust = ctk.CTkFrame(self.tab_fiyat_listeleri, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="💰 Fiyat Listeleri / Kademeli İskonto", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="💰 Fiyat Listeleri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
 
-        sekmeler = ctk.CTkTabview(self.tab_fiyat_listeleri)
-        sekmeler.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        sekmeler.add("Fiyat Listeleri")
-        sekmeler.add("Kademeli İskonto")
+        govde = ctk.CTkFrame(self.tab_fiyat_listeleri, fg_color="transparent")
+        govde.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        fl_tab = sekmeler.tab("Fiyat Listeleri")
-        ekle_satiri = ctk.CTkFrame(fl_tab, fg_color="transparent")
-        ekle_satiri.pack(fill="x", pady=(10, 5))
-        self.fl_ad = ctk.CTkEntry(ekle_satiri, placeholder_text="Liste Adı (Örn: Toptancı Fiyatları)", width=250)
+        self._fl_form_liste_id = None   # None = yeni liste oluşturuluyor, dolu = mevcut listeyi düzenleme
+        self._fl_veri_cache = []
+        self.fl_liste_govde = ctk.CTkFrame(govde, fg_color="transparent")
+        self.fl_form_govde = ctk.CTkFrame(govde, fg_color="transparent")
+        self._fl_liste_olustur()
+        self._fl_form_olustur()
+        self.fl_liste_goster()
+
+    def init_kademeli_iskonto(self):
+        ust = ctk.CTkFrame(self.tab_kademeli_iskonto, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="🪜 Kademeli İskonto", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+
+        govde = ctk.CTkFrame(self.tab_kademeli_iskonto, fg_color="transparent")
+        govde.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        self.ik_liste_govde = ctk.CTkFrame(govde, fg_color="transparent")
+        self.ik_form_govde = ctk.CTkFrame(govde, fg_color="transparent")
+        self._ik_liste_olustur()
+        self._ik_form_olustur()
+        self.ik_liste_goster()
+
+    def ik_liste_goster(self):
+        self.ik_form_govde.pack_forget()
+        self.ik_liste_govde.pack(fill="both", expand=True)
+
+    def ik_form_goster(self):
+        self.ik_liste_govde.pack_forget()
+        self.ik_min_miktar.delete(0, "end")
+        self.ik_oran.delete(0, "end")
+        self.ik_form_govde.pack(fill="both", expand=True)
+
+    def _ik_liste_olustur(self):
+        ust = ctk.CTkFrame(self.ik_liste_govde, fg_color="transparent")
+        ust.pack(fill="x", pady=(10, 5))
+        ctk.CTkLabel(ust, text="Genel miktar bazlı iskonto - tüm ürünler/müşteriler için geçerli", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkButton(ust, text="+ Kademe Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.ik_form_goster).pack(side="right")
+        self.ik_tree = OzelTablo(self.ik_liste_govde, ["ID", "Min. Miktar", "İskonto %"], [50, 150, 100], height=12)
+        self.ik_tree.pack(fill="both", expand=True)
+
+        self.iskonto_kademelerini_yukle()
+
+    def _ik_form_olustur(self):
+        ust = ctk.CTkFrame(self.ik_form_govde, fg_color="transparent")
+        ust.pack(fill="x", pady=(10, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.ik_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni İskonto Kademesi", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Kademe Ekle", fg_color="#49B772", hover_color="#3E9C61", width=130, height=30,
+                      command=self.iskonto_kademe_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.ik_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(fill="x", pady=(0, 10))
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        self.ik_min_miktar = ctk.CTkEntry(satir, placeholder_text="Min. Miktar (Örn: 100)", width=180)
+        self.ik_min_miktar.pack(side="left", padx=(0, 8))
+        self.ik_oran = ctk.CTkEntry(satir, placeholder_text="İskonto Oranı % (Örn: 5)", width=180)
+        self.ik_oran.pack(side="left")
+
+    def fl_liste_goster(self):
+        self.fl_form_govde.pack_forget()
+        self.fl_liste_govde.pack(fill="both", expand=True)
+
+    def fl_form_goster(self):
+        self.fl_liste_govde.pack_forget()
+        self.fl_form_govde.pack(fill="both", expand=True)
+
+    def _fl_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.fl_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="Fiyat Listeleri", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni Fiyat Listesi", fg_color="#49B772", hover_color="#3E9C61", height=32,
+                      command=self.fl_yeni_form_ac).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.fl_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=8)
+        self.fl_arama = ctk.CTkEntry(arama_bar, placeholder_text="Liste adı veya açıklamaya göre ara...", width=300)
+        self.fl_arama.pack(side="left", padx=(0, 12), pady=8)
+        self.fl_arama.bind("<KeyRelease>", lambda e: self._fl_tree_render())
+
+        self.fl_tree = OzelTablo(self.fl_liste_govde, ["ID", "Liste Adı", "Açıklama"], [50, 220, 320], height=14)
+        self.fl_tree.pack(fill="both", expand=True, pady=(0, 5))
+        self.fl_tree.bind("<Double-1>", self.fl_ac_islem)
+
+        alt_buton = ctk.CTkFrame(self.fl_liste_govde, fg_color="transparent")
+        alt_buton.pack(fill="x", pady=(0, 10))
+        ctk.CTkButton(alt_buton, text="✏️ Aç (Kalem / Müşteri Yönet)", fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.fl_ac_islem).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(alt_buton, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
+                      command=self.fiyat_listesi_sil_islem).pack(side="left")
+
+        self.fiyat_listelerini_yukle()
+
+    def _fl_form_olustur(self):
+        ust = ctk.CTkFrame(self.fl_form_govde, fg_color="transparent")
+        ust.pack(fill="x", pady=(10, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.fl_liste_goster).pack(side="left")
+        self.fl_form_baslik = ctk.CTkLabel(ust, text="+ Yeni Fiyat Listesi", font=("Segoe UI", 16, "bold"), text_color="#76CCE1")
+        self.fl_form_baslik.pack(side="left", padx=(15, 0))
+        self.fl_olustur_buton = ctk.CTkButton(ust, text="💾 Oluştur", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                                               command=self.fiyat_listesi_kaydet_islem)
+        self.fl_olustur_buton.pack(side="right")
+
+        bilgi_kutu = ctk.CTkFrame(self.fl_form_govde, fg_color=RENK_KART, corner_radius=12)
+        bilgi_kutu.pack(fill="x", pady=(0, 10))
+        bilgi_satir = ctk.CTkFrame(bilgi_kutu, fg_color="transparent")
+        bilgi_satir.pack(fill="x", padx=14, pady=14)
+        self.fl_ad = ctk.CTkEntry(bilgi_satir, placeholder_text="Liste Adı (Örn: Toptancı Fiyatları)", width=280)
         self.fl_ad.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(ekle_satiri, text="+ Liste Oluştur", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.fiyat_listesi_olustur_islem).pack(side="left")
-        liste_cerceve, self.fl_tree = tablo_olustur(fl_tab, ["ID", "Liste Adı", "Açıklama"], [50, 220, 300], height=5)
-        liste_cerceve.pack(fill="x", pady=(0, 10))
+        self.fl_aciklama = ctk.CTkEntry(bilgi_satir, placeholder_text="Açıklama (opsiyonel)", width=280)
+        self.fl_aciklama.pack(side="left")
 
-        atama_satiri = ctk.CTkFrame(fl_tab, fg_color="transparent")
-        atama_satiri.pack(fill="x", pady=(0, 5))
-        ctk.CTkLabel(atama_satiri, text="Müşteriye Ata:", font=("Arial", 11)).pack(side="left", padx=(0, 8))
+        atama_kutu = ctk.CTkFrame(self.fl_form_govde, fg_color=RENK_KART, corner_radius=12)
+        atama_kutu.pack(fill="x", pady=(0, 10))
+        atama_satiri = ctk.CTkFrame(atama_kutu, fg_color="transparent")
+        atama_satiri.pack(fill="x", padx=14, pady=(14, 8))
+        ctk.CTkLabel(atama_satiri, text="Müşteriye Ata:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8))
         self.fl_musteri_id = ctk.CTkEntry(atama_satiri, placeholder_text="Müşteri ID", width=90)
         self.fl_musteri_id.pack(side="left", padx=(0, 4))
         ctk.CTkButton(atama_satiri, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.fl_musteri_id)).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(atama_satiri, text="Ata (Seçili Liste)", fg_color="#9965F1", hover_color="#8256CD",
+        ctk.CTkButton(atama_satiri, text="Bu Listeyi Ata", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.musteri_fiyat_listesi_ata_islem).pack(side="left")
 
-        urun_satiri = ctk.CTkFrame(fl_tab, fg_color="transparent")
-        urun_satiri.pack(fill="x", pady=(10, 5))
-        ctk.CTkLabel(urun_satiri, text="Seçili Listeye Ürün Fiyatı Ekle:", font=("Arial", 11)).pack(side="left", padx=(0, 8))
-        self.fl_stok_kod = ctk.CTkEntry(urun_satiri, placeholder_text="Stok Kod", width=100)
-        self.fl_stok_kod.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(urun_satiri, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
-                      command=lambda: self.urun_secim_penceresi(self.fl_stok_kod)).pack(side="left", padx=(0, 8))
-        self.fl_fiyat = ctk.CTkEntry(urun_satiri, placeholder_text="Özel Fiyat", width=100)
-        self.fl_fiyat.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(urun_satiri, text="+ Fiyat Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.fiyat_listesi_kalem_ekle_islem).pack(side="left")
-        kalem_cerceve, self.fl_kalem_tree = tablo_olustur(fl_tab, ["Stok Kod", "Ürün", "Fiyat"], [100, 250, 100], height=6)
-        kalem_cerceve.pack(fill="both", expand=True, pady=(5, 10))
-        self.fl_tree.bind("<<TreeviewSelect>>", lambda e: self.fiyat_listesi_kalemleri_yukle())
+        ctk.CTkLabel(atama_kutu, text="Bu Listeye Atanmış Müşteriler:", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=14, pady=(0, 4))
+        self.fl_atanmis_tree = OzelTablo(atama_kutu, ["Müşteri ID", "Firma Adı"], [90, 350], height=4)
+        self.fl_atanmis_tree.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkButton(atama_kutu, text="✕ Seçilenin Atamasını Kaldır", fg_color="#F36D6D", hover_color="#CF5D5D", height=28,
+                      command=self.fiyat_listesi_musteri_kaldir_islem).pack(anchor="w", padx=14, pady=(0, 14))
 
-        ik_tab = sekmeler.tab("Kademeli İskonto")
-        ctk.CTkLabel(ik_tab, text="Genel miktar bazlı iskonto - tüm ürünler/müşteriler için geçerli", font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(10, 5))
-        ik_satiri = ctk.CTkFrame(ik_tab, fg_color="transparent")
-        ik_satiri.pack(fill="x", pady=(0, 10))
-        self.ik_min_miktar = ctk.CTkEntry(ik_satiri, placeholder_text="Min. Miktar (Örn: 100)", width=150)
-        self.ik_min_miktar.pack(side="left", padx=(0, 8))
-        self.ik_oran = ctk.CTkEntry(ik_satiri, placeholder_text="İskonto Oranı % (Örn: 5)", width=150)
-        self.ik_oran.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(ik_satiri, text="+ Kademe Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.iskonto_kademe_ekle_islem).pack(side="left")
-        ik_liste_cerceve, self.ik_tree = tablo_olustur(ik_tab, ["ID", "Min. Miktar", "İskonto %"], [50, 150, 100], height=8)
-        ik_liste_cerceve.pack(fill="both", expand=True)
+        kalem_kutu = ctk.CTkFrame(self.fl_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kalem_kutu.pack(fill="both", expand=True, pady=(0, 10))
+        ctk.CTkLabel(kalem_kutu, text="Ürün Fiyatları", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=14, pady=(14, 2))
+        ctk.CTkLabel(kalem_kutu, text="Sadece '+ Ürün Ekle' ile eklediğiniz ürünler burada listelenir (stoktaki tüm ürünler otomatik "
+                                       "gösterilmez - ürün sayısı arttıkça yavaşlamaması için). Standart stok fiyatı sadece referans amaçlı "
+                                       "gösterilir, buradan değiştirilmez.",
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=14, pady=(0, 8))
 
-        self.fiyat_listelerini_yukle()
-        self.iskonto_kademelerini_yukle()
+        arama_satiri = ctk.CTkFrame(kalem_kutu, fg_color="transparent")
+        arama_satiri.pack(fill="x", padx=14, pady=(0, 6))
+        ctk.CTkLabel(arama_satiri, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(0, 4))
+        self.fl_urun_arama = ctk.CTkEntry(arama_satiri, placeholder_text="Eklenmiş ürünlerde ara...", width=320)
+        self.fl_urun_arama.pack(side="left", padx=(0, 8))
+        self.fl_urun_arama.bind("<KeyRelease>", lambda e: self._fl_urun_grid_render())
+        ctk.CTkButton(arama_satiri, text="+ Ürün Ekle", width=110, fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.fl_urun_ekle_ac).pack(side="left")
 
-    def fiyat_listesi_olustur_islem(self):
+        grid_baslik = ctk.CTkFrame(kalem_kutu, fg_color="transparent")
+        grid_baslik.pack(fill="x", padx=14)
+        ctk.CTkLabel(grid_baslik, text="Stok Kod", font=("Segoe UI", 10, "bold"), text_color=RENK_METIN_SOLUK, width=100, anchor="w").pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(grid_baslik, text="Ürün Adı", font=("Segoe UI", 10, "bold"), text_color=RENK_METIN_SOLUK, width=220, anchor="w").pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(grid_baslik, text="Standart Fiyat", font=("Segoe UI", 10, "bold"), text_color=RENK_METIN_SOLUK, width=100, anchor="w").pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(grid_baslik, text="Bu Listede Özel Fiyat", font=("Segoe UI", 10, "bold"), text_color=RENK_METIN_SOLUK, width=140, anchor="w").pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(grid_baslik, text="Para Birimi", font=("Segoe UI", 10, "bold"), text_color=RENK_METIN_SOLUK, width=80, anchor="w").pack(side="left")
+
+        self.fl_urun_grid_alani = ctk.CTkScrollableFrame(kalem_kutu, fg_color=RENK_TABAN, height=320)
+        self.fl_urun_grid_alani.pack(fill="both", expand=True, padx=14, pady=(4, 14))
+        self._fl_stok_by_kod = {}
+        self._fl_kalem_cache = {}
+        self._fl_yeni_satir_stok_kodlari = []   # "+ Ürün Ekle" ile seçilip henüz kaydedilmemiş kalemler
+
+    def fl_yeni_form_ac(self):
+        self._fl_form_liste_id = None
+        self.fl_form_baslik.configure(text="+ Yeni Fiyat Listesi")
+        self.fl_ad.delete(0, "end")
+        self.fl_aciklama.delete(0, "end")
+        self.fl_olustur_buton.configure(text="💾 Oluştur")
+        for i in self.fl_atanmis_tree.get_children():
+            self.fl_atanmis_tree.delete(i)
+        self.fiyat_listesi_kalemleri_yukle()
+        self.fl_form_goster()
+
+    def fl_ac_islem(self, event=None):
+        secili = self.fl_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen açmak için bir fiyat listesi seçin.")
+            return
+        liste_id = int(secili[0])
+        veri = next((l for l in self._fl_veri_cache if l["ListeID"] == liste_id), None)
+        if not veri:
+            return
+        self._fl_form_liste_id = liste_id
+        self.fl_form_baslik.configure(text=f"Fiyat Listesi: {veri['ListeAdi']}")
+        self.fl_ad.delete(0, "end")
+        self.fl_ad.insert(0, veri["ListeAdi"])
+        self.fl_aciklama.delete(0, "end")
+        self.fl_aciklama.insert(0, veri.get("Aciklama") or "")
+        self.fl_olustur_buton.configure(text="💾 Güncelle")
+        self.fiyat_listesi_kalemleri_yukle()
+        self.fiyat_listesi_musterileri_yukle()
+        self.fl_form_goster()
+
+    def fiyat_listesi_kaydet_islem(self):
         ad = self.fl_ad.get().strip()
         if not ad:
             messagebox.showwarning("Eksik Bilgi", "Liste adı zorunludur.")
             return
+        data = {"ListeAdi": ad, "Aciklama": self.fl_aciklama.get().strip() or None}
         try:
-            res = requests.post(f"{API}/fiyat-listesi-ekle", json={"ListeAdi": ad}, headers=self.req_headers(), timeout=5)
+            if self._fl_form_liste_id:
+                res = requests.put(f"{API}/fiyat-listesi-guncelle/{self._fl_form_liste_id}", json=data, headers=self.req_headers(), timeout=5)
+            else:
+                res = requests.post(f"{API}/fiyat-listesi-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.fl_ad.delete(0, "end")
+                self.fiyat_listelerini_yukle()
+                yeni_id = res.json().get("ListeID")
+                if yeni_id and not self._fl_form_liste_id:
+                    # Liste oluşturuldu - forma dönmeden aynı ekranda kalıp direkt kalem/müşteri
+                    # eklemeye devam edilebilsin diye "düzenleme moduna" geçiyoruz.
+                    self._fl_form_liste_id = yeni_id
+                    self.fl_form_baslik.configure(text=f"Fiyat Listesi: {ad}")
+                    self.fl_olustur_buton.configure(text="💾 Güncelle")
+                    self.fiyat_listesi_musterileri_yukle()
+                    self.fiyat_listesi_kalemleri_yukle()
+                else:
+                    self.fl_form_baslik.configure(text=f"Fiyat Listesi: {ad}")
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kaydedildi."))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def fiyat_listesi_sil_islem(self):
+        secili = self.fl_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen silmek için bir fiyat listesi seçin.")
+            return
+        if not messagebox.askyesno("Onay", "Bu fiyat listesini silmek istediğinize emin misiniz?\n"
+                                            "Listedeki tüm özel fiyatlar ve müşteri atamaları da silinecek."):
+            return
+        try:
+            res = requests.delete(f"{API}/fiyat-listesi-sil/{secili[0]}", headers=self.req_headers(), timeout=5)
+            if res.status_code == 200:
+                if self._fl_form_liste_id == int(secili[0]):
+                    self._fl_form_liste_id = None
                 self.fiyat_listelerini_yukle()
             else:
                 self.api_hata_goster(res)
@@ -2951,67 +3590,203 @@ class MainApp(ctk.CTkToplevel):
     def fiyat_listelerini_yukle(self):
         try:
             res = requests.get(f"{API}/fiyat-listeleri", headers=self.req_headers(), timeout=5)
-            for i in self.fl_tree.get_children():
-                self.fl_tree.delete(i)
-            for l in res.json().get("listeler", []):
-                self.fl_tree.insert("", "end", iid=str(l["ListeID"]), values=(l["ListeID"], l["ListeAdi"], l["Aciklama"]))
+            self._fl_veri_cache = res.json().get("listeler", [])
         except Exception:
-            pass
+            self._fl_veri_cache = []
+        self._fl_tree_render()
+
+    def _fl_tree_render(self):
+        if not hasattr(self, "fl_tree"):
+            return
+        for i in self.fl_tree.get_children():
+            self.fl_tree.delete(i)
+        arama = self.fl_arama.get().strip().lower() if hasattr(self, "fl_arama") else ""
+        for l in self._fl_veri_cache:
+            if arama and arama not in str(l.get("ListeAdi", "")).lower() and arama not in str(l.get("Aciklama", "")).lower():
+                continue
+            self.fl_tree.insert("", "end", iid=str(l["ListeID"]), values=(l["ListeID"], l["ListeAdi"], l["Aciklama"]))
 
     def musteri_fiyat_listesi_ata_islem(self):
-        secili = self.fl_tree.selection()
-        if not secili:
-            messagebox.showinfo("Seçim Yok", "Lütfen bir fiyat listesi seçin.")
+        if not self._fl_form_liste_id:
+            messagebox.showinfo("Liste Yok", "Önce fiyat listesini oluşturun.")
             return
         try:
             musteri_id = int(self.fl_musteri_id.get())
         except ValueError:
             messagebox.showwarning("Eksik Bilgi", "Geçerli bir Müşteri ID girin.")
             return
-        data = {"MusteriID": musteri_id, "ListeID": int(secili[0])}
+        data = {"MusteriID": musteri_id, "ListeID": self._fl_form_liste_id}
         try:
             res = requests.post(f"{API}/musteri-fiyat-listesi-ata", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
                 self.fl_musteri_id.delete(0, "end")
+                self.fiyat_listesi_musterileri_yukle()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj"))
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
-    def fiyat_listesi_kalem_ekle_islem(self):
-        secili = self.fl_tree.selection()
+    def fiyat_listesi_musterileri_yukle(self):
+        for i in self.fl_atanmis_tree.get_children():
+            self.fl_atanmis_tree.delete(i)
+        if not self._fl_form_liste_id:
+            return
+        try:
+            res = requests.get(f"{API}/fiyat-listesi-musterileri/{self._fl_form_liste_id}", headers=self.req_headers(), timeout=5)
+            for m in res.json().get("musteriler", []):
+                self.fl_atanmis_tree.insert("", "end", iid=str(m["MusteriID"]), values=(m["MusteriID"], m["FirmaAdi"]))
+        except Exception:
+            pass
+
+    def fiyat_listesi_musteri_kaldir_islem(self):
+        secili = self.fl_atanmis_tree.selection()
         if not secili:
-            messagebox.showinfo("Seçim Yok", "Lütfen önce üstteki tablodan bir fiyat listesi seçin.")
+            messagebox.showinfo("Seçim Yok", "Lütfen atamasını kaldırmak için bir müşteri seçin.")
             return
         try:
-            data = {"ListeID": int(secili[0]), "StokKod": self.fl_stok_kod.get().strip(), "Fiyat": float(self.fl_fiyat.get())}
-        except ValueError:
-            messagebox.showwarning("Hatalı Değer", "Fiyat sayısal olmalıdır.")
-            return
-        try:
-            res = requests.post(f"{API}/fiyat-listesi-kalem-ekle", json=data, headers=self.req_headers(), timeout=5)
+            res = requests.delete(f"{API}/musteri-fiyat-listesi-kaldir/{secili[0]}", headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.fl_stok_kod.delete(0, "end")
-                self.fl_fiyat.delete(0, "end")
-                self.fiyat_listesi_kalemleri_yukle()
+                self.fiyat_listesi_musterileri_yukle()
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
-    def fiyat_listesi_kalemleri_yukle(self):
-        secili = self.fl_tree.selection()
-        for i in self.fl_kalem_tree.get_children():
-            self.fl_kalem_tree.delete(i)
-        if not secili:
+    def fiyat_listesi_kalemleri_yukle(self, bekleyenleri_sifirla=True):
+        # bekleyenleri_sifirla=False: kaydet/sil sonrası tek bir kalemi yenilerken
+        # kullanıcının "+ Ürün Ekle" ile seçip henüz kaydetmediği DİĞER bekleyen
+        # satırları silmemek için (aksi halde onlar da "kaybolmuş" gibi görünürdü).
+        if bekleyenleri_sifirla:
+            self._fl_yeni_satir_stok_kodlari = []
+        if self._fl_form_liste_id:
+            # Tüm stok kataloğu sadece "StokKod -> ürün bilgisi" sözlüğü olarak
+            # tutuluyor (arama penceresi ve standart fiyat referansı için) - ASLA
+            # tek tek satır olarak render EDİLMİYOR, sadece "+ Ürün Ekle" ile
+            # seçilen ya da zaten bu listede kayıtlı olan ürünler ekrana çiziliyor.
+            # Ürün sayısı arttıkça (50+, 100+ vb.) tüm kataloğu widget olarak
+            # basmak yavaşlığa yol açardı.
+            try:
+                res = requests.get(f"{API}/stok-listesi", headers=self.req_headers(), timeout=6)
+                self._fl_stok_by_kod = {s["StokKod"]: s for s in res.json().get("stoklar", [])}
+            except Exception:
+                self._fl_stok_by_kod = {}
+            self._fl_kalem_cache = {}
+            try:
+                res = requests.get(f"{API}/fiyat-listesi-kalemleri/{self._fl_form_liste_id}", headers=self.req_headers(), timeout=5)
+                for k in res.json().get("kalemler", []):
+                    self._fl_kalem_cache[k["StokKod"]] = k
+            except Exception:
+                pass
+        else:
+            self._fl_stok_by_kod = {}
+            self._fl_kalem_cache = {}
+        self._fl_urun_grid_render()
+
+    def fl_urun_ekle_ac(self):
+        if not self._fl_form_liste_id:
+            messagebox.showinfo("Liste Yok", "Önce fiyat listesini oluşturun.")
+            return
+        # urun_secim_penceresi seçilen ürünün kodunu bir hedef Entry'ye yazıp kendini
+        # kapatıyor (geri çağrı desteklemiyor) - bu yüzden ekrana hiç basılmayan,
+        # sadece seçim sonucunu yakalamak için geçici bir Entry+StringVar kullanıyoruz.
+        gecici_var = ctk.StringVar()
+        gecici_entry = ctk.CTkEntry(self.fl_form_govde, textvariable=gecici_var)
+
+        def secim_yakalandi(*args):
+            kod = gecici_var.get().strip()
+            if not kod:
+                return
+            gecici_var.trace_remove("write", trace_id[0])
+            gecici_entry.destroy()
+            if kod in self._fl_kalem_cache or kod in self._fl_yeni_satir_stok_kodlari:
+                messagebox.showinfo("Zaten Ekli", f"'{kod}' bu listede zaten var.")
+                return
+            if kod not in self._fl_stok_by_kod:
+                messagebox.showwarning("Bulunamadı", f"'{kod}' stok kataloğunda bulunamadı.")
+                return
+            self._fl_yeni_satir_stok_kodlari.append(kod)
+            self._fl_urun_grid_render()
+
+        trace_id = [gecici_var.trace_add("write", secim_yakalandi)]
+        self.urun_secim_penceresi(gecici_entry)
+
+    def fl_urun_satiri_iptal(self, stok_kod):
+        if stok_kod in self._fl_yeni_satir_stok_kodlari:
+            self._fl_yeni_satir_stok_kodlari.remove(stok_kod)
+            self._fl_urun_grid_render()
+
+    def _fl_urun_grid_render(self):
+        if not hasattr(self, "fl_urun_grid_alani"):
+            return
+        for w in self.fl_urun_grid_alani.winfo_children():
+            w.destroy()
+        arama = self.fl_urun_arama.get().strip().lower() if hasattr(self, "fl_urun_arama") else ""
+        # Sadece zaten kayıtlı kalemler + "+ Ürün Ekle" ile henüz kaydedilmemiş
+        # bekleyen satırlar gösterilir - tüm stok kataloğu DEĞİL.
+        gosterilecek_kodlar = list(self._fl_kalem_cache.keys()) + [k for k in self._fl_yeni_satir_stok_kodlari if k not in self._fl_kalem_cache]
+        if not gosterilecek_kodlar:
+            ctk.CTkLabel(self.fl_urun_grid_alani, text="Henüz ürün eklenmedi - başlamak için '+ Ürün Ekle' butonunu kullanın.",
+                         font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(pady=20)
+            return
+        for stok_kod in gosterilecek_kodlar:
+            s = self._fl_stok_by_kod.get(stok_kod, {"StokKod": stok_kod, "StokAdi": stok_kod, "BirimFiyat": 0})
+            if arama and arama not in s["StokKod"].lower() and arama not in s["StokAdi"].lower():
+                continue
+            satir = ctk.CTkFrame(self.fl_urun_grid_alani, fg_color="transparent")
+            satir.pack(fill="x", pady=2)
+            ctk.CTkLabel(satir, text=s["StokKod"], width=100, anchor="w", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(satir, text=s["StokAdi"], width=220, anchor="w", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(satir, text=f"{s['BirimFiyat']:,.2f} TL", width=100, anchor="w", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(side="left", padx=(0, 8))
+            ozel = self._fl_kalem_cache.get(stok_kod)
+            fiyat_entry = ctk.CTkEntry(satir, placeholder_text="Standart fiyatı kullan", width=140)
+            if ozel:
+                fiyat_entry.insert(0, f"{ozel['Fiyat']:g}")
+            fiyat_entry.pack(side="left", padx=(0, 6))
+            pb_menu = ctk.CTkOptionMenu(satir, values=["TL", "USD", "EUR", "GBP"], width=80)
+            pb_menu.set(ozel["ParaBirimi"] if ozel else "TL")
+            pb_menu.pack(side="left", padx=(0, 6))
+            ctk.CTkButton(satir, text="💾", width=30, fg_color="#49B772", hover_color="#3E9C61",
+                          command=lambda kod=stok_kod, e=fiyat_entry, pb=pb_menu: self.fiyat_listesi_kalem_kaydet_islem(kod, e, pb)).pack(side="left", padx=(0, 4))
+            if ozel:
+                ctk.CTkButton(satir, text="✕", width=30, fg_color="#F36D6D", hover_color="#CF5D5D",
+                              command=lambda kalem_id=ozel["KalemID"]: self.fiyat_listesi_kalem_sil_islem(kalem_id)).pack(side="left")
+            else:
+                ctk.CTkButton(satir, text="✕", width=30, fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                              command=lambda kod=stok_kod: self.fl_urun_satiri_iptal(kod)).pack(side="left")
+
+    def fiyat_listesi_kalem_kaydet_islem(self, stok_kod, fiyat_entry, pb_menu):
+        if not self._fl_form_liste_id:
+            messagebox.showinfo("Liste Yok", "Önce fiyat listesini oluşturun.")
+            return
+        metin = fiyat_entry.get().strip()
+        if not metin:
+            messagebox.showinfo("Boş Fiyat", "Fiyat girin - kaldırmak için zaten kayıtlıysa ✕ butonunu kullanın.")
             return
         try:
-            res = requests.get(f"{API}/fiyat-listesi-kalemleri/{secili[0]}", headers=self.req_headers(), timeout=5)
-            for k in res.json().get("kalemler", []):
-                self.fl_kalem_tree.insert("", "end", values=(k["StokKod"], k["StokAdi"], f"{k['Fiyat']:,.2f}"))
-        except Exception:
-            pass
+            fiyat = float(metin)
+        except ValueError:
+            messagebox.showwarning("Hatalı Değer", "Fiyat sayısal olmalıdır.")
+            return
+        data = {"ListeID": self._fl_form_liste_id, "StokKod": stok_kod, "Fiyat": fiyat, "ParaBirimi": pb_menu.get()}
+        try:
+            res = requests.post(f"{API}/fiyat-listesi-kalem-ekle", json=data, headers=self.req_headers(), timeout=5)
+            if res.status_code == 200:
+                self.fiyat_listesi_kalemleri_yukle(bekleyenleri_sifirla=False)
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+    def fiyat_listesi_kalem_sil_islem(self, kalem_id):
+        try:
+            res = requests.delete(f"{API}/fiyat-listesi-kalem-sil/{kalem_id}", headers=self.req_headers(), timeout=5)
+            if res.status_code == 200:
+                self.fiyat_listesi_kalemleri_yukle(bekleyenleri_sifirla=False)
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def iskonto_kademe_ekle_islem(self):
         try:
@@ -3022,9 +3797,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/iskonto-kademe-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.ik_min_miktar.delete(0, "end")
-                self.ik_oran.delete(0, "end")
                 self.iskonto_kademelerini_yukle()
+                self.ik_liste_goster()
+                messagebox.showinfo("Başarılı", "İskonto kademesi eklendi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -3043,13 +3818,13 @@ class MainApp(ctk.CTkToplevel):
     def init_belge_zinciri(self):
         ust = ctk.CTkFrame(self.tab_belge_zinciri, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔗 Belge Zinciri Görünümü", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔗 Belge Zinciri Görünümü", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
 
-        ara_cerceve = ctk.CTkFrame(self.tab_belge_zinciri, fg_color=RENK_KART, corner_radius=12)
+        ara_cerceve = ctk.CTkFrame(self.tab_belge_zinciri, fg_color=RENK_PANEL, corner_radius=12)
         ara_cerceve.pack(fill="x", padx=20, pady=(0, 10))
         satir1 = ctk.CTkFrame(ara_cerceve, fg_color="transparent")
         satir1.pack(fill="x", padx=10, pady=(10, 8))
-        ctk.CTkLabel(satir1, text="1) Önce Müşteri Seçin:", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(satir1, text="1) Önce Müşteri Seçin:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8))
         mus_frame = ctk.CTkFrame(satir1, fg_color="transparent")
         mus_frame.pack(side="left")
         self.bz_musteri_id = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
@@ -3061,7 +3836,7 @@ class MainApp(ctk.CTkToplevel):
 
         satir2 = ctk.CTkFrame(ara_cerceve, fg_color="transparent")
         satir2.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkLabel(satir2, text="2) Teklif/Sipariş Seçin:", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(satir2, text="2) Teklif/Sipariş Seçin:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8))
         self.bz_belge_secim = ctk.CTkOptionMenu(satir2, values=["Önce müşteri seçin"], width=380,
                                                  command=lambda _: self.belge_zinciri_goster())
         self.bz_belge_secim.pack(side="left", padx=(0, 8))
@@ -3131,13 +3906,25 @@ class MainApp(ctk.CTkToplevel):
         }
 
         def ok_isareti():
-            ctk.CTkLabel(self.bz_sonuc_alani, text="↓", font=("Arial", 22, "bold"), text_color=RENK_METIN_SOLUK).pack(pady=2)
+            ctk.CTkLabel(self.bz_sonuc_alani, text="↓", font=("Segoe UI", 22, "bold"), text_color=RENK_METIN_SOLUK).pack(pady=2)
 
         def durum_rozeti(parent, durum):
             renk = DURUM_RENKLERI.get(durum, "#6b7280")
             rozet = ctk.CTkFrame(parent, fg_color=renk, corner_radius=14)
             rozet.pack(side="right", padx=(8, 0))
-            ctk.CTkLabel(rozet, text=durum or "-", font=("Arial", 10, "bold"), text_color=RENK_METIN).pack(padx=10, pady=3)
+            ctk.CTkLabel(rozet, text=durum or "-", font=("Segoe UI", 10, "bold"), text_color=RENK_METIN).pack(padx=10, pady=3)
+
+        def cift_tikla_baglama(widget, handler):
+            """widget ve TÜM alt widget'larına çift tıklama olayını bağlar - kartın
+            neresine tıklanırsa tıklansın popup açılsın diye (tek bir label'a
+            bağlamak, kullanıcının boşluğa tıklamasında hiçbir şey yapmıyor izlenimi verirdi)."""
+            widget.bind("<Double-Button-1>", handler)
+            try:
+                widget.configure(cursor="hand2")
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                cift_tikla_baglama(child, handler)
 
         def bolum_karti(baslik, ikon, renk, satirlar_ciz_fn):
             dis_cerceve = ctk.CTkFrame(self.bz_sonuc_alani, fg_color="transparent")
@@ -3148,7 +3935,7 @@ class MainApp(ctk.CTkToplevel):
             ic_kart.pack(side="left", fill="both", expand=True)
             baslik_satiri = ctk.CTkFrame(ic_kart, fg_color="transparent")
             baslik_satiri.pack(fill="x", padx=14, pady=(10, 4))
-            ctk.CTkLabel(baslik_satiri, text=f"{ikon} {baslik}", font=("Arial", 13, "bold"), text_color=renk).pack(side="left")
+            ctk.CTkLabel(baslik_satiri, text=f"{ikon} {baslik}", font=("Segoe UI", 13, "bold"), text_color=renk).pack(side="left")
             satirlar_ciz_fn(ic_kart)
             ctk.CTkFrame(ic_kart, height=6, fg_color="transparent").pack()
 
@@ -3160,10 +3947,11 @@ class MainApp(ctk.CTkToplevel):
             def ciz_teklif(kart, t=t):
                 satir = ctk.CTkFrame(kart, fg_color="transparent")
                 satir.pack(fill="x", padx=14, pady=(0, 8))
-                ctk.CTkLabel(satir, text=f"#{t['TeklifID']} — {t.get('FirmaAdi') or '-'}", font=("Arial", 12, "bold"), anchor="w").pack(side="left")
+                ctk.CTkLabel(satir, text=f"#{t['TeklifID']} — {t.get('FirmaAdi') or '-'}", font=("Segoe UI", 12, "bold"), anchor="w").pack(side="left")
                 durum_rozeti(satir, t.get("Durum"))
-                ctk.CTkLabel(kart, text=f"{t['Tutar']:,.2f} TL   ·   {t.get('Tarih') or '-'}", font=("Arial", 11),
-                             text_color=RENK_METIN_SOLUK, anchor="w").pack(fill="x", padx=14, pady=(0, 8))
+                ctk.CTkLabel(kart, text=f"{t['Tutar']:,.2f} TL   ·   {t.get('Tarih') or '-'}   ·   🔍 detay için çift tıklayın",
+                             font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, anchor="w").pack(fill="x", padx=14, pady=(0, 8))
+                cift_tikla_baglama(kart, lambda e, tid=t["TeklifID"]: self.teklif_detay_penceresi_ac(teklif_id=tid))
             bolum_karti("Teklif", "📝", "#5585EF", ciz_teklif)
 
         if zincir.get("Siparisler"):
@@ -3174,10 +3962,10 @@ class MainApp(ctk.CTkToplevel):
                 for s in zincir["Siparisler"]:
                     satir = ctk.CTkFrame(kart, fg_color="transparent")
                     satir.pack(fill="x", padx=14, pady=(0, 2))
-                    ctk.CTkLabel(satir, text=f"#{s['SiparisID']} — {s.get('FirmaAdi') or '-'}", font=("Arial", 12, "bold"), anchor="w").pack(side="left")
+                    ctk.CTkLabel(satir, text=f"#{s['SiparisID']} — {s.get('FirmaAdi') or '-'}", font=("Segoe UI", 12, "bold"), anchor="w").pack(side="left")
                     durum_rozeti(satir, s.get("Durum"))
                     ctk.CTkLabel(kart, text=f"{s.get('UrunAdi') or '-'} ({s.get('Miktar', 0):g})   ·   {s['Tutar']:,.2f} TL",
-                                 font=("Arial", 11), text_color=RENK_METIN_SOLUK, anchor="w").pack(fill="x", padx=14, pady=(0, 8))
+                                 font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, anchor="w").pack(fill="x", padx=14, pady=(0, 8))
             bolum_karti("Siparişler", "🛒", "#9965F1", ciz_siparisler)
 
         alt_belgeler_var = zincir.get("Irsaliyeler") or zincir.get("Faturalar")
@@ -3190,9 +3978,9 @@ class MainApp(ctk.CTkToplevel):
                 for i in zincir["Irsaliyeler"]:
                     satir = ctk.CTkFrame(kart, fg_color="transparent")
                     satir.pack(fill="x", padx=14, pady=(0, 2))
-                    ctk.CTkLabel(satir, text=f"#{i['IrsaliyeID']} — {i.get('BelgeNo') or 'Belge No Yok'}", font=("Arial", 12, "bold"), anchor="w").pack(side="left")
+                    ctk.CTkLabel(satir, text=f"#{i['IrsaliyeID']} — {i.get('BelgeNo') or 'Belge No Yok'}", font=("Segoe UI", 12, "bold"), anchor="w").pack(side="left")
                     ctk.CTkLabel(kart, text=f"{i.get('CariAd') or '-'}   ·   {i.get('Tarih') or '-'}",
-                                 font=("Arial", 11), text_color=RENK_METIN_SOLUK, anchor="w").pack(fill="x", padx=14, pady=(0, 8))
+                                 font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, anchor="w").pack(fill="x", padx=14, pady=(0, 8))
             bolum_karti("İrsaliyeler", "🚚", "#76CCE1", ciz_irsaliyeler)
 
         if zincir.get("Faturalar"):
@@ -3201,28 +3989,28 @@ class MainApp(ctk.CTkToplevel):
                 for f in zincir["Faturalar"]:
                     satir = ctk.CTkFrame(kart, fg_color="transparent")
                     satir.pack(fill="x", padx=14, pady=(0, 2))
-                    ctk.CTkLabel(satir, text=f"#{f['FaturaID']} — {f.get('FirmaAdi') or '-'}", font=("Arial", 12, "bold"), anchor="w").pack(side="left")
+                    ctk.CTkLabel(satir, text=f"#{f['FaturaID']} — {f.get('FirmaAdi') or '-'}", font=("Segoe UI", 12, "bold"), anchor="w").pack(side="left")
                     ctk.CTkLabel(kart, text=f"{f['Tutar']:,.2f} TL   ·   {f.get('Tarih') or '-'}",
-                                 font=("Arial", 11), text_color="#45C89D", anchor="w").pack(fill="x", padx=14, pady=(0, 8))
+                                 font=("Segoe UI", 11), text_color="#45C89D", anchor="w").pack(fill="x", padx=14, pady=(0, 8))
             bolum_karti("Faturalar", "🧾", "#45C89D", ciz_faturalar)
 
         if not varmi:
             ctk.CTkLabel(self.bz_sonuc_alani, text="Bu belge için ilişkili başka bir kayıt bulunamadı.",
-                         text_color=RENK_METIN_SOLUK, font=("Arial", 12)).pack(pady=30)
+                         text_color=RENK_METIN_SOLUK, font=("Segoe UI", 12)).pack(pady=30)
 
     def init_nakit_akis(self):
         ust = ctk.CTkFrame(self.tab_nakit_akis, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="💵 Nakit Akış Tahmini", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="💵 Nakit Akış Tahmini", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.nakit_akis_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_nakit_akis, text="Not: Bu bir TAHMİNDİR - standart 30 günlük vade varsayımı kullanılır, gerçek tarihler farklılık gösterebilir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
 
-        liste_cerceve, self.nakit_akis_tree = tablo_olustur(
+        self.nakit_akis_tree = OzelTablo(
             self.tab_nakit_akis, ["Hafta", "Beklenen Tahsilat", "Beklenen Ödeme", "Net Akış", "Kümülatif Bakiye"],
             [200, 150, 150, 130, 150], height=10)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.nakit_akis_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self.nakit_akis_yukle()
 
@@ -3242,45 +4030,43 @@ class MainApp(ctk.CTkToplevel):
             pass
 
     def init_numune_siparis(self):
-        ust = ctk.CTkFrame(self.tab_numune_siparis, fg_color="transparent")
+        self.numune_liste_govde = ctk.CTkFrame(self.tab_numune_siparis, fg_color="transparent")
+        self.numune_form_govde = ctk.CTkFrame(self.tab_numune_siparis, fg_color="transparent")
+        self._numune_liste_olustur()
+        self._numune_form_olustur()
+        self.numune_liste_goster()
+
+    def numune_liste_goster(self):
+        self.numune_form_govde.pack_forget()
+        self.numune_liste_govde.pack(fill="both", expand=True)
+
+    def numune_form_goster(self):
+        self.numune_liste_govde.pack_forget()
+        for e in (self.ns_musteri_id, self.ns_stok_kod, self.ns_urun_adi, self.ns_miktar):
+            e.delete(0, "end")
+        self.numune_form_govde.pack(fill="both", expand=True)
+
+    def _numune_liste_olustur(self):
+        ust = ctk.CTkFrame(self.numune_liste_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🧪 Numune Siparişleri", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🧪 Numune Siparişleri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.numune_siparis_listesi_yukle).pack(side="right")
-        ctk.CTkLabel(self.tab_numune_siparis,
+        ctk.CTkButton(ust, text="+ Numune Gönder", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.numune_form_goster).pack(side="right", padx=(0, 8))
+        ctk.CTkLabel(self.numune_liste_govde,
                      text="Normal sipariş akışından ayrı - bir numunenin gerçek siparişe dönüşüp dönüşmediğini izler.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 8))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 8))
 
-        form = ctk.CTkFrame(self.tab_numune_siparis, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=10)
-        mus_frame = ctk.CTkFrame(satir1, fg_color="transparent")
-        mus_frame.pack(side="left", padx=(0, 8))
-        self.ns_musteri_id = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
-        self.ns_musteri_id.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.ns_musteri_id)).pack(side="left")
-        self.ns_stok_kod = ctk.CTkEntry(satir1, placeholder_text="Stok Kod (opsiyonel)", width=120)
-        self.ns_stok_kod.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(satir1, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
-                      command=lambda: self.urun_secim_penceresi(
-                          self.ns_stok_kod, hedef_ad_entry=self.ns_urun_adi, hedef_fiyat_entry=None)).pack(side="left", padx=(0, 8))
-        self.ns_urun_adi = ctk.CTkEntry(satir1, placeholder_text="Ürün Adı", width=200)
-        self.ns_urun_adi.pack(side="left", padx=(0, 8))
-        self.ns_miktar = ctk.CTkEntry(satir1, placeholder_text="Miktar", width=90)
-        self.ns_miktar.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir1, text="+ Numune Gönder", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.numune_siparis_ekle_islem).pack(side="left")
+        self.numune_tree = OzelTablo(
+            self.numune_liste_govde, ["ID", "Müşteri", "Ürün", "Miktar", "Gönderim", "Durum"],
+            [40, 160, 200, 70, 100, 130], height=13, durum_kolonu="Durum")
+        self.numune_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
 
-        liste_cerceve, self.numune_tree = tablo_olustur(
-            self.tab_numune_siparis, ["ID", "Müşteri", "Ürün", "Miktar", "Gönderim", "Durum"],
-            [40, 160, 200, 70, 100, 130], height=13)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
-
-        alt_cerceve = ctk.CTkFrame(self.tab_numune_siparis, fg_color=RENK_KART, corner_radius=12)
+        alt_cerceve = ctk.CTkFrame(self.numune_liste_govde, fg_color=RENK_KART, corner_radius=12)
         alt_cerceve.pack(fill="x", padx=20, pady=(0, 15))
         ctk.CTkLabel(alt_cerceve, text="Yukarıdaki listeden bir numune SEÇİN, sonucunu buradan işaretleyin:",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 4))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 4))
         alt_satir = ctk.CTkFrame(alt_cerceve, fg_color="transparent")
         alt_satir.pack(fill="x", padx=10, pady=(0, 10))
         self.ns_yeni_durum = ctk.CTkOptionMenu(alt_satir, values=["Değerlendiriliyor", "Siparişe Dönüştü", "Reddedildi"], width=170)
@@ -3289,6 +4075,37 @@ class MainApp(ctk.CTkToplevel):
                       command=self.numune_siparis_sonuclandir_islem).pack(side="left")
 
         self.numune_siparis_listesi_yukle()
+
+    def _numune_form_olustur(self):
+        ust = ctk.CTkFrame(self.numune_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.numune_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Numune Siparişi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Numune Gönder", fg_color="#49B772", hover_color="#3E9C61", width=150, height=30,
+                      command=self.numune_siparis_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.numune_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        mus_frame = ctk.CTkFrame(satir, fg_color="transparent")
+        mus_frame.pack(side="left", padx=(0, 8))
+        self.ns_musteri_id = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
+        self.ns_musteri_id.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.ns_musteri_id)).pack(side="left")
+        stok_frame = ctk.CTkFrame(satir, fg_color="transparent")
+        stok_frame.pack(side="left", padx=(0, 8))
+        self.ns_stok_kod = ctk.CTkEntry(stok_frame, placeholder_text="Stok Kod (opsiyonel)", width=120)
+        self.ns_stok_kod.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(stok_frame, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
+                      command=lambda: self.urun_secim_penceresi(
+                          self.ns_stok_kod, hedef_ad_entry=self.ns_urun_adi, hedef_fiyat_entry=None)).pack(side="left")
+        self.ns_urun_adi = ctk.CTkEntry(satir, placeholder_text="Ürün Adı", width=200)
+        self.ns_urun_adi.pack(side="left", padx=(0, 8))
+        self.ns_miktar = ctk.CTkEntry(satir, placeholder_text="Miktar", width=90)
+        self.ns_miktar.pack(side="left")
 
     def numune_siparis_ekle_islem(self):
         try:
@@ -3310,9 +4127,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/numune-siparis", json=data, headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
-                for e in (self.ns_musteri_id, self.ns_stok_kod, self.ns_urun_adi, self.ns_miktar):
-                    e.delete(0, "end")
                 self.numune_siparis_listesi_yukle()
+                self.numune_liste_goster()
+                messagebox.showinfo("Başarılı", "Numune siparişi gönderildi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -3354,43 +4171,46 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_firsatlar(self):
-        ust = ctk.CTkFrame(self.tab_firsatlar, fg_color="transparent")
+        self.firsat_liste_govde = ctk.CTkFrame(self.tab_firsatlar, fg_color="transparent")
+        self.firsat_form_govde = ctk.CTkFrame(self.tab_firsatlar, fg_color="transparent")
+        self._firsat_liste_olustur()
+        self._firsat_form_olustur()
+        self.firsat_liste_goster()
+
+    def firsat_liste_goster(self):
+        self.firsat_form_govde.pack_forget()
+        self.firsat_liste_govde.pack(fill="both", expand=True)
+
+    def firsat_form_goster(self):
+        self.firsat_liste_govde.pack_forget()
+        for e in (self.fr_musteri, self.fr_ad, self.fr_tutar):
+            e.delete(0, "end")
+        self.firsat_form_govde.pack(fill="both", expand=True)
+
+    def _firsat_liste_olustur(self):
+        ust = ctk.CTkFrame(self.firsat_liste_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🎯 Satış Fırsatları", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🎯 Satış Fırsatları", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.firsatlari_yukle).pack(side="right")
+        ctk.CTkButton(ust, text="+ Fırsat Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.firsat_form_goster).pack(side="right", padx=(0, 8))
 
-        ekle_cerceve = ctk.CTkFrame(self.tab_firsatlar, fg_color=RENK_KART, corner_radius=12)
-        ekle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(10, 5))
-        mus_frame = ctk.CTkFrame(satir1, fg_color="transparent")
-        mus_frame.pack(side="left", padx=(0, 8))
-        self.fr_musteri = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
-        self.fr_musteri.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.fr_musteri)).pack(side="left")
-        self.fr_ad = ctk.CTkEntry(satir1, placeholder_text="Fırsat Adı", width=200)
-        self.fr_ad.pack(side="left", padx=(0, 8))
-        self.fr_tutar = ctk.CTkEntry(satir1, placeholder_text="Tahmini Tutar", width=120)
-        self.fr_tutar.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir1, text="+ Fırsat Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.firsat_ekle_islem).pack(side="left")
+        self.firsat_tree = OzelTablo(
+            self.firsat_liste_govde, ["ID", "Müşteri", "Fırsat", "Tutar", "Aşama", "Kapanış Tarihi"], [40, 160, 180, 100, 130, 110], height=10)
+        self.firsat_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
 
-        liste_cerceve, self.firsat_tree = tablo_olustur(
-            self.tab_firsatlar, ["ID", "Müşteri", "Fırsat", "Tutar", "Aşama", "Kapanış Tarihi"], [40, 160, 180, 100, 130, 110], height=10)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
-
-        asama_satiri = ctk.CTkFrame(self.tab_firsatlar, fg_color="transparent")
+        asama_satiri = ctk.CTkFrame(self.firsat_liste_govde, fg_color="transparent")
         asama_satiri.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(asama_satiri, text="Seçili fırsatın aşamasını değiştir:", font=("Arial", 11)).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(asama_satiri, text="Seçili fırsatın aşamasını değiştir:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
         self.fr_yeni_asama = ctk.CTkOptionMenu(asama_satiri, values=["İlk Görüşme", "Teklif", "Müzakere", "Kazanıldı", "Kaybedildi"], width=140)
         self.fr_yeni_asama.pack(side="left", padx=(0, 8))
         ctk.CTkButton(asama_satiri, text="Güncelle", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.firsat_asama_guncelle_islem).pack(side="left")
 
-        aktivite_cerceve = ctk.CTkFrame(self.tab_firsatlar, fg_color=RENK_KART, corner_radius=12)
+        aktivite_cerceve = ctk.CTkFrame(self.firsat_liste_govde, fg_color=RENK_KART, corner_radius=12)
         aktivite_cerceve.pack(fill="x", padx=20, pady=(0, 20))
-        ctk.CTkLabel(aktivite_cerceve, text="Seçili Fırsata Aktivite Ekle (Arama/Toplantı/Not)", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(aktivite_cerceve, text="Seçili Fırsata Aktivite Ekle (Arama/Toplantı/Not)", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         akt_satiri = ctk.CTkFrame(aktivite_cerceve, fg_color="transparent")
         akt_satiri.pack(fill="x", padx=10, pady=(0, 10))
         self.akt_tip = ctk.CTkOptionMenu(akt_satiri, values=["Arama", "Toplantı", "Email", "Not"], width=110)
@@ -3402,10 +4222,33 @@ class MainApp(ctk.CTkToplevel):
 
         self.firsatlari_yukle()
 
+    def _firsat_form_olustur(self):
+        ust = ctk.CTkFrame(self.firsat_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.firsat_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Satış Fırsatı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Fırsat Ekle", fg_color="#49B772", hover_color="#3E9C61", width=130, height=30,
+                      command=self.firsat_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.firsat_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        mus_frame = ctk.CTkFrame(satir, fg_color="transparent")
+        mus_frame.pack(side="left", padx=(0, 8))
+        self.fr_musteri = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=100)
+        self.fr_musteri.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.fr_musteri)).pack(side="left")
+        self.fr_ad = ctk.CTkEntry(satir, placeholder_text="Fırsat Adı", width=220)
+        self.fr_ad.pack(side="left", padx=(0, 8))
+        self.fr_tutar = ctk.CTkEntry(satir, placeholder_text="Tahmini Tutar", width=140)
+        self.fr_tutar.pack(side="left")
+
     def init_satis_hunisi(self):
         ust = ctk.CTkFrame(self.tab_satis_hunisi, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔻 Satış Hunisi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔻 Satış Hunisi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.satis_hunisi_yukle).pack(side="right")
 
@@ -3456,17 +4299,17 @@ class MainApp(ctk.CTkToplevel):
     def init_teklif_donusum(self):
         ust = ctk.CTkFrame(self.tab_teklif_donusum, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔄 Teklif Dönüşüm Analizi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔄 Teklif Dönüşüm Analizi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.teklif_donusum_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_teklif_donusum,
                      text="Bir teklif 'Onaylandı' olduğunda otomatik siparişe dönüşür (bkz. Teklif ekranı) - dönüşüm oranı = "
                           "Onaylanan / (Onaylanan + Reddedilen). Bekleyen teklifler bu orana dahil edilmez.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         kpi_cerceve = ctk.CTkFrame(self.tab_teklif_donusum, fg_color=RENK_KART, corner_radius=12)
         kpi_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        self.td_kpi_etiket = ctk.CTkLabel(kpi_cerceve, text="Yükleniyor...", font=("Arial", 13, "bold"), justify="left")
+        self.td_kpi_etiket = ctk.CTkLabel(kpi_cerceve, text="Yükleniyor...", font=("Segoe UI", 13, "bold"), justify="left")
         self.td_kpi_etiket.pack(anchor="w", padx=15, pady=15)
 
         grafik_satiri = ctk.CTkFrame(self.tab_teklif_donusum, fg_color="transparent")
@@ -3478,10 +4321,10 @@ class MainApp(ctk.CTkToplevel):
         self.td_cubuk_alani.pack(side="left", fill="both", expand=True, padx=(10, 0))
         self.td_cubuk_alani.pack_propagate(False)
 
-        ctk.CTkLabel(self.tab_teklif_donusum, text="Müşteri Bazında Dönüşüm", font=("Arial", 13, "bold")).pack(anchor="w", padx=22, pady=(5, 3))
-        liste_cerceve, self.td_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_teklif_donusum, text="Müşteri Bazında Dönüşüm", font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=22, pady=(5, 3))
+        self.td_tree = OzelTablo(
             self.tab_teklif_donusum, ["Müşteri", "Toplam Teklif", "Onaylanan", "Reddedilen", "Dönüşüm %"], [220, 110, 100, 100, 100], height=10)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.td_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.td_tree.tag_configure("dusuk_donusum", foreground="#F36D6D")
 
         self.teklif_donusum_yukle()
@@ -3590,9 +4433,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/firsat-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                for e in [self.fr_musteri, self.fr_ad, self.fr_tutar]:
-                    e.delete(0, "end")
                 self.firsatlari_yukle()
+                self.firsat_liste_goster()
+                messagebox.showinfo("Başarılı", "Fırsat eklendi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -3659,33 +4502,21 @@ class MainApp(ctk.CTkToplevel):
     def init_arac_filo(self):
         ust = ctk.CTkFrame(self.tab_arac_filo, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🚚 Araç/Filo Yönetimi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🚚 Araç/Filo Yönetimi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.arac_listesi_yukle).pack(side="right")
 
-        form = ctk.CTkFrame(self.tab_arac_filo, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(10, 5))
-        self.ar_plaka = ctk.CTkEntry(satir1, placeholder_text="Plaka", width=120)
-        self.ar_plaka.pack(side="left", padx=(0, 8))
-        self.ar_marka = ctk.CTkEntry(satir1, placeholder_text="Marka", width=120)
-        self.ar_marka.pack(side="left", padx=(0, 8))
-        self.ar_model = ctk.CTkEntry(satir1, placeholder_text="Model", width=120)
-        self.ar_model.pack(side="left", padx=(0, 8))
-        satir2 = ctk.CTkFrame(form, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 10))
-        self.ar_muayene = ctk.CTkEntry(satir2, placeholder_text="Muayene Tarihi (YYYY-AA-GG)", width=180)
-        self.ar_muayene.pack(side="left", padx=(0, 8))
-        self.ar_sigorta = ctk.CTkEntry(satir2, placeholder_text="Sigorta Bitiş (YYYY-AA-GG)", width=180)
-        self.ar_sigorta.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir2, text="+ Araç Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.arac_ekle_islem).pack(side="left")
+        ust_buton_satiri = ctk.CTkFrame(self.tab_arac_filo, fg_color="transparent")
+        ust_buton_satiri.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkButton(ust_buton_satiri, text="+ Araç Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.arac_ekle_penceresi_ac).pack(side="left", padx=(0, 5))
+        ctk.CTkButton(ust_buton_satiri, text="✏️ Düzenle", fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.arac_duzenle_penceresi_ac).pack(side="left")
 
-        liste_cerceve, self.arac_tree = tablo_olustur(
+        self.arac_tree = OzelTablo(
             self.tab_arac_filo, ["ID", "Plaka", "Marka", "Model", "Muayene", "Sigorta Bitiş", "Durum"],
-            [40, 110, 110, 110, 110, 110, 90], height=10)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+            [40, 110, 110, 110, 110, 110, 90], height=10, durum_kolonu="Durum")
+        self.arac_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
 
         alt_satir = ctk.CTkFrame(self.tab_arac_filo, fg_color="transparent")
         alt_satir.pack(fill="x", padx=20, pady=(0, 15))
@@ -3696,23 +4527,106 @@ class MainApp(ctk.CTkToplevel):
 
         self.arac_listesi_yukle()
 
-    def arac_ekle_islem(self):
-        plaka = self.ar_plaka.get().strip()
-        if not plaka:
-            messagebox.showwarning("Eksik Bilgi", "Plaka girin.")
+    def arac_ekle_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Araç")
+        self._pencere_ortala(pencere, 440, 440)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="🚚 Yeni Araç", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        ar_plaka = ctk.CTkEntry(pencere, placeholder_text="Plaka", width=320)
+        ar_plaka.pack(pady=5)
+        ar_marka = ctk.CTkEntry(pencere, placeholder_text="Marka", width=320)
+        ar_marka.pack(pady=5)
+        ar_model = ctk.CTkEntry(pencere, placeholder_text="Model", width=320)
+        ar_model.pack(pady=5)
+        ar_muayene = ctk.CTkEntry(pencere, placeholder_text="Muayene Tarihi (YYYY-AA-GG)", width=320)
+        ar_muayene.pack(pady=5)
+        ar_sigorta = ctk.CTkEntry(pencere, placeholder_text="Sigorta Bitiş (YYYY-AA-GG)", width=320)
+        ar_sigorta.pack(pady=5)
+
+        def kaydet():
+            plaka = ar_plaka.get().strip()
+            if not plaka:
+                messagebox.showwarning("Eksik Bilgi", "Plaka girin.")
+                return
+            data = {"Plaka": plaka, "Marka": ar_marka.get().strip() or None, "Model": ar_model.get().strip() or None,
+                    "MuayeneTarihi": ar_muayene.get().strip() or None, "SigortaBitisTarihi": ar_sigorta.get().strip() or None}
+            try:
+                res = requests.post(f"{API}/arac", json=data, headers=self.req_headers(), timeout=6)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.arac_listesi_yukle()
+                    messagebox.showinfo("Başarılı", "Araç eklendi.")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="+ Araç Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
+
+    def arac_duzenle_penceresi_ac(self):
+        secili = self.arac_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen düzenlemek için bir araç seçin.")
             return
-        data = {"Plaka": plaka, "Marka": self.ar_marka.get().strip() or None, "Model": self.ar_model.get().strip() or None,
-                "MuayeneTarihi": self.ar_muayene.get().strip() or None, "SigortaBitisTarihi": self.ar_sigorta.get().strip() or None}
-        try:
-            res = requests.post(f"{API}/arac", json=data, headers=self.req_headers(), timeout=6)
-            if res.status_code == 200:
-                for e in (self.ar_plaka, self.ar_marka, self.ar_model, self.ar_muayene, self.ar_sigorta):
-                    e.delete(0, "end")
-                self.arac_listesi_yukle()
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+        arac_id = secili[0]
+        mevcut = self.arac_tree.item(arac_id)["values"]
+        _, plaka_eski, marka_eski, model_eski, muayene_eski, sigorta_eski, durum_eski = mevcut
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Araç Düzenle")
+        self._pencere_ortala(pencere, 440, 480)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="✏️ Araç Düzenle", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        ar_plaka = ctk.CTkEntry(pencere, placeholder_text="Plaka", width=320)
+        ar_plaka.insert(0, plaka_eski)
+        ar_plaka.pack(pady=5)
+        ar_marka = ctk.CTkEntry(pencere, placeholder_text="Marka", width=320)
+        ar_marka.insert(0, "" if marka_eski == "-" else marka_eski)
+        ar_marka.pack(pady=5)
+        ar_model = ctk.CTkEntry(pencere, placeholder_text="Model", width=320)
+        ar_model.insert(0, "" if model_eski == "-" else model_eski)
+        ar_model.pack(pady=5)
+        ar_muayene = ctk.CTkEntry(pencere, placeholder_text="Muayene Tarihi (YYYY-AA-GG)", width=320)
+        ar_muayene.insert(0, "" if muayene_eski == "-" else muayene_eski)
+        ar_muayene.pack(pady=5)
+        ar_sigorta = ctk.CTkEntry(pencere, placeholder_text="Sigorta Bitiş (YYYY-AA-GG)", width=320)
+        ar_sigorta.insert(0, "" if sigorta_eski == "-" else sigorta_eski)
+        ar_sigorta.pack(pady=5)
+        ar_durum = ctk.CTkOptionMenu(pencere, values=["Aktif", "Serviste", "Pasif"], width=320)
+        ar_durum.set(durum_eski if durum_eski in ("Aktif", "Serviste", "Pasif") else "Aktif")
+        ar_durum.pack(pady=5)
+
+        def kaydet():
+            plaka = ar_plaka.get().strip()
+            if not plaka:
+                messagebox.showwarning("Eksik Bilgi", "Plaka girin.")
+                return
+            data = {"AracID": int(arac_id), "Plaka": plaka, "Marka": ar_marka.get().strip() or None,
+                    "Model": ar_model.get().strip() or None, "MuayeneTarihi": ar_muayene.get().strip() or None,
+                    "SigortaBitisTarihi": ar_sigorta.get().strip() or None, "Durum": ar_durum.get()}
+            try:
+                res = requests.put(f"{API}/arac", json=data, headers=self.req_headers(), timeout=6)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.arac_listesi_yukle()
+                    messagebox.showinfo("Başarılı", "Araç güncellendi.")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="💾 Kaydet", fg_color="#5585EF", hover_color="#4871CB",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
 
     def arac_listesi_yukle(self):
         for i in self.arac_tree.get_children():
@@ -3757,7 +4671,7 @@ class MainApp(ctk.CTkToplevel):
         pencere.geometry("460x460")
         pencere.transient(self)
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"🔧 {plaka} — Bakım Geçmişi", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
+        ctk.CTkLabel(pencere, text=f"🔧 {plaka} — Bakım Geçmişi", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
 
         form = ctk.CTkFrame(pencere, fg_color="transparent")
         form.pack(fill="x", padx=20)
@@ -3785,8 +4699,8 @@ class MainApp(ctk.CTkToplevel):
             for b in bakimlar:
                 satir = ctk.CTkFrame(alan, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=12)
                 satir.pack(fill="x", pady=3, padx=4)
-                ctk.CTkLabel(satir, text=f"{b['Tarih']} — {b['Aciklama']}", font=("Arial", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
-                ctk.CTkLabel(satir, text=f"{b['Tutar']:,.2f} TL", font=("Arial", 10), text_color="#45C89D").pack(anchor="w", padx=10, pady=(0, 8))
+                ctk.CTkLabel(satir, text=f"{b['Tarih']} — {b['Aciklama']}", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+                ctk.CTkLabel(satir, text=f"{b['Tutar']:,.2f} TL", font=("Segoe UI", 10), text_color="#45C89D").pack(anchor="w", padx=10, pady=(0, 8))
 
         def ekle():
             try:
@@ -3815,22 +4729,42 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(pencere, text="Kapat", fg_color=gecerli_renk(RENK_KENARLIK), command=pencere.destroy).pack(pady=(0, 15))
 
     def init_demirbas_paneli(self):
-        frame = self.tab_demirbas
-        
-        ctk.CTkLabel(frame, text="📋 Kayıtlı Demirbaşlar ve Sabit Kıymetler", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=15, anchor="w", padx=20)
+        self.demirbas_liste_govde = ctk.CTkFrame(self.tab_demirbas, fg_color="transparent")
+        self.demirbas_form_govde = ctk.CTkFrame(self.tab_demirbas, fg_color="transparent")
+        self._demirbas_liste_olustur()
+        self._demirbas_form_olustur()
+        self.demirbas_liste_goster()
+
+    def demirbas_liste_goster(self):
+        self.demirbas_form_govde.pack_forget()
+        self.demirbas_liste_govde.pack(fill="both", expand=True)
+
+    def demirbas_form_goster(self):
+        self.demirbas_liste_govde.pack_forget()
+        for e in (self.db_ad, self.db_kategori, self.db_tutar, self.db_seri, self.db_aciklama, self.db_omur, self.db_lokasyon):
+            e.delete(0, "end")
+        self.demirbas_form_govde.pack(fill="both", expand=True)
+
+    def _demirbas_liste_olustur(self):
+        frame = self.demirbas_liste_govde
+        ust = ctk.CTkFrame(frame, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="📋 Kayıtlı Demirbaşlar ve Sabit Kıymetler", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Demirbaş", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.demirbas_form_goster).pack(side="right")
 
         buton_satiri_db = ctk.CTkFrame(frame, fg_color="transparent")
         buton_satiri_db.pack(anchor="w", padx=20, pady=(0, 10))
         ctk.CTkButton(
             buton_satiri_db, text="🔄 Listeyi Yenile",
             fg_color="#42ACA2", hover_color="#38928A", text_color="black",
-            font=("Arial", 11, "bold"), width=120, height=30,
+            font=("Segoe UI", 11, "bold"), width=120, height=30,
             command=self.demirbaslari_tabloya_yukle
         ).pack(side="left", padx=(0, 8))
         ctk.CTkButton(
             buton_satiri_db, text="📉 Amortismanı Şimdi Hesapla",
             fg_color="#76CCE1", hover_color="#64ADBF", text_color=RENK_TABAN,
-            font=("Arial", 11, "bold"), height=30,
+            font=("Segoe UI", 11, "bold"), height=30,
             command=self.amortisman_hesapla_simdi_islem
         ).pack(side="left")
 
@@ -3839,18 +4773,78 @@ class MainApp(ctk.CTkToplevel):
 
         self.demirbaslari_tabloya_yukle()
 
+    def _demirbas_form_olustur(self):
+        frame = self.demirbas_form_govde
+        ust = ctk.CTkFrame(frame, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.demirbas_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Demirbaş", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Demirbaşı Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=150, height=30,
+                      command=self.demirbas_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(frame, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(fill="x", padx=20, pady=(0, 10))
+        kart.grid_columnconfigure((0, 1, 2), weight=1, uniform="db_col")
+
+        self.db_ad = ctk.CTkEntry(kart, placeholder_text="Demirbaş Adı (örn: Enjeksiyon Makinesi / PC)", width=260)
+        self.db_ad.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        self.db_kategori = ctk.CTkEntry(kart, placeholder_text="Kategori (örn: Makine Parkuru / Bilişim)", width=220)
+        self.db_kategori.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        self.db_tutar = ctk.CTkEntry(kart, placeholder_text="Alış Tutarı (TL)", width=150)
+        self.db_tutar.grid(row=0, column=2, padx=10, pady=10, sticky="ew")
+        self.db_seri = ctk.CTkEntry(kart, placeholder_text="Seri No / Kod", width=180)
+        self.db_seri.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+        self.db_omur = ctk.CTkEntry(kart, placeholder_text="Faydalı Ömür (Yıl, opsiyonel)", width=180)
+        self.db_omur.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
+        self.db_lokasyon = ctk.CTkEntry(kart, placeholder_text="Lokasyon (opsiyonel)", width=180)
+        self.db_lokasyon.grid(row=1, column=2, padx=10, pady=10, sticky="ew")
+        self.db_aciklama = ctk.CTkEntry(kart, placeholder_text="Açıklama (opsiyonel)", width=260)
+        self.db_aciklama.grid(row=2, column=0, columnspan=3, padx=10, pady=10, sticky="ew")
+
+    def demirbas_ekle_islem(self):
+        ad = self.db_ad.get().strip()
+        if not ad:
+            messagebox.showwarning("Eksik Alan", "Demirbaş adı boş bırakılamaz.")
+            return
+        try:
+            tutar = float(self.db_tutar.get().replace(",", "."))
+        except ValueError:
+            messagebox.showwarning("Hata", "Alış tutarı sayısal olmalıdır.")
+            return
+        omur_metni = self.db_omur.get().strip()
+        data = {
+            "DemirbasAdi": ad,
+            "Kategori": self.db_kategori.get().strip() or "Genel",
+            "AlisTutari": tutar,
+            "SeriNo": self.db_seri.get().strip(),
+            "Aciklama": self.db_aciklama.get().strip(),
+            "FaydaliOmurYil": int(omur_metni) if omur_metni else None,
+            "Lokasyon": self.db_lokasyon.get().strip() or None,
+        }
+        try:
+            res = requests.post(f"{API}/demirbas-ekle", json=data, headers=self.req_headers(), timeout=5)
+            if res.status_code == 200:
+                self.demirbaslari_tabloya_yukle()
+                self.demirbas_liste_goster()
+                messagebox.showinfo("Başarılı", "Demirbaş başarıyla kaydedildi.")
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
     def init_yaslandirma(self):
-        ctk.CTkLabel(self.tab_yaslandirma, text="⏳ Alacak Yaşlandırma Raporu", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=(15, 5), anchor="w", padx=20)
+        ctk.CTkLabel(self.tab_yaslandirma, text="⏳ Alacak Yaşlandırma Raporu", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=(15, 5), anchor="w", padx=20)
         ctk.CTkLabel(self.tab_yaslandirma, text="Ödenmemiş faturaların vade yaşına göre dağılımı (yalnızca açık bakiyesi olan müşteriler listelenir).",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20, pady=(0, 10))
 
         ctk.CTkButton(self.tab_yaslandirma, text="🔄 Raporu Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.yaslandirma_yukle).pack(anchor="w", padx=20, pady=(0, 10))
 
-        ya_cerceve, self.yaslandirma_tree = tablo_olustur(
+        self.yaslandirma_tree = OzelTablo(
             self.tab_yaslandirma, ["Müşteri", "Toplam Açık Bakiye", "0-30 Gün", "31-60 Gün", "61-90 Gün", "90+ Gün", "Risk Limiti"],
             [220, 140, 110, 110, 110, 110, 120], height=18)
-        ya_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.yaslandirma_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.yaslandirma_yukle()
 
     def yaslandirma_yukle(self):
@@ -3870,20 +4864,20 @@ class MainApp(ctk.CTkToplevel):
             pass
 
     def init_kdv_beyanname(self):
-        ctk.CTkLabel(self.tab_kdv_beyanname, text="🧾 KDV Beyanname Taslağı", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(anchor="w", padx=20, pady=(15, 5))
+        ctk.CTkLabel(self.tab_kdv_beyanname, text="🧾 KDV Beyanname Taslağı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(anchor="w", padx=20, pady=(15, 5))
         ctk.CTkLabel(self.tab_kdv_beyanname,
                      text="⚠️ Bu resmi bir beyanname DEĞİLDİR, GİB'e doğrudan gönderilemez. Sadece 391 (Hesaplanan KDV) ile "
                           "191 (İndirilecek KDV) arasındaki farkı hesaplayan bir hazırlık taslağıdır - resmi beyan için "
                           "mali müşavirinize/e-beyanname yazılımınıza bu rakamları iletin.",
-                     font=("Arial", 11), text_color="#F7B341", wraplength=850, justify="left").pack(anchor="w", padx=22, pady=(0, 12))
+                     font=("Segoe UI", 11), text_color="#F7B341", wraplength=850, justify="left").pack(anchor="w", padx=22, pady=(0, 12))
 
         secim_cerceve = ctk.CTkFrame(self.tab_kdv_beyanname, fg_color=RENK_KART, corner_radius=12)
         secim_cerceve.pack(fill="x", padx=20, pady=(0, 15))
-        ctk.CTkLabel(secim_cerceve, text="Yıl:", font=("Arial", 11, "bold")).pack(side="left", padx=(15, 5), pady=15)
+        ctk.CTkLabel(secim_cerceve, text="Yıl:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(15, 5), pady=15)
         self.kdv_yil = ctk.CTkEntry(secim_cerceve, width=80)
         self.kdv_yil.insert(0, str(datetime.now().year))
         self.kdv_yil.pack(side="left", padx=(0, 15))
-        ctk.CTkLabel(secim_cerceve, text="Ay:", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 5))
+        ctk.CTkLabel(secim_cerceve, text="Ay:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 5))
         self.kdv_ay = ctk.CTkEntry(secim_cerceve, width=60)
         self.kdv_ay.insert(0, str(datetime.now().month))
         self.kdv_ay.pack(side="left", padx=(0, 15))
@@ -3892,13 +4886,13 @@ class MainApp(ctk.CTkToplevel):
 
         sonuc_cerceve = ctk.CTkFrame(self.tab_kdv_beyanname, fg_color=RENK_KART, corner_radius=12)
         sonuc_cerceve.pack(fill="x", padx=20, pady=(0, 15))
-        self.kdv_hesaplanan_lbl = ctk.CTkLabel(sonuc_cerceve, text="Hesaplanan KDV: -", font=("Arial", 13), text_color=RENK_METIN_SOLUK)
+        self.kdv_hesaplanan_lbl = ctk.CTkLabel(sonuc_cerceve, text="Hesaplanan KDV: -", font=("Segoe UI", 13), text_color=RENK_METIN_SOLUK)
         self.kdv_hesaplanan_lbl.pack(anchor="w", padx=20, pady=(15, 5))
-        self.kdv_indirilecek_lbl = ctk.CTkLabel(sonuc_cerceve, text="İndirilecek KDV: -", font=("Arial", 13), text_color=RENK_METIN_SOLUK)
+        self.kdv_indirilecek_lbl = ctk.CTkLabel(sonuc_cerceve, text="İndirilecek KDV: -", font=("Segoe UI", 13), text_color=RENK_METIN_SOLUK)
         self.kdv_indirilecek_lbl.pack(anchor="w", padx=20, pady=(0, 5))
-        self.kdv_odenecek_lbl = ctk.CTkLabel(sonuc_cerceve, text="Ödenecek KDV: -", font=("Arial", 16, "bold"), text_color="#F36D6D")
+        self.kdv_odenecek_lbl = ctk.CTkLabel(sonuc_cerceve, text="Ödenecek KDV: -", font=("Segoe UI", 16, "bold"), text_color="#F36D6D")
         self.kdv_odenecek_lbl.pack(anchor="w", padx=20, pady=(5, 5))
-        self.kdv_devreden_lbl = ctk.CTkLabel(sonuc_cerceve, text="Devreden KDV: -", font=("Arial", 16, "bold"), text_color="#49B772")
+        self.kdv_devreden_lbl = ctk.CTkLabel(sonuc_cerceve, text="Devreden KDV: -", font=("Segoe UI", 16, "bold"), text_color="#49B772")
         self.kdv_devreden_lbl.pack(anchor="w", padx=20, pady=(0, 15))
 
     def kdv_beyanname_hesapla(self):
@@ -3922,22 +4916,22 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_muhtasar_beyanname(self):
-        ctk.CTkLabel(self.tab_muhtasar_beyanname, text="📋 Muhtasar Beyanname Taslağı", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(anchor="w", padx=20, pady=(15, 5))
+        ctk.CTkLabel(self.tab_muhtasar_beyanname, text="📋 Muhtasar Beyanname Taslağı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(anchor="w", padx=20, pady=(15, 5))
         ctk.CTkLabel(self.tab_muhtasar_beyanname,
                      text="⚠️ Bu resmi bir beyanname DEĞİLDİR, GİB'e doğrudan gönderilemez. Personelin GÜNCEL Brüt Maaşı "
                           "kullanılır (geçmiş ayların gerçek tahakkuku saklanmaz) - Yıl/Ay seçimi SADECE o dönemde henüz "
                           "işe girmemiş personeli hariç tutar, geçmişte farklı bir maaş almışsa bunu yansıtmaz. Kira "
                           "stopajı vb. DAHİL DEĞİLDİR, kümülatif yıllık matrah takip edilmez. Resmi beyan için mali "
                           "müşavirinize danışın.",
-                     font=("Arial", 11), text_color="#F7B341", wraplength=850, justify="left").pack(anchor="w", padx=22, pady=(0, 12))
+                     font=("Segoe UI", 11), text_color="#F7B341", wraplength=850, justify="left").pack(anchor="w", padx=22, pady=(0, 12))
 
         secim_cerceve = ctk.CTkFrame(self.tab_muhtasar_beyanname, fg_color=RENK_KART, corner_radius=12)
         secim_cerceve.pack(fill="x", padx=20, pady=(0, 15))
-        ctk.CTkLabel(secim_cerceve, text="Yıl:", font=("Arial", 11, "bold")).pack(side="left", padx=(15, 5), pady=15)
+        ctk.CTkLabel(secim_cerceve, text="Yıl:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(15, 5), pady=15)
         self.mbt_yil = ctk.CTkEntry(secim_cerceve, width=80)
         self.mbt_yil.insert(0, str(datetime.now().year))
         self.mbt_yil.pack(side="left", padx=(0, 15))
-        ctk.CTkLabel(secim_cerceve, text="Ay:", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 5))
+        ctk.CTkLabel(secim_cerceve, text="Ay:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 5))
         self.mbt_ay = ctk.CTkEntry(secim_cerceve, width=60)
         self.mbt_ay.insert(0, str(datetime.now().month))
         self.mbt_ay.pack(side="left", padx=(0, 15))
@@ -3946,18 +4940,18 @@ class MainApp(ctk.CTkToplevel):
 
         sonuc_cerceve = ctk.CTkFrame(self.tab_muhtasar_beyanname, fg_color=RENK_KART, corner_radius=12)
         sonuc_cerceve.pack(fill="x", padx=20, pady=(0, 15))
-        self.mbt_gelir_vergisi_lbl = ctk.CTkLabel(sonuc_cerceve, text="Toplam Gelir Vergisi Stopajı: -", font=("Arial", 13), text_color=RENK_METIN_SOLUK)
+        self.mbt_gelir_vergisi_lbl = ctk.CTkLabel(sonuc_cerceve, text="Toplam Gelir Vergisi Stopajı: -", font=("Segoe UI", 13), text_color=RENK_METIN_SOLUK)
         self.mbt_gelir_vergisi_lbl.pack(anchor="w", padx=20, pady=(15, 5))
-        self.mbt_damga_lbl = ctk.CTkLabel(sonuc_cerceve, text="Toplam Damga Vergisi: -", font=("Arial", 13), text_color=RENK_METIN_SOLUK)
+        self.mbt_damga_lbl = ctk.CTkLabel(sonuc_cerceve, text="Toplam Damga Vergisi: -", font=("Segoe UI", 13), text_color=RENK_METIN_SOLUK)
         self.mbt_damga_lbl.pack(anchor="w", padx=20, pady=(0, 5))
-        self.mbt_toplam_lbl = ctk.CTkLabel(sonuc_cerceve, text="Toplam Ödenecek Muhtasar: -", font=("Arial", 16, "bold"), text_color="#F36D6D")
+        self.mbt_toplam_lbl = ctk.CTkLabel(sonuc_cerceve, text="Toplam Ödenecek Muhtasar: -", font=("Segoe UI", 16, "bold"), text_color="#F36D6D")
         self.mbt_toplam_lbl.pack(anchor="w", padx=20, pady=(5, 15))
 
-        ctk.CTkLabel(self.tab_muhtasar_beyanname, text="Personel Bazlı Detay", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(0, 3))
-        mbt_cerceve, self.mbt_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_muhtasar_beyanname, text="Personel Bazlı Detay", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(0, 3))
+        self.mbt_tree = OzelTablo(
             self.tab_muhtasar_beyanname, ["Personel", "Brüt Maaş", "Gelir Vergisi", "Damga Vergisi"],
             [220, 130, 130, 130], height=12)
-        mbt_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        self.mbt_tree.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
     def muhtasar_beyanname_hesapla(self):
         try:
@@ -3983,43 +4977,43 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_cari_mutabakat(self):
-        ust = ctk.CTkFrame(self.tab_cari_mutabakat, fg_color="transparent")
+        self.cari_mutabakat_liste_govde = ctk.CTkFrame(self.tab_cari_mutabakat, fg_color="transparent")
+        self.cari_mutabakat_form_govde = ctk.CTkFrame(self.tab_cari_mutabakat, fg_color="transparent")
+        self._cari_mutabakat_liste_olustur()
+        self._cari_mutabakat_form_olustur()
+        self.cari_mutabakat_liste_goster()
+
+    def cari_mutabakat_liste_goster(self):
+        self.cari_mutabakat_form_govde.pack_forget()
+        self.cari_mutabakat_liste_govde.pack(fill="both", expand=True)
+
+    def cari_mutabakat_form_goster(self):
+        self.cari_mutabakat_liste_govde.pack_forget()
+        self.cm_cari_id_entry.delete(0, "end")
+        self.cm_cari_unvan_entry.delete(0, "end")
+        self.cm_donem.delete(0, "end")
+        self.cm_aciklama.delete(0, "end")
+        self.cari_mutabakat_form_govde.pack(fill="both", expand=True)
+
+    def _cari_mutabakat_liste_olustur(self):
+        ust = ctk.CTkFrame(self.cari_mutabakat_liste_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🤝 Cari Mutabakat", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🤝 Cari Mutabakat", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.cari_mutabakat_yukle).pack(side="right")
-        ctk.CTkLabel(self.tab_cari_mutabakat,
+        ctk.CTkButton(ust, text="➕ Yeni Mutabakat Talebi", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.cari_mutabakat_form_goster).pack(side="right", padx=(0, 8))
+        ctk.CTkLabel(self.cari_mutabakat_liste_govde,
                      text="Müşteri/Tedarikçi hesap ekstresi bakiyesini dondurup mutabakat talebi olarak kaydeder, "
                           "sonradan 'Mutabık'/'Mutabık Değil' olarak sonuçlandırabilirsiniz.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        form_cerceve = ctk.CTkFrame(self.tab_cari_mutabakat, fg_color=RENK_KART, corner_radius=12)
-        form_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form_cerceve, text="Cari Tipi:", font=("Arial", 11, "bold")).grid(row=0, column=0, padx=(15, 5), pady=(12, 6), sticky="w")
-        self.cm_cari_tipi = ctk.CTkOptionMenu(form_cerceve, values=["Musteri", "Tedarikci"], width=120,
-                                               command=lambda _: self._cari_mutabakat_secim_temizle())
-        self.cm_cari_tipi.grid(row=0, column=1, padx=(0, 15), pady=(12, 6))
-        ctk.CTkButton(form_cerceve, text="🔍 Müşteri/Tedarikçi Seç", fg_color="#5585EF", hover_color="#4871CB",
-                      command=self.cari_mutabakat_secici_ac).grid(row=0, column=2, padx=(0, 15), pady=(12, 6))
-        self.cm_cari_id = ctk.CTkEntry(form_cerceve, width=0)  # gizli: sadece seçim penceresinin yazacağı hedef
-        self.cm_cari_unvan = ctk.CTkEntry(form_cerceve, width=260, placeholder_text="Seçilen cari (yukarıdaki butonla seçin)")
-        self.cm_cari_unvan.grid(row=0, column=3, padx=(0, 15), pady=(12, 6))
-        self.cm_cari_unvan.bind("<Key>", lambda e: "break")  # elle yazılmasın, sadece seçim penceresinden dolsun
+        self.cm_tree = OzelTablo(
+            self.cari_mutabakat_liste_govde, ["ID", "Tip", "Cari Adı", "Dönem", "Bakiye", "Durum", "Mutabakat Tarihi", "Açıklama"],
+            [50, 90, 200, 90, 110, 110, 140, 220], height=14, durum_kolonu="Durum")
+        self.cm_tree.pack(fill="both", expand=True, padx=20, pady=(0, 8))
 
-        ctk.CTkLabel(form_cerceve, text="Dönem (YYYY-MM):", font=("Arial", 11, "bold")).grid(row=1, column=0, columnspan=2, padx=(15, 5), pady=(0, 12), sticky="w")
-        self.cm_donem = ctk.CTkEntry(form_cerceve, width=100, placeholder_text="2026-09")
-        self.cm_donem.grid(row=1, column=2, padx=(0, 15), pady=(0, 12), sticky="w")
-        self.cm_aciklama = ctk.CTkEntry(form_cerceve, width=260, placeholder_text="Açıklama (opsiyonel)")
-        self.cm_aciklama.grid(row=1, column=3, padx=(0, 15), pady=(0, 12))
-        ctk.CTkButton(form_cerceve, text="➕ Talep Oluştur", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.cari_mutabakat_olustur_islem).grid(row=1, column=4, padx=(0, 15), pady=(0, 12))
-
-        cm_cerceve, self.cm_tree = tablo_olustur(
-            self.tab_cari_mutabakat, ["ID", "Tip", "Cari Adı", "Dönem", "Bakiye", "Durum", "Mutabakat Tarihi", "Açıklama"],
-            [50, 90, 200, 90, 110, 110, 140, 220], height=14)
-        cm_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 8))
-
-        buton_satiri = ctk.CTkFrame(self.tab_cari_mutabakat, fg_color="transparent")
+        buton_satiri = ctk.CTkFrame(self.cari_mutabakat_liste_govde, fg_color="transparent")
         buton_satiri.pack(fill="x", padx=20, pady=(0, 15))
         ctk.CTkButton(buton_satiri, text="✅ Mutabık Olarak İşaretle", fg_color="#49B772", hover_color="#3E9C61",
                       command=lambda: self.cari_mutabakat_sonuclandir_islem("Mutabık")).pack(side="left", padx=(0, 8))
@@ -4028,37 +5022,65 @@ class MainApp(ctk.CTkToplevel):
 
         self.cari_mutabakat_yukle()
 
+    def _cari_mutabakat_form_olustur(self):
+        ust = ctk.CTkFrame(self.cari_mutabakat_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.cari_mutabakat_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="➕ Yeni Mutabakat Talebi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="➕ Talep Oluştur", fg_color="#49B772", hover_color="#3E9C61", width=150, height=30,
+                      command=self.cari_mutabakat_olustur_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.cari_mutabakat_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+
+        self.cm_cari_id_entry = ctk.CTkEntry(kart, width=0)  # gizli: sadece seçim penceresinin yazacağı hedef
+
+        satir1 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir1.pack(fill="x", padx=15, pady=(15, 8))
+        self.cm_cari_tipi = ctk.CTkOptionMenu(satir1, values=["Musteri", "Tedarikci"], width=140,
+                                               command=self._cari_mutabakat_secim_temizle)
+        self.cm_cari_tipi.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(satir1, text="🔍 Müşteri/Tedarikçi Seç", fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.cari_mutabakat_secici_ac).pack(side="left", padx=(0, 8))
+        self.cm_cari_unvan_entry = ctk.CTkEntry(satir1, width=260, placeholder_text="Seçilen cari (yukarıdaki butonla seçin)")
+        self.cm_cari_unvan_entry.pack(side="left")
+        self.cm_cari_unvan_entry.bind("<Key>", lambda e: "break")  # elle yazılmasın, sadece seçim penceresinden dolsun
+
+        satir2 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir2.pack(fill="x", padx=15, pady=(0, 15))
+        self.cm_donem = ctk.CTkEntry(satir2, width=200, placeholder_text="Dönem (YYYY-MM, örn: 2026-09)")
+        self.cm_donem.pack(side="left", padx=(0, 8))
+        self.cm_aciklama = ctk.CTkEntry(satir2, width=260, placeholder_text="Açıklama (opsiyonel)")
+        self.cm_aciklama.pack(side="left")
+
     def cari_mutabakat_secici_ac(self):
         if self.cm_cari_tipi.get() == "Musteri":
-            self.musteri_secim_penceresi(self.cm_cari_id, self.cm_cari_unvan)
+            self.musteri_secim_penceresi(self.cm_cari_id_entry, self.cm_cari_unvan_entry)
         else:
-            self.tedarikci_secim_penceresi(self.cm_cari_id, self.cm_cari_unvan)
+            self.tedarikci_secim_penceresi(self.cm_cari_id_entry, self.cm_cari_unvan_entry)
 
-    def _cari_mutabakat_secim_temizle(self):
-        """Cari Tipi (Müşteri/Tedarikçi) değiştirilince önceki seçim geçersizleşir - yanlış tipte
-        bir ID ile talep oluşturulmasını önlemek için ID/Unvan alanları temizlenir."""
-        self.cm_cari_id.delete(0, "end")
-        self.cm_cari_unvan.delete(0, "end")
+    def _cari_mutabakat_secim_temizle(self, _=None):
+        self.cm_cari_id_entry.delete(0, "end")
+        self.cm_cari_unvan_entry.delete(0, "end")
 
     def cari_mutabakat_olustur_islem(self):
         try:
-            cari_id = int(self.cm_cari_id.get())
+            cari_id = int(self.cm_cari_id_entry.get())
         except ValueError:
             messagebox.showwarning("Eksik Bilgi", "Lütfen '🔍 Müşteri/Tedarikçi Seç' ile bir cari seçin.")
             return
-        donem = self.cm_donem.get().strip()
-        if not donem:
+        donem_deger = self.cm_donem.get().strip()
+        if not donem_deger:
             messagebox.showwarning("Eksik Bilgi", "Dönem (YYYY-MM) zorunludur.")
             return
-        data = {"CariTipi": self.cm_cari_tipi.get(), "CariID": cari_id, "Donem": donem,
+        data = {"CariTipi": self.cm_cari_tipi.get(), "CariID": cari_id, "Donem": donem_deger,
                 "Aciklama": self.cm_aciklama.get().strip() or None}
         try:
             res = requests.post(f"{API}/cari-mutabakat", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                self._cari_mutabakat_secim_temizle()
-                self.cm_donem.delete(0, "end")
-                self.cm_aciklama.delete(0, "end")
                 self.cari_mutabakat_yukle()
+                self.cari_mutabakat_liste_goster()
                 messagebox.showinfo("Başarılı", f"Mutabakat talebi oluşturuldu. Gönderilen Bakiye: {res.json()['GonderilenBakiye']:,.2f} TL")
             else:
                 self.api_hata_goster(res)
@@ -4095,24 +5117,24 @@ class MainApp(ctk.CTkToplevel):
     def init_stok_degerleme(self):
         ust = ctk.CTkFrame(self.tab_stok_degerleme, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📦 Dönem Sonu Stok Değerleme Raporu", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📦 Dönem Sonu Stok Değerleme Raporu", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.stok_degerleme_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_stok_degerleme,
                      text="Anlık stok durumunu (miktar × ortalama maliyet) tarihli bir rapora dondurur - "
                           "geçmişe dönük 'o tarihte stok değerim neydi' sorusuna cevap verir.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         ctk.CTkButton(self.tab_stok_degerleme, text="📸 Şimdi Değerleme Yap (Yeni Rapor Oluştur)", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.stok_degerleme_olustur_islem).pack(anchor="w", padx=20, pady=(0, 10))
 
-        sd_cerceve, self.sd_tree = tablo_olustur(
+        self.sd_tree = OzelTablo(
             self.tab_stok_degerleme, ["Rapor ID", "Rapor Tarihi", "Toplam Değer", "Oluşturan"],
             [90, 150, 150, 150], height=14)
-        sd_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        self.sd_tree.pack(fill="both", expand=True, padx=20, pady=(0, 8))
         self.sd_tree.bind("<Double-Button-1>", self.stok_degerleme_detay_goster)
         ctk.CTkLabel(self.tab_stok_degerleme, text="Detayları görmek için bir rapora çift tıklayın.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 15))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 15))
 
         self.stok_degerleme_yukle()
 
@@ -4161,42 +5183,42 @@ class MainApp(ctk.CTkToplevel):
         pencere.geometry("700x500")
         pencere.transient(self)
         ctk.CTkLabel(pencere, text=f"Rapor Tarihi: {veri['RaporTarihi']} — Toplam Değer: {veri['ToplamDeger']:,.2f} TL",
-                     font=("Arial", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=15, pady=(15, 10))
-        detay_cerceve, detay_tree = tablo_olustur(
+                     font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=15, pady=(15, 10))
+        detay_tree = OzelTablo(
             pencere, ["Stok Kod", "Stok Adı", "Miktar", "Birim Maliyet", "Toplam Değer"],
             [100, 220, 90, 110, 120], height=16)
-        detay_cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        detay_tree.pack(fill="both", expand=True, padx=15, pady=(0, 15))
         for k in veri.get("Kalemler", []):
             detay_tree.insert("", "end", values=(k["StokKod"], k["StokAdi"], f"{k['Miktar']:g}", f"{k['BirimMaliyet']:,.2f}", f"{k['ToplamDeger']:,.2f}"))
 
     def init_donem_kilitleme(self):
         ust = ctk.CTkFrame(self.tab_donem_kilit, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔒 Dönem Kilitleme", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔒 Dönem Kilitleme", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.donem_kilit_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_donem_kilit,
                      text="Kilitli bir dönemin kaydı korunur. Kilitlemek şifre gerektirmez (koruma sağladığı için); "
                           "kilidi AÇMAK (kapatılmış bir döneme yeniden dokunma izni) şifre ister.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         form_cerceve = ctk.CTkFrame(self.tab_donem_kilit, fg_color=RENK_KART, corner_radius=12)
         form_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form_cerceve, text="Yıl:", font=("Arial", 11, "bold")).grid(row=0, column=0, padx=(15, 5), pady=15, sticky="w")
+        ctk.CTkLabel(form_cerceve, text="Yıl:", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, padx=(15, 5), pady=15, sticky="w")
         self.dk_yil = ctk.CTkEntry(form_cerceve, width=80)
         self.dk_yil.insert(0, str(datetime.now().year))
         self.dk_yil.grid(row=0, column=1, padx=(0, 15), pady=15)
-        ctk.CTkLabel(form_cerceve, text="Ay:", font=("Arial", 11, "bold")).grid(row=0, column=2, padx=(0, 5), pady=15, sticky="w")
+        ctk.CTkLabel(form_cerceve, text="Ay:", font=("Segoe UI", 11, "bold")).grid(row=0, column=2, padx=(0, 5), pady=15, sticky="w")
         self.dk_ay = ctk.CTkEntry(form_cerceve, width=60)
         self.dk_ay.insert(0, str(datetime.now().month))
         self.dk_ay.grid(row=0, column=3, padx=(0, 15), pady=15)
         ctk.CTkButton(form_cerceve, text="🔒 Dönemi Kilitle", fg_color="#F36D6D", hover_color="#CF5D5D",
                       command=self.donem_kilitle_islem).grid(row=0, column=4, padx=(0, 15), pady=15)
 
-        dk_cerceve, self.dk_tree = tablo_olustur(
+        self.dk_tree = OzelTablo(
             self.tab_donem_kilit, ["ID", "Yıl", "Ay", "Kilitleyen", "Kilitleme Tarihi"],
             [50, 70, 60, 150, 160], height=12)
-        dk_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        self.dk_tree.pack(fill="both", expand=True, padx=20, pady=(0, 8))
         ctk.CTkButton(self.tab_donem_kilit, text="🔓 Seçili Dönemin Kilidini Aç (şifre ister)", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.donem_kilit_ac_islem).pack(anchor="w", padx=20, pady=(0, 15))
 
@@ -4250,7 +5272,7 @@ class MainApp(ctk.CTkToplevel):
         sifre_penceresi.grab_set()
 
         ctk.CTkLabel(sifre_penceresi, text=f"{yil}-{int(ay):02d} dönemini yeniden açmak için şifre girin:",
-                     font=("Arial", 12, "bold"), wraplength=320, justify="left").pack(padx=15, pady=(20, 10))
+                     font=("Segoe UI", 12, "bold"), wraplength=320, justify="left").pack(padx=15, pady=(20, 10))
         sifre_entry = ctk.CTkEntry(sifre_penceresi, width=200, show="•")
         sifre_entry.pack(pady=(0, 15))
         sifre_entry.focus_set()
@@ -4276,15 +5298,15 @@ class MainApp(ctk.CTkToplevel):
     def init_yil_sonu_kapanisi(self):
         ust = ctk.CTkFrame(self.tab_yil_sonu, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📆 Yıl Sonu Devir/Kapanışı", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📆 Yıl Sonu Devir/Kapanışı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkLabel(self.tab_yil_sonu,
                      text="Gelir ve gider hesapları geçicidir (temporary) - her yıl sonunda sıfırlanıp net kâr/zararı '690 Dönem Net Kâr/Zararı' hesabına devretmesi gerekir. "
                           "Önce Önizle ile o yılın toplamını kontrol edin, sonra Dönem Kilitleme şifrenizle kapatın. Bir yıl SADECE BİR KEZ kapatılabilir.",
-                     font=("Arial", 11), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         form_cerceve = ctk.CTkFrame(self.tab_yil_sonu, fg_color=RENK_KART, corner_radius=12)
         form_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form_cerceve, text="Yıl:", font=("Arial", 11, "bold")).pack(side="left", padx=(15, 5), pady=15)
+        ctk.CTkLabel(form_cerceve, text="Yıl:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(15, 5), pady=15)
         self.ys_yil = ctk.CTkEntry(form_cerceve, width=90)
         self.ys_yil.insert(0, str(datetime.now().year - 1))
         self.ys_yil.pack(side="left", padx=(0, 15), pady=15)
@@ -4294,14 +5316,14 @@ class MainApp(ctk.CTkToplevel):
                                              state="disabled", command=self.yil_sonu_kapat_islem)
         self.ys_kapat_buton.pack(side="left", pady=15)
 
-        self.ys_durum_etiket = ctk.CTkLabel(self.tab_yil_sonu, text="", font=("Arial", 12, "bold"))
+        self.ys_durum_etiket = ctk.CTkLabel(self.tab_yil_sonu, text="", font=("Segoe UI", 12, "bold"))
         self.ys_durum_etiket.pack(anchor="w", padx=22, pady=(0, 5))
 
-        ys_cerceve, self.ys_tree = tablo_olustur(
+        self.ys_tree = OzelTablo(
             self.tab_yil_sonu, ["Hesap Kodu", "Hesap Adı", "Tür", "Tutar"], [100, 260, 90, 130], height=14)
-        ys_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        self.ys_tree.pack(fill="both", expand=True, padx=20, pady=(0, 8))
 
-        self.ys_ozet_etiket = ctk.CTkLabel(self.tab_yil_sonu, text="", font=("Arial", 13, "bold"))
+        self.ys_ozet_etiket = ctk.CTkLabel(self.tab_yil_sonu, text="", font=("Segoe UI", 13, "bold"))
         self.ys_ozet_etiket.pack(anchor="w", padx=22, pady=(0, 15))
 
         self._ys_onizleme_yili = None
@@ -4365,7 +5387,7 @@ class MainApp(ctk.CTkToplevel):
         sifre_penceresi.grab_set()
 
         ctk.CTkLabel(sifre_penceresi, text=f"{yil} yılını KESİN OLARAK kapatmak için Dönem Kilitleme şifresini girin:",
-                     font=("Arial", 12, "bold"), wraplength=340, justify="left").pack(padx=15, pady=(20, 10))
+                     font=("Segoe UI", 12, "bold"), wraplength=340, justify="left").pack(padx=15, pady=(20, 10))
         sifre_entry = ctk.CTkEntry(sifre_penceresi, width=200, show="•")
         sifre_entry.pack(pady=(0, 15))
         sifre_entry.focus_set()
@@ -4391,32 +5413,32 @@ class MainApp(ctk.CTkToplevel):
     def init_onay_bekleyenler(self):
         ust = ctk.CTkFrame(self.tab_onay_bekleyenler, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="✅ Onay Bekleyen İşlemler", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="✅ Onay Bekleyen İşlemler", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.onay_bekleyenleri_yukle).pack(side="right")
 
         esik_cerceve = ctk.CTkFrame(self.tab_onay_bekleyenler, fg_color=RENK_KART, corner_radius=12)
         esik_cerceve.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkLabel(esik_cerceve, text="Fatura Onay Eşiği (bu tutarın üzerindeki Satış Faturaları Yönetici onayına düşer):",
-                     font=("Arial", 11)).pack(side="left", padx=10, pady=10)
+                     font=("Segoe UI", 11)).pack(side="left", padx=10, pady=10)
         self.onay_esik_entry = ctk.CTkEntry(esik_cerceve, width=120)
         self.onay_esik_entry.pack(side="left", padx=(0, 10))
         ctk.CTkButton(esik_cerceve, text="Kaydet", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.onay_esigi_kaydet).pack(side="left")
 
         ctk.CTkLabel(self.tab_onay_bekleyenler, text="Bir işleme çift tıklayarak Onayla/Reddet seçebilirsiniz. Ctrl/Shift ile birden fazla satır seçip toplu onaylayabilirsiniz.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
         ctk.CTkLabel(self.tab_onay_bekleyenler,
                      text="Bu liste, o anki adımda SİZİN rolünüzün onayını bekleyen işlemleri gösterir (Yönetici/Master tümünü görür). "
                           "Tutar aralığına göre birden fazla onay adımı olabilir - 'Adım' kolonu (örn. 2/3) o an kaçıncı aşamada olduğunu, "
                           "'Bekleyen Rol' hangi rolün onayını beklediğini gösterir. Onay zincirlerini Sistem → Onay Zincirleri'nden tanımlayabilirsiniz.\n"
                           "⚠️ Yönetici rolündeki bir kullanıcının kendi girdiği sipariş/fatura HİÇBİR ZAMAN bu listeye düşmez.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 8))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 8))
 
-        onay_cerceve, self.onay_tree = tablo_olustur(
+        self.onay_tree = OzelTablo(
             self.tab_onay_bekleyenler, ["ID", "Tür", "Özet", "Tutar", "Talep Eden", "Adım", "Bekleyen Rol", "Durum", "Onaylayan", "Tarih"],
-            [50, 100, 220, 100, 90, 60, 100, 90, 100, 130], height=16)
-        onay_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+            [50, 100, 220, 100, 90, 60, 100, 90, 100, 130], height=16, durum_kolonu="Durum")
+        self.onay_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
         self.onay_tree.bind("<Double-Button-1>", self.onay_islem_penceresi)
 
         ctk.CTkButton(self.tab_onay_bekleyenler, text="✅ Seçilenleri Toplu Onayla", fg_color="#49B772", hover_color="#3E9C61",
@@ -4451,25 +5473,25 @@ class MainApp(ctk.CTkToplevel):
     def init_cop_kutusu(self):
         ust = ctk.CTkFrame(self.tab_cop_kutusu, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🗑️ Çöp Kutusu", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🗑️ Çöp Kutusu", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.cop_kutusu_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_cop_kutusu,
                      text="Silinen Stok Kartı ve Müşteri kayıtları kalıcı silinmiyor, buradan geri getirilebiliyor. "
                           "Diğer kayıt türleri (henüz) bu kapsamda değil.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        ctk.CTkLabel(self.tab_cop_kutusu, text="📦 Silinmiş Stok Kartları", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(0, 3))
-        stok_cerceve, self.ck_stok_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_cop_kutusu, text="📦 Silinmiş Stok Kartları", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(0, 3))
+        self.ck_stok_tree = OzelTablo(
             self.tab_cop_kutusu, ["Stok Kod", "Stok Adı", "Birim", "Mevcut Miktar"], [130, 260, 100, 130], height=6)
-        stok_cerceve.pack(fill="x", padx=20, pady=(0, 5))
+        self.ck_stok_tree.pack(fill="x", padx=20, pady=(0, 5))
         ctk.CTkButton(self.tab_cop_kutusu, text="♻️ Seçili Stok Kartını Geri Getir", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.cop_kutusu_stok_geri_getir).pack(anchor="w", padx=20, pady=(0, 15))
 
-        ctk.CTkLabel(self.tab_cop_kutusu, text="🏢 Silinmiş Müşteriler", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(0, 3))
-        mus_cerceve, self.ck_musteri_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_cop_kutusu, text="🏢 Silinmiş Müşteriler", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(0, 3))
+        self.ck_musteri_tree = OzelTablo(
             self.tab_cop_kutusu, ["Müşteri ID", "Firma Adı", "Yetkili", "Telefon"], [90, 260, 150, 130], height=6)
-        mus_cerceve.pack(fill="x", padx=20, pady=(0, 5))
+        self.ck_musteri_tree.pack(fill="x", padx=20, pady=(0, 5))
         ctk.CTkButton(self.tab_cop_kutusu, text="♻️ Seçili Müşteriyi Geri Getir", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.cop_kutusu_musteri_geri_getir).pack(anchor="w", padx=20, pady=(0, 15))
 
@@ -4506,7 +5528,7 @@ class MainApp(ctk.CTkToplevel):
             res = requests.put(f"{API}/stok-geri-getir/{secili[0]}", headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
                 self.cop_kutusu_yukle()
-                if hasattr(self, "stoklari_yukle"):
+                if hasattr(self, "stok_tree"):
                     self.stoklari_yukle()
                 messagebox.showinfo("Başarılı", "Stok kartı geri getirildi.")
             else:
@@ -4530,24 +5552,24 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_genel_varsayilanlar(self):
-        ctk.CTkLabel(self.tab_genel_varsayilanlar, text="⚙️ Genel Varsayılanlar", font=("Arial", 18, "bold"),
+        ctk.CTkLabel(self.tab_genel_varsayilanlar, text="⚙️ Genel Varsayılanlar", font=("Segoe UI", 18, "bold"),
                      text_color="#76CCE1").pack(anchor="w", padx=20, pady=(15, 5))
         ctk.CTkLabel(self.tab_genel_varsayilanlar,
                      text="Bu ekran mevcut belge oluşturma ekranlarındaki para birimi vb. alanları otomatik değiştirmez — sadece merkezi bir referans sağlar.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=800, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=800, justify="left").pack(anchor="w", padx=20, pady=(0, 10))
 
         cerceve = ctk.CTkFrame(self.tab_genel_varsayilanlar, fg_color=RENK_KART, corner_radius=12)
         cerceve.pack(fill="x", padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(cerceve, text="Varsayılan Para Birimi", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).grid(row=0, column=0, padx=15, pady=(15, 3), sticky="w")
+        ctk.CTkLabel(cerceve, text="Varsayılan Para Birimi", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).grid(row=0, column=0, padx=15, pady=(15, 3), sticky="w")
         self.gv_para_birimi = ctk.CTkEntry(cerceve, placeholder_text="Örn: TL", width=200)
         self.gv_para_birimi.grid(row=1, column=0, padx=15, pady=(0, 15), sticky="w")
 
-        ctk.CTkLabel(cerceve, text="Varsayılan Ülke", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).grid(row=0, column=1, padx=15, pady=(15, 3), sticky="w")
+        ctk.CTkLabel(cerceve, text="Varsayılan Ülke", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).grid(row=0, column=1, padx=15, pady=(15, 3), sticky="w")
         self.gv_ulke = ctk.CTkEntry(cerceve, placeholder_text="Örn: Türkiye", width=200)
         self.gv_ulke.grid(row=1, column=1, padx=15, pady=(0, 15), sticky="w")
 
-        ctk.CTkLabel(cerceve, text="Puan Kazanım Oranı (%, POS Sadakat için)", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).grid(row=0, column=2, padx=15, pady=(15, 3), sticky="w")
+        ctk.CTkLabel(cerceve, text="Puan Kazanım Oranı (%, POS Sadakat için)", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).grid(row=0, column=2, padx=15, pady=(15, 3), sticky="w")
         self.gv_puan_orani = ctk.CTkEntry(cerceve, placeholder_text="Örn: 1", width=200)
         self.gv_puan_orani.grid(row=1, column=2, padx=15, pady=(0, 15), sticky="w")
 
@@ -4584,13 +5606,13 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_bildirim_ayarlari(self):
-        ctk.CTkLabel(self.tab_bildirim_ayarlari, text="📧 Bildirim Ayarları", font=("Arial", 18, "bold"),
+        ctk.CTkLabel(self.tab_bildirim_ayarlari, text="📧 Bildirim Ayarları", font=("Segoe UI", 18, "bold"),
                      text_color="#76CCE1").pack(anchor="w", padx=20, pady=(15, 10))
 
         eposta_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=12)
         eposta_cerceve.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkLabel(eposta_cerceve, text="Bildirim E-postası Ayarları (haftalık rapor + kritik stok uyarısı buradan gider)",
-                     font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+                     font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         eposta_satiri = ctk.CTkFrame(eposta_cerceve, fg_color="transparent")
         eposta_satiri.pack(fill="x", padx=10, pady=(0, 10))
         self.eposta_gonderen_entry = ctk.CTkEntry(eposta_satiri, placeholder_text="Gönderen Gmail Adresi", width=220)
@@ -4604,12 +5626,12 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(eposta_satiri, text="✉️ Test Gönder", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.eposta_test_gonder_islem).pack(side="left")
         ctk.CTkLabel(eposta_cerceve, text="Not: Gmail kullanıyorsanız normal şifreniz değil, Google hesabınızdan oluşturduğunuz 'Uygulama Şifresi' girilmelidir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 10))
 
         efatura_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=12)
         efatura_cerceve.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkLabel(efatura_cerceve, text="e-Fatura/e-Arşiv Entegratör Ayarları",
-                     font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+                     font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         efatura_satiri1 = ctk.CTkFrame(efatura_cerceve, fg_color="transparent")
         efatura_satiri1.pack(fill="x", padx=10, pady=(0, 5))
         self.efatura_url_entry = ctk.CTkEntry(efatura_satiri1, placeholder_text="Entegratör API URL", width=280)
@@ -4636,10 +5658,10 @@ class MainApp(ctk.CTkToplevel):
                      text="Not: Bu ayarlar sadece XML'in gönderileceği entegratör bağlantısını tanımlar - gerçek GİB\n"
                           "iletimi/imzalama için özel bir entegratörle (Uyumsoft, Foriba, Logo vb.) sözleşme yapılmalıdır.\n"
                           "'Otomatik Gönder' AÇILMADAN önce entegratör ayarlarının doğru girildiğinden emin olun.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=10, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=10, pady=(0, 10))
 
         ctk.CTkLabel(efatura_cerceve, text="e-İrsaliye (yukarıdaki AYNI entegratör hesabı üzerinden, ayrı seri kodu)",
-                     font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(4, 4))
+                     font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(4, 4))
         eirs_satiri1 = ctk.CTkFrame(efatura_cerceve, fg_color="transparent")
         eirs_satiri1.pack(fill="x", padx=10, pady=(0, 5))
         self.eirsaliye_seri_entry = ctk.CTkEntry(eirs_satiri1, placeholder_text="Seri Kodu (örn. NIS)", width=160)
@@ -4657,7 +5679,7 @@ class MainApp(ctk.CTkToplevel):
 
         yedek_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=12)
         yedek_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(yedek_cerceve, text="💾 Otomatik Veritabanı Yedekleme", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(yedek_cerceve, text="💾 Otomatik Veritabanı Yedekleme", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         yedek_satiri1 = ctk.CTkFrame(yedek_cerceve, fg_color="transparent")
         yedek_satiri1.pack(fill="x", padx=10, pady=(0, 5))
         self.yedek_otomatik_var = ctk.BooleanVar(value=True)
@@ -4671,14 +5693,14 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(yedek_satiri1, text="💾 Şimdi Yedekle", fg_color="#76CCE1", hover_color="#64ADBF",
                       command=self.veritabani_yedekle_islem).pack(side="left")
         self.yedek_son_bilgi_label = ctk.CTkLabel(yedek_cerceve, text="Son yedek bilgisi yükleniyor...",
-                                                    font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left")
+                                                    font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, justify="left")
         self.yedek_son_bilgi_label.pack(anchor="w", padx=10, pady=(0, 10))
 
         whatsapp_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=12)
         whatsapp_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(whatsapp_cerceve, text="📱 WhatsApp Kritik Uyarı Entegrasyonu (İskelet)", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(whatsapp_cerceve, text="📱 WhatsApp Kritik Uyarı Entegrasyonu (İskelet)", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         ctk.CTkLabel(whatsapp_cerceve, text="Gerçek kullanım için bir WhatsApp Business API sağlayıcısına (Twilio vb.) ihtiyaç var - burası sadece o sağlayıcıya bağlanacak iskelet.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 5))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 5))
         wa_satiri1 = ctk.CTkFrame(whatsapp_cerceve, fg_color="transparent")
         wa_satiri1.pack(fill="x", padx=10, pady=(0, 5))
         self.wa_url_entry = ctk.CTkEntry(wa_satiri1, placeholder_text="Entegratör URL", width=280)
@@ -4699,10 +5721,10 @@ class MainApp(ctk.CTkToplevel):
 
         rapor_cerceve = ctk.CTkFrame(self.tab_bildirim_ayarlari, fg_color=RENK_KART, corner_radius=12)
         rapor_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(rapor_cerceve, text="📊 Haftalık Yönetici Raporu", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(rapor_cerceve, text="📊 Haftalık Yönetici Raporu", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         ctk.CTkLabel(rapor_cerceve, text="Her Cuma saat 17:00'de toplam ciro, fatura sayısı ve kritik stok özetini yukarıdaki e-posta ayarlarındaki alıcıya otomatik gönderir. "
                      "SMTP ayarları (üstteki 'E-posta Ayarları' kartı) doldurulmamışsa gönderilmez.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=700, justify="left").pack(anchor="w", padx=10, pady=(0, 8))
         ctk.CTkButton(rapor_cerceve, text="📤 Şimdi Gönder (Test)", fg_color="#42ACA2", hover_color="#38928A",
                       command=self.haftalik_rapor_simdi_gonder_islem).pack(anchor="w", padx=10, pady=(0, 10))
 
@@ -4950,23 +5972,23 @@ class MainApp(ctk.CTkToplevel):
         pencere.geometry("520x480")
         pencere.transient(self)
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"Onay #{secili[0]} — {detay.get('EvrakTuru', satir[1])}", font=("Arial", 15, "bold"), text_color="#76CCE1").pack(pady=(20, 5))
-        ctk.CTkLabel(pencere, text=str(satir[2]), font=("Arial", 12), wraplength=480).pack(pady=(0, 5))
+        ctk.CTkLabel(pencere, text=f"Onay #{secili[0]} — {detay.get('EvrakTuru', satir[1])}", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(20, 5))
+        ctk.CTkLabel(pencere, text=str(satir[2]), font=("Segoe UI", 12), wraplength=480).pack(pady=(0, 5))
         ctk.CTkLabel(pencere, text=f"Cari: {detay.get('CariAd', '-')}   ·   Belge No: {detay.get('BelgeNo', '-')}   ·   Tarih: {detay.get('Tarih', '-')}",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(pady=(0, 5))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(pady=(0, 5))
         ctk.CTkLabel(pencere, text=f"Adım: {satir[5]}   ·   Bekleyen Rol: {satir[6]}",
-                     font=("Arial", 11, "bold"), text_color="#5585EF").pack(pady=(0, 10))
+                     font=("Segoe UI", 11, "bold"), text_color="#5585EF").pack(pady=(0, 10))
 
         kalemler = detay.get("Kalemler", [])
         if kalemler:
-            ctk.CTkLabel(pencere, text="Kalem Dökümü", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
-            kalem_cerceve, kalem_tree = tablo_olustur(pencere, ["Ürün", "Miktar", "Birim Fiyat", "KDV %", "Satır Toplamı"],
+            ctk.CTkLabel(pencere, text="Kalem Dökümü", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+            kalem_tree = OzelTablo(pencere, ["Ürün", "Miktar", "Birim Fiyat", "KDV %", "Satır Toplamı"],
                                                        [160, 80, 100, 70, 110], height=6)
-            kalem_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+            kalem_tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
             for k in kalemler:
                 kalem_tree.insert("", "end", values=(k["UrunAd"], k["Miktar"], f"{k['Fiyat']:,.2f}", f"%{k['KdvOrani']:g}", f"{k['SatirToplami']:,.2f}"))
 
-        ctk.CTkLabel(pencere, text=f"Genel Toplam: {satir[3]}", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(0, 10))
+        ctk.CTkLabel(pencere, text=f"Genel Toplam: {satir[3]}", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(0, 10))
 
         def onayla():
             try:
@@ -4999,13 +6021,13 @@ class MainApp(ctk.CTkToplevel):
     def init_yevmiye(self):
         ust = ctk.CTkFrame(self.tab_yevmiye, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📖 Yevmiye Defteri (Çift Taraflı Kayıtlar)", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📖 Yevmiye Defteri (Çift Taraflı Kayıtlar)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.yevmiye_yukle).pack(side="right")
 
         edefter_satiri = ctk.CTkFrame(self.tab_yevmiye, fg_color=RENK_KART, corner_radius=12)
         edefter_satiri.pack(fill="x", padx=20, pady=(0, 5))
-        ctk.CTkLabel(edefter_satiri, text="e-Defter Hazırlık Dışa Aktarımı:", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left", padx=(10, 8), pady=10)
+        ctk.CTkLabel(edefter_satiri, text="e-Defter Hazırlık Dışa Aktarımı:", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left", padx=(10, 8), pady=10)
         self.ed_yil = ctk.CTkEntry(edefter_satiri, placeholder_text="Yıl", width=80)
         self.ed_yil.insert(0, str(datetime.now().year))
         self.ed_yil.pack(side="left", padx=(0, 6))
@@ -5015,7 +6037,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(edefter_satiri, text="📤 XML Dışa Aktar", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.e_defter_disa_aktar_islem).pack(side="left")
         ctk.CTkLabel(edefter_satiri, text="Not: GİB'in resmi e-Defter/Berat formatı DEĞİLDİR, muhasebecinize/e-Defter yazılımına aktarım içindir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(side="left", padx=(10, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(side="left", padx=(10, 10))
 
         govde = ctk.CTkFrame(self.tab_yevmiye, fg_color="transparent")
         govde.pack(fill="both", expand=True, padx=20, pady=(5, 20))
@@ -5023,18 +6045,18 @@ class MainApp(ctk.CTkToplevel):
         govde.grid_columnconfigure(1, weight=2)
         govde.grid_rowconfigure(0, weight=1)
 
-        sol_cerceve, self.yevmiye_fis_tree = tablo_olustur(
+        self.yevmiye_fis_tree = OzelTablo(
             govde, ["Fiş ID", "Tarih", "Açıklama", "Kaynak", "Kullanıcı", "Tutar"],
             [60, 130, 220, 100, 100, 110], height=20)
-        sol_cerceve.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.yevmiye_fis_tree.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.yevmiye_fis_tree.bind("<<TreeviewSelect>>", self.yevmiye_satir_goster)
 
         sag = ctk.CTkFrame(govde, fg_color=RENK_KART, corner_radius=12)
         sag.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        ctk.CTkLabel(sag, text="Fiş Satırları (Borç / Alacak)", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        sag_cerceve, self.yevmiye_satir_tree = tablo_olustur(
+        ctk.CTkLabel(sag, text="Fiş Satırları (Borç / Alacak)", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        self.yevmiye_satir_tree = OzelTablo(
             sag, ["Hesap Kodu", "Hesap Adı", "Borç", "Alacak"], [80, 160, 90, 90], height=16)
-        sag_cerceve.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.yevmiye_satir_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         self.yevmiye_yukle()
 
@@ -5093,17 +6115,17 @@ class MainApp(ctk.CTkToplevel):
     def init_mizan(self):
         ust = ctk.CTkFrame(self.tab_mizan, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="⚖️ Mizan (Deneme Bilançosu)", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="⚖️ Mizan (Deneme Bilançosu)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.mizan_yukle).pack(side="right")
 
-        self.mizan_denge_etiketi = ctk.CTkLabel(self.tab_mizan, text="", font=("Arial", 12, "bold"))
+        self.mizan_denge_etiketi = ctk.CTkLabel(self.tab_mizan, text="", font=("Segoe UI", 12, "bold"))
         self.mizan_denge_etiketi.pack(anchor="w", padx=20, pady=(0, 5))
 
-        mizan_cerceve, self.mizan_tree = tablo_olustur(
+        self.mizan_tree = OzelTablo(
             self.tab_mizan, ["Hesap Kodu", "Hesap Adı", "Toplam Borç", "Toplam Alacak", "Bakiye"],
             [100, 220, 130, 130, 130], height=18)
-        mizan_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.mizan_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.mizan_yukle()
 
     def mizan_yukle(self):
@@ -5125,58 +6147,92 @@ class MainApp(ctk.CTkToplevel):
             pass
 
     def init_butce(self):
-        frame = self.tab_butce
+        self.butce_liste_govde = ctk.CTkFrame(self.tab_butce, fg_color="transparent")
+        self.butce_form_govde = ctk.CTkFrame(self.tab_butce, fg_color="transparent")
+        self._bt_hesap_cache = []
+        self._butce_liste_olustur()
+        self._butce_form_olustur()
+        self.butce_liste_goster()
+
+    def butce_liste_goster(self):
+        self.butce_form_govde.pack_forget()
+        self.butce_liste_govde.pack(fill="both", expand=True)
+
+    def butce_form_goster(self):
+        self.butce_liste_govde.pack_forget()
+        self.bt_yil_form.delete(0, "end")
+        self.bt_yil_form.insert(0, self.bt_yil.get() or str(datetime.now().year))
+        self.bt_ay_form.set(self.bt_ay.get() or str(datetime.now().month))
+        self.bt_hedef_tutar.delete(0, "end")
+        self._butce_hesap_secim_guncelle()
+        self.butce_form_govde.pack(fill="both", expand=True)
+
+    def _butce_liste_olustur(self):
+        frame = self.butce_liste_govde
         ust = ctk.CTkFrame(frame, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📊 Bütçe Yönetimi (Hesap Planı Bazlı)", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📊 Bütçe Yönetimi (Hesap Planı Bazlı)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Bütçe Hedefi", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.butce_form_goster).pack(side="right")
 
-        form_cerceve = ctk.CTkFrame(frame, fg_color=RENK_KART, corner_radius=12)
-        form_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form_cerceve, text="Bütçe Hedefi Belirle", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        form_satiri = ctk.CTkFrame(form_cerceve, fg_color="transparent")
-        form_satiri.pack(fill="x", padx=10, pady=(0, 10))
-
+        rapor_ust = ctk.CTkFrame(frame, fg_color=RENK_KART, corner_radius=12)
+        rapor_ust.pack(fill="x", padx=20, pady=(0, 10))
+        rapor_ust_satiri = ctk.CTkFrame(rapor_ust, fg_color="transparent")
+        rapor_ust_satiri.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(rapor_ust_satiri, text="Bütçe Raporu Dönemi:", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left", padx=(0, 8))
         simdi = datetime.now()
-        self.bt_yil = ctk.CTkEntry(form_satiri, placeholder_text="Yıl", width=80)
+        self.bt_yil = ctk.CTkEntry(rapor_ust_satiri, placeholder_text="Yıl", width=80)
         self.bt_yil.insert(0, str(simdi.year))
         self.bt_yil.pack(side="left", padx=(0, 8))
-        self.bt_ay = ctk.CTkOptionMenu(form_satiri, values=[str(i) for i in range(1, 13)], width=70)
+        self.bt_ay = ctk.CTkOptionMenu(rapor_ust_satiri, values=[str(i) for i in range(1, 13)], width=70)
         self.bt_ay.set(str(simdi.month))
         self.bt_ay.pack(side="left", padx=(0, 8))
-        self.bt_hesap_secim = ctk.CTkOptionMenu(form_satiri, values=["Yükleniyor..."], width=220)
-        self.bt_hesap_secim.pack(side="left", padx=(0, 8))
-        self.bt_hedef_tutar = ctk.CTkEntry(form_satiri, placeholder_text="Hedef Tutar (TL)", width=150)
-        self.bt_hedef_tutar.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(form_satiri, text="💾 Hedefi Kaydet", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.butce_hedefi_kaydet_islem).pack(side="left")
-
-        rapor_ust = ctk.CTkFrame(frame, fg_color="transparent")
-        rapor_ust.pack(fill="x", padx=20, pady=(0, 5))
-        ctk.CTkLabel(rapor_ust, text="Bütçe Raporu", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
-        ctk.CTkButton(rapor_ust, text="🔄 Raporu Getir", fg_color="#5585EF", hover_color="#4871CB",
-                      command=self.butce_raporu_yukle).pack(side="left", padx=10)
-        ctk.CTkButton(rapor_ust, text="🗑️ Seçili Hedefi Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
+        ctk.CTkButton(rapor_ust_satiri, text="🔄 Raporu Getir", fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.butce_raporu_yukle).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(rapor_ust_satiri, text="🗑️ Seçili Hedefi Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
                       command=self.butce_hedefi_sil_islem).pack(side="left")
 
-        rapor_cerceve, self.butce_tree = tablo_olustur(
+        self.butce_tree = OzelTablo(
             frame, ["Hesap Kodu", "Hesap Adı", "Hedef", "Gerçekleşen", "Fark", "Fark %"],
             [90, 200, 120, 120, 120, 90], height=14)
-        rapor_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.butce_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.butce_tree.tag_configure("dusuk_marj", foreground="#F36D6D")
 
-        self._bt_hesap_cache = []
         self.butce_hesap_secenekleri_yukle()
         self.butce_raporu_yukle()
+
+    def _butce_form_olustur(self):
+        ust = ctk.CTkFrame(self.butce_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.butce_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="📊 Bütçe Hedefi Belirle", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Hedefi Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=150, height=30,
+                      command=self.butce_hedefi_kaydet_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.butce_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        self.bt_yil_form = ctk.CTkEntry(satir, placeholder_text="Yıl", width=80)
+        self.bt_yil_form.pack(side="left", padx=(0, 8))
+        self.bt_ay_form = ctk.CTkOptionMenu(satir, values=[str(i) for i in range(1, 13)], width=70)
+        self.bt_ay_form.pack(side="left", padx=(0, 8))
+        self.bt_hesap_secim = ctk.CTkOptionMenu(satir, values=["Hesap Yok"], width=280)
+        self.bt_hesap_secim.pack(side="left", padx=(0, 8))
+        self.bt_hedef_tutar = ctk.CTkEntry(satir, placeholder_text="Hedef Tutar (TL)", width=150)
+        self.bt_hedef_tutar.pack(side="left")
+
+    def _butce_hesap_secim_guncelle(self):
+        secenekler = [f"{h['HesapKodu']} - {h['HesapAdi']}" for h in self._bt_hesap_cache] or ["Hesap Yok"]
+        self.bt_hesap_secim.configure(values=secenekler)
+        self.bt_hesap_secim.set(secenekler[0])
 
     def butce_hesap_secenekleri_yukle(self):
         try:
             res = requests.get(f"{API}/hesap-plani", headers=self.req_headers(), timeout=5)
             hesaplar = res.json() if res.status_code == 200 else []
             self._bt_hesap_cache = hesaplar
-            secenekler = [f"{h['HesapKodu']} - {h['HesapAdi']}" for h in hesaplar] or ["Hesap Yok"]
-            self.bt_hesap_secim.configure(values=secenekler)
-            if hesaplar:
-                self.bt_hesap_secim.set(secenekler[0])
         except Exception:
             pass
 
@@ -5187,7 +6243,7 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showwarning("Eksik Bilgi", "Bir hesap seçin.")
             return
         try:
-            yil, ay = int(self.bt_yil.get()), int(self.bt_ay.get())
+            yil, ay = int(self.bt_yil_form.get()), int(self.bt_ay_form.get())
             hedef = float(self.bt_hedef_tutar.get())
         except ValueError:
             messagebox.showwarning("Eksik/Hatalı Bilgi", "Yıl, Ay ve Hedef Tutar sayısal olmalıdır.")
@@ -5196,8 +6252,11 @@ class MainApp(ctk.CTkToplevel):
             res = requests.post(f"{API}/butce-hedefi-belirle", json={"Yil": yil, "Ay": ay, "HesapKodu": hesap_kodu, "HedefTutar": hedef},
                                  headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
-                self.bt_hedef_tutar.delete(0, "end")
+                self.bt_yil.delete(0, "end")
+                self.bt_yil.insert(0, str(yil))
+                self.bt_ay.set(str(ay))
                 self.butce_raporu_yukle()
+                self.butce_liste_goster()
                 messagebox.showinfo("Başarılı", "Bütçe hedefi kaydedildi.")
             else:
                 self.api_hata_goster(res)
@@ -5246,11 +6305,11 @@ class MainApp(ctk.CTkToplevel):
     def init_mali_tablolar(self):
         ust = ctk.CTkFrame(self.tab_mali_tablolar, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📊 Mali Tablolar", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📊 Mali Tablolar", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.mali_tablolari_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_mali_tablolar, text="Not: Bu tablolar Yevmiye kayıtlarından otomatik üretilir, resmi beyan için mali müşavirinizin onayından geçmelidir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
 
         icerik = ctk.CTkFrame(self.tab_mali_tablolar, fg_color="transparent")
         icerik.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -5259,13 +6318,13 @@ class MainApp(ctk.CTkToplevel):
 
         sol = ctk.CTkFrame(icerik, fg_color=RENK_KART, corner_radius=12)
         sol.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        ctk.CTkLabel(sol, text="Bilanço", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(12, 5))
+        ctk.CTkLabel(sol, text="Bilanço", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(12, 5))
         self.bilanco_alani = ctk.CTkScrollableFrame(sol, fg_color="transparent", height=400)
         self.bilanco_alani.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
         sag = ctk.CTkFrame(icerik, fg_color=RENK_KART, corner_radius=12)
         sag.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        ctk.CTkLabel(sag, text="Gelir Tablosu", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(12, 5))
+        ctk.CTkLabel(sag, text="Gelir Tablosu", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(12, 5))
         self.gelir_tablosu_alani = ctk.CTkScrollableFrame(sag, fg_color="transparent", height=400)
         self.gelir_tablosu_alani.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
@@ -5273,14 +6332,14 @@ class MainApp(ctk.CTkToplevel):
 
         enf_cerceve = ctk.CTkFrame(self.tab_mali_tablolar, fg_color=RENK_KART, corner_radius=12)
         enf_cerceve.pack(fill="x", padx=20, pady=(0, 20))
-        ctk.CTkLabel(enf_cerceve, text="🧮 Enflasyon Düzeltmesi (Tahmini Araç)", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(12, 3))
+        ctk.CTkLabel(enf_cerceve, text="🧮 Enflasyon Düzeltmesi (Tahmini Araç)", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(12, 3))
         ctk.CTkLabel(enf_cerceve, text="⚠️ Bu GERÇEK/resmi bir VUK Mük.298 enflasyon düzeltmesi değildir - sadece stok, duran varlık ve "
                      "özkaynak gibi parasal olmayan kalemlere girdiğiniz katsayıyı uygulayıp kabaca bir etki tahmini verir. "
                      "Resmi hesap için mali müşavirinize danışın.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=850, justify="left").pack(anchor="w", padx=12, pady=(0, 8))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=850, justify="left").pack(anchor="w", padx=12, pady=(0, 8))
         enf_satiri = ctk.CTkFrame(enf_cerceve, fg_color="transparent")
         enf_satiri.pack(fill="x", padx=12, pady=(0, 10))
-        ctk.CTkLabel(enf_satiri, text="Düzeltme Katsayısı:", font=("Arial", 11)).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(enf_satiri, text="Düzeltme Katsayısı:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
         self.enf_katsayi = ctk.CTkEntry(enf_satiri, placeholder_text="Örn: 1.15 (%15 artış için)", width=180)
         self.enf_katsayi.pack(side="left", padx=(0, 8))
         ctk.CTkButton(enf_satiri, text="Hesapla", fg_color="#9965F1", hover_color="#8256CD",
@@ -5309,18 +6368,18 @@ class MainApp(ctk.CTkToplevel):
         baslik_satiri = ctk.CTkFrame(self.enf_sonuc_alani, fg_color="transparent")
         baslik_satiri.pack(fill="x", pady=(0, 4))
         for metin, genislik in [("Hesap", 220), ("Nominal", 120), ("Düzeltilmiş", 120), ("Fark", 100)]:
-            ctk.CTkLabel(baslik_satiri, text=metin, font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK, width=genislik, anchor="w").pack(side="left")
+            ctk.CTkLabel(baslik_satiri, text=metin, font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK, width=genislik, anchor="w").pack(side="left")
         for s in veri.get("Satirlar", []):
             satir = ctk.CTkFrame(self.enf_sonuc_alani, fg_color="transparent")
             satir.pack(fill="x", pady=1)
             renk = RENK_METIN_SOLUK if s["ParasalMi"] else "#F7B341"
-            ctk.CTkLabel(satir, text=f"{s['HesapKodu']} - {s['HesapAdi']}", font=("Arial", 10), width=220, anchor="w", text_color=renk).pack(side="left")
-            ctk.CTkLabel(satir, text=f"{s['Nominal']:,.2f}", font=("Arial", 10), width=120, anchor="w").pack(side="left")
-            ctk.CTkLabel(satir, text=f"{s['Duzeltilmis']:,.2f}", font=("Arial", 10), width=120, anchor="w").pack(side="left")
-            ctk.CTkLabel(satir, text=f"{s['Fark']:,.2f}", font=("Arial", 10), width=100, anchor="w", text_color="#45C89D" if s['Fark'] >= 0 else "#F36D6D").pack(side="left")
+            ctk.CTkLabel(satir, text=f"{s['HesapKodu']} - {s['HesapAdi']}", font=("Segoe UI", 10), width=220, anchor="w", text_color=renk).pack(side="left")
+            ctk.CTkLabel(satir, text=f"{s['Nominal']:,.2f}", font=("Segoe UI", 10), width=120, anchor="w").pack(side="left")
+            ctk.CTkLabel(satir, text=f"{s['Duzeltilmis']:,.2f}", font=("Segoe UI", 10), width=120, anchor="w").pack(side="left")
+            ctk.CTkLabel(satir, text=f"{s['Fark']:,.2f}", font=("Segoe UI", 10), width=100, anchor="w", text_color="#45C89D" if s['Fark'] >= 0 else "#F36D6D").pack(side="left")
         ctk.CTkFrame(self.enf_sonuc_alani, height=1, fg_color=RENK_KENARLIK).pack(fill="x", pady=6)
         ctk.CTkLabel(self.enf_sonuc_alani, text=f"Tahmini Net Etki: {veri.get('TahminiNetEtki', 0):,.2f} TL",
-                     font=("Arial", 12, "bold"), text_color="#76CCE1").pack(anchor="w")
+                     font=("Segoe UI", 12, "bold"), text_color="#76CCE1").pack(anchor="w")
 
     def mali_tablolari_yukle(self):
         for w in self.bilanco_alani.winfo_children():
@@ -5332,77 +6391,123 @@ class MainApp(ctk.CTkToplevel):
             b = res.json()
 
             def alt_baslik(metin):
-                ctk.CTkLabel(self.bilanco_alani, text=metin, font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(8, 3))
+                ctk.CTkLabel(self.bilanco_alani, text=metin, font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(8, 3))
 
             def satir_yaz(liste, alan):
                 for kalem in liste:
                     satir = ctk.CTkFrame(alan, fg_color="transparent")
                     satir.pack(fill="x", pady=1)
-                    ctk.CTkLabel(satir, text=f"{kalem['HesapKodu']} - {kalem['HesapAdi']}", font=("Arial", 11)).pack(side="left")
-                    ctk.CTkLabel(satir, text=f"{kalem['Tutar']:,.2f} TL", font=("Arial", 11)).pack(side="right")
+                    ctk.CTkLabel(satir, text=f"{kalem['HesapKodu']} - {kalem['HesapAdi']}", font=("Segoe UI", 11)).pack(side="left")
+                    ctk.CTkLabel(satir, text=f"{kalem['Tutar']:,.2f} TL", font=("Segoe UI", 11)).pack(side="right")
 
-            ctk.CTkLabel(self.bilanco_alani, text="AKTİF (VARLIKLAR)", font=("Arial", 12, "bold"), text_color="#5585EF").pack(anchor="w")
+            ctk.CTkLabel(self.bilanco_alani, text="AKTİF (VARLIKLAR)", font=("Segoe UI", 12, "bold"), text_color="#5585EF").pack(anchor="w")
             alt_baslik("I. Dönen Varlıklar")
             satir_yaz(b.get("DonenVarliklar", []), self.bilanco_alani)
-            ctk.CTkLabel(self.bilanco_alani, text=f"Dönen Varlıklar Toplamı: {b.get('ToplamDonenVarlik', 0):,.2f} TL", font=("Arial", 10, "italic")).pack(anchor="e")
+            ctk.CTkLabel(self.bilanco_alani, text=f"Dönen Varlıklar Toplamı: {b.get('ToplamDonenVarlik', 0):,.2f} TL", font=("Segoe UI", 10, "italic")).pack(anchor="e")
             alt_baslik("II. Duran Varlıklar")
             satir_yaz(b.get("DuranVarliklar", []), self.bilanco_alani)
-            ctk.CTkLabel(self.bilanco_alani, text=f"Duran Varlıklar Toplamı: {b.get('ToplamDuranVarlik', 0):,.2f} TL", font=("Arial", 10, "italic")).pack(anchor="e")
+            ctk.CTkLabel(self.bilanco_alani, text=f"Duran Varlıklar Toplamı: {b.get('ToplamDuranVarlik', 0):,.2f} TL", font=("Segoe UI", 10, "italic")).pack(anchor="e")
             ctk.CTkFrame(self.bilanco_alani, height=1, fg_color=RENK_KENARLIK).pack(fill="x", pady=6)
-            ctk.CTkLabel(self.bilanco_alani, text=f"TOPLAM VARLIK: {b.get('ToplamVarlik', 0):,.2f} TL", font=("Arial", 12, "bold"), text_color="#45C89D").pack(anchor="w")
+            ctk.CTkLabel(self.bilanco_alani, text=f"TOPLAM VARLIK: {b.get('ToplamVarlik', 0):,.2f} TL", font=("Segoe UI", 12, "bold"), text_color="#45C89D").pack(anchor="w")
 
-            ctk.CTkLabel(self.bilanco_alani, text="PASİF (KAYNAKLAR)", font=("Arial", 12, "bold"), text_color="#9965F1").pack(anchor="w", pady=(14, 0))
+            ctk.CTkLabel(self.bilanco_alani, text="PASİF (KAYNAKLAR)", font=("Segoe UI", 12, "bold"), text_color="#9965F1").pack(anchor="w", pady=(14, 0))
             alt_baslik("I. Kısa Vadeli Yabancı Kaynaklar")
             satir_yaz(b.get("KisaVadeliYabanciKaynaklar", []), self.bilanco_alani)
-            ctk.CTkLabel(self.bilanco_alani, text=f"KVYK Toplamı: {b.get('ToplamKVYK', 0):,.2f} TL", font=("Arial", 10, "italic")).pack(anchor="e")
+            ctk.CTkLabel(self.bilanco_alani, text=f"KVYK Toplamı: {b.get('ToplamKVYK', 0):,.2f} TL", font=("Segoe UI", 10, "italic")).pack(anchor="e")
             alt_baslik("II. Uzun Vadeli Yabancı Kaynaklar")
             satir_yaz(b.get("UzunVadeliYabanciKaynaklar", []), self.bilanco_alani)
-            ctk.CTkLabel(self.bilanco_alani, text=f"UVYK Toplamı: {b.get('ToplamUVYK', 0):,.2f} TL", font=("Arial", 10, "italic")).pack(anchor="e")
+            ctk.CTkLabel(self.bilanco_alani, text=f"UVYK Toplamı: {b.get('ToplamUVYK', 0):,.2f} TL", font=("Segoe UI", 10, "italic")).pack(anchor="e")
             alt_baslik("III. Özkaynaklar")
             satir_yaz(b.get("Ozkaynaklar", []), self.bilanco_alani)
-            ctk.CTkLabel(self.bilanco_alani, text=f"Özkaynaklar Toplamı: {b.get('ToplamOzkaynak', 0):,.2f} TL", font=("Arial", 10, "italic")).pack(anchor="e")
+            ctk.CTkLabel(self.bilanco_alani, text=f"Özkaynaklar Toplamı: {b.get('ToplamOzkaynak', 0):,.2f} TL", font=("Segoe UI", 10, "italic")).pack(anchor="e")
             ctk.CTkFrame(self.bilanco_alani, height=1, fg_color=RENK_KENARLIK).pack(fill="x", pady=6)
-            ctk.CTkLabel(self.bilanco_alani, text=f"TOPLAM KAYNAK: {b.get('ToplamKaynak', 0):,.2f} TL", font=("Arial", 12, "bold"), text_color="#45C89D").pack(anchor="w")
+            ctk.CTkLabel(self.bilanco_alani, text=f"TOPLAM KAYNAK: {b.get('ToplamKaynak', 0):,.2f} TL", font=("Segoe UI", 12, "bold"), text_color="#45C89D").pack(anchor="w")
             fark = b.get("Fark", 0)
             if abs(fark) > 1:
-                ctk.CTkLabel(self.bilanco_alani, text=f"⚠️ Denksizlik: {fark:,.2f} TL", font=("Arial", 10), text_color="#F36D6D").pack(anchor="w", pady=(4, 0))
+                ctk.CTkLabel(self.bilanco_alani, text=f"⚠️ Denksizlik: {fark:,.2f} TL", font=("Segoe UI", 10), text_color="#F36D6D").pack(anchor="w", pady=(4, 0))
         except Exception:
             pass
 
         try:
             res = requests.get(f"{API}/gelir-tablosu", headers=self.req_headers(), timeout=8)
             g = res.json()
-            ctk.CTkLabel(self.gelir_tablosu_alani, text="— GELİRLER —", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(0, 3))
+            ctk.CTkLabel(self.gelir_tablosu_alani, text="— GELİRLER —", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(0, 3))
             for v in g.get("Gelirler", []):
                 satir = ctk.CTkFrame(self.gelir_tablosu_alani, fg_color="transparent")
                 satir.pack(fill="x", pady=1)
-                ctk.CTkLabel(satir, text=f"{v['HesapKodu']} - {v['HesapAdi']}", font=("Arial", 11)).pack(side="left")
-                ctk.CTkLabel(satir, text=f"{v['Tutar']:,.2f} TL", font=("Arial", 11)).pack(side="right")
-            ctk.CTkLabel(self.gelir_tablosu_alani, text=f"Toplam Gelir: {g.get('ToplamGelir', 0):,.2f} TL", font=("Arial", 11, "bold")).pack(anchor="w", pady=(5, 10))
-            ctk.CTkLabel(self.gelir_tablosu_alani, text="— GİDERLER —", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(0, 3))
+                ctk.CTkLabel(satir, text=f"{v['HesapKodu']} - {v['HesapAdi']}", font=("Segoe UI", 11)).pack(side="left")
+                ctk.CTkLabel(satir, text=f"{v['Tutar']:,.2f} TL", font=("Segoe UI", 11)).pack(side="right")
+            ctk.CTkLabel(self.gelir_tablosu_alani, text=f"Toplam Gelir: {g.get('ToplamGelir', 0):,.2f} TL", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(5, 10))
+            ctk.CTkLabel(self.gelir_tablosu_alani, text="— GİDERLER —", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(0, 3))
             for v in g.get("Giderler", []):
                 satir = ctk.CTkFrame(self.gelir_tablosu_alani, fg_color="transparent")
                 satir.pack(fill="x", pady=1)
-                ctk.CTkLabel(satir, text=f"{v['HesapKodu']} - {v['HesapAdi']}", font=("Arial", 11)).pack(side="left")
-                ctk.CTkLabel(satir, text=f"{v['Tutar']:,.2f} TL", font=("Arial", 11)).pack(side="right")
-            ctk.CTkLabel(self.gelir_tablosu_alani, text=f"Toplam Gider: {g.get('ToplamGider', 0):,.2f} TL", font=("Arial", 11, "bold")).pack(anchor="w", pady=(5, 10))
+                ctk.CTkLabel(satir, text=f"{v['HesapKodu']} - {v['HesapAdi']}", font=("Segoe UI", 11)).pack(side="left")
+                ctk.CTkLabel(satir, text=f"{v['Tutar']:,.2f} TL", font=("Segoe UI", 11)).pack(side="right")
+            ctk.CTkLabel(self.gelir_tablosu_alani, text=f"Toplam Gider: {g.get('ToplamGider', 0):,.2f} TL", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(5, 10))
             ctk.CTkFrame(self.gelir_tablosu_alani, height=1, fg_color=RENK_KENARLIK).pack(fill="x", pady=6)
             net = g.get("NetKarZarar", 0)
             renk = "#45C89D" if net >= 0 else "#F36D6D"
-            ctk.CTkLabel(self.gelir_tablosu_alani, text=f"NET {'KÂR' if net >= 0 else 'ZARAR'}: {net:,.2f} TL", font=("Arial", 13, "bold"), text_color=renk).pack(anchor="w")
+            ctk.CTkLabel(self.gelir_tablosu_alani, text=f"NET {'KÂR' if net >= 0 else 'ZARAR'}: {net:,.2f} TL", font=("Segoe UI", 13, "bold"), text_color=renk).pack(anchor="w")
         except Exception:
             pass
 
     def init_krediler(self):
-        ust = ctk.CTkFrame(self.tab_krediler, fg_color="transparent")
-        ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🏦 Banka Kredileri", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        self.kr_liste_govde = ctk.CTkFrame(self.tab_krediler, fg_color="transparent")
+        self.kr_form_govde = ctk.CTkFrame(self.tab_krediler, fg_color="transparent")
+        self._krediler_liste_olustur()
+        self._krediler_form_olustur()
+        self.krediler_liste_goster()
 
-        ekle_cerceve = ctk.CTkFrame(self.tab_krediler, fg_color=RENK_KART, corner_radius=12)
+    def krediler_liste_goster(self):
+        self.kr_form_govde.pack_forget()
+        self.kr_liste_govde.pack(fill="both", expand=True)
+
+    def krediler_form_goster(self):
+        self.kr_liste_govde.pack_forget()
+        for e in (self.kr_ad, self.kr_anapara, self.kr_faiz, self.kr_taksit_sayisi, self.kr_baslangic):
+            e.delete(0, "end")
+        self._kredi_banka_hesaplarini_yukle()
+        self.kr_form_govde.pack(fill="both", expand=True)
+
+    def _krediler_liste_olustur(self):
+        ust = ctk.CTkFrame(self.kr_liste_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="🏦 Banka Kredileri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Kredi", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.krediler_form_goster).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.kr_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=20, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.kr_arama = ctk.CTkEntry(arama_bar, placeholder_text="Kredi adına göre ara...", width=280)
+        self.kr_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.kr_arama.bind("<KeyRelease>", lambda e: self._krediler_tree_render())
+
+        self.kredi_tree = OzelTablo(
+            self.kr_liste_govde, ["ID", "Kredi Adı", "Anapara", "Faiz %", "Taksit", "Ödenen", "Başlangıç", "Durum"],
+            [40, 160, 100, 70, 60, 70, 110, 90], height=14, durum_kolonu="Durum")
+        self.kredi_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+        self.kredi_tree.bind("<Double-Button-1>", self.kredi_taksitleri_ac)
+        ctk.CTkLabel(self.kr_liste_govde, text="Bir krediye çift tıklayarak taksit planını görebilirsiniz.",
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 20))
+
+        self._kr_veri_cache = []
+        self.kredileri_yukle()
+
+    def _krediler_form_olustur(self):
+        ust = ctk.CTkFrame(self.kr_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.krediler_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Kredi Ekle", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Kredi Ekle", fg_color="#49B772", hover_color="#3E9C61", width=120, height=30,
+                      command=self.kredi_ekle_islem).pack(side="right")
+
+        ekle_cerceve = ctk.CTkFrame(self.kr_form_govde, fg_color=RENK_KART, corner_radius=12)
         ekle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(ekle_cerceve, text="Yeni Kredi Ekle", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         satir1 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(0, 5))
+        satir1.pack(fill="x", padx=10, pady=(10, 5))
         self.kr_ad = ctk.CTkEntry(satir1, placeholder_text="Kredi Adı", width=200)
         self.kr_ad.pack(side="left", padx=(0, 8))
         self.kr_anapara = ctk.CTkEntry(satir1, placeholder_text="Anapara Tutarı", width=130)
@@ -5415,18 +6520,29 @@ class MainApp(ctk.CTkToplevel):
         self.kr_taksit_sayisi.pack(side="left", padx=(0, 8))
         self.kr_baslangic = ctk.CTkEntry(satir2, placeholder_text="İlk Taksit Tarihi (YYYY-AA-GG)", width=190)
         self.kr_baslangic.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir2, text="+ Kredi Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.kredi_ekle_islem).pack(side="left")
 
-        liste_cerceve, self.kredi_tree = tablo_olustur(
-            self.tab_krediler, ["ID", "Kredi Adı", "Anapara", "Faiz %", "Taksit", "Ödenen", "Başlangıç", "Durum"],
-            [40, 160, 100, 70, 60, 70, 110, 90], height=6)
-        liste_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        self.kredi_tree.bind("<Double-Button-1>", self.kredi_taksitleri_ac)
-        ctk.CTkLabel(self.tab_krediler, text="Bir krediye çift tıklayarak taksit planını görebilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 20))
+        # Banka Hesabı seçimi - verilirse kredi kullanımı ve taksit ödemeleri bu hesabın
+        # gerçek bakiyesine işlenir (Finans & Banka ile bağlantılı); verilmezse taksitler
+        # varsayılan olarak Kasa TL'den düşülür.
+        satir3 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
+        satir3.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(satir3, text="Banka Hesabı (opsiyonel - verilmezse taksitler Kasa'dan düşer):",
+                     font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+        self.kr_banka_hesap = ctk.CTkOptionMenu(satir3, values=["(Seçilmedi - Kasa'dan düşülür)"], width=280)
+        self.kr_banka_hesap.pack(side="left")
+        self._kr_banka_hesap_cache = []
+        self._kredi_banka_hesaplarini_yukle()
 
-        self.kredileri_yukle()
+    def _kredi_banka_hesaplarini_yukle(self):
+        try:
+            res = requests.get(f"{API}/banka-hesaplari", headers=self.req_headers(), timeout=5)
+            self._kr_banka_hesap_cache = res.json().get("hesaplar", []) if res.status_code == 200 else []
+        except Exception:
+            self._kr_banka_hesap_cache = []
+        secenekler = ["(Seçilmedi - Kasa'dan düşülür)"] + [f"{h['HesapID']} - {h['BankaAdi']} {h.get('SubeAdi') or ''}".strip()
+                                                             for h in self._kr_banka_hesap_cache]
+        self.kr_banka_hesap.configure(values=secenekler)
+        self.kr_banka_hesap.set(secenekler[0])
 
     def kredi_ekle_islem(self):
         try:
@@ -5436,12 +6552,23 @@ class MainApp(ctk.CTkToplevel):
         except ValueError:
             messagebox.showwarning("Eksik/Hatalı Bilgi", "Anapara, faiz oranı ve taksit sayısı sayısal olmalıdır.")
             return
+
+        secili_banka = self.kr_banka_hesap.get() if hasattr(self, "kr_banka_hesap") else ""
+        if secili_banka and secili_banka != "(Seçilmedi - Kasa'dan düşülür)":
+            try:
+                data["BankaHesapID"] = int(secili_banka.split(" - ")[0])
+            except (ValueError, IndexError):
+                data["BankaHesapID"] = None
+        else:
+            data["BankaHesapID"] = None
+
         try:
             res = requests.post(f"{API}/kredi-ekle", json=data, headers=self.req_headers(), timeout=10)
             if res.status_code == 200:
-                for e in [self.kr_ad, self.kr_anapara, self.kr_faiz, self.kr_taksit_sayisi, self.kr_baslangic]:
-                    e.delete(0, "end")
                 self.kredileri_yukle()
+                if hasattr(self, "banka_tree"):
+                    self.finans_verilerini_yukle()
+                self.krediler_liste_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj"))
             else:
                 self.api_hata_goster(res)
@@ -5451,14 +6578,23 @@ class MainApp(ctk.CTkToplevel):
     def kredileri_yukle(self):
         try:
             res = requests.get(f"{API}/kredi-listesi", headers=self.req_headers(), timeout=5)
-            for i in self.kredi_tree.get_children():
-                self.kredi_tree.delete(i)
-            for k in res.json().get("krediler", []):
-                self.kredi_tree.insert("", "end", iid=str(k["KrediID"]),
-                                        values=(k["KrediID"], k["KrediAdi"], f"{k['AnaparaTutari']:,.2f}", f"{k['FaizOrani']:g}",
-                                                k["TaksitSayisi"], f"{k['OdenenTaksit']}/{k['TaksitSayisi']}", k["BaslangicTarihi"], k["Durum"]))
+            self._kr_veri_cache = res.json().get("krediler", [])
         except Exception:
-            pass
+            self._kr_veri_cache = []
+        self._krediler_tree_render()
+
+    def _krediler_tree_render(self):
+        if not hasattr(self, "kredi_tree"):
+            return
+        for i in self.kredi_tree.get_children():
+            self.kredi_tree.delete(i)
+        arama = self.kr_arama.get().strip().lower() if hasattr(self, "kr_arama") else ""
+        for k in self._kr_veri_cache:
+            if arama and arama not in str(k.get("KrediAdi", "")).lower():
+                continue
+            self.kredi_tree.insert("", "end", iid=str(k["KrediID"]),
+                                    values=(k["KrediID"], k["KrediAdi"], f"{k['AnaparaTutari']:,.2f}", f"{k['FaizOrani']:g}",
+                                            k["TaksitSayisi"], f"{k['OdenenTaksit']}/{k['TaksitSayisi']}", k["BaslangicTarihi"], k["Durum"]))
 
     def kredi_taksitleri_ac(self, event=None):
         secili = self.kredi_tree.selection()
@@ -5472,9 +6608,9 @@ class MainApp(ctk.CTkToplevel):
         pencere.lift()
         pencere.focus_force()
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"🏦 Kredi #{kredi_id} - Taksit Planı", font=("Arial", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
-        cerceve, tree = tablo_olustur(pencere, ["No", "Vade", "Taksit Tutarı", "Anapara", "Faiz", "Durum"], [50, 110, 110, 100, 100, 90], height=13)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        ctk.CTkLabel(pencere, text=f"🏦 Kredi #{kredi_id} - Taksit Planı", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        tree = OzelTablo(pencere, ["No", "Vade", "Taksit Tutarı", "Anapara", "Faiz", "Durum"], [50, 110, 110, 100, 100, 90], height=13, durum_kolonu="Durum")
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 10))
 
         def listeyi_yukle():
             try:
@@ -5498,6 +6634,14 @@ class MainApp(ctk.CTkToplevel):
                 if res.status_code == 200:
                     listeyi_yukle()
                     self.kredileri_yukle()
+                    # Taksit ödemesi Kasa'dan veya Banka'dan gerçekten düşüyor (bkz. taksit_ode
+                    # backend fonksiyonu) - ama bu ekranlar Finans/Kasa sekmesinde ayrıca
+                    # tutulan cache'ler kullandığı için, o sekmeler zaten açılmışsa (lazy-init
+                    # tamamlanmışsa) elle yenilenmezse eski/bayat bakiye gösterirler.
+                    if hasattr(self, "banka_tree"):
+                        self.finans_verilerini_yukle()
+                    if hasattr(self, "kasa_kartlari_alani"):
+                        self.kasalari_yukle()
                     messagebox.showinfo("Başarılı", res.json().get("mesaj"))
                 else:
                     self.api_hata_goster(res)
@@ -5509,43 +6653,71 @@ class MainApp(ctk.CTkToplevel):
         listeyi_yukle()
 
     def init_teminat(self):
-        ust = ctk.CTkFrame(self.tab_teminat, fg_color="transparent")
+        self.teminat_liste_govde = ctk.CTkFrame(self.tab_teminat, fg_color="transparent")
+        self.teminat_form_govde = ctk.CTkFrame(self.tab_teminat, fg_color="transparent")
+        self._teminat_liste_olustur()
+        self._teminat_form_olustur()
+        self.teminat_liste_goster()
+
+    def teminat_liste_goster(self):
+        self.teminat_form_govde.pack_forget()
+        self.teminat_liste_govde.pack(fill="both", expand=True)
+
+    def teminat_form_goster(self):
+        self.teminat_liste_govde.pack_forget()
+        for e in (self.tm_cari, self.tm_tutar, self.tm_banka, self.tm_mektup_no, self.tm_baslangic, self.tm_bitis):
+            e.delete(0, "end")
+        self.teminat_form_govde.pack(fill="both", expand=True)
+
+    def _teminat_liste_olustur(self):
+        ust = ctk.CTkFrame(self.teminat_liste_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📜 Teminat Mektupları", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📜 Teminat Mektupları", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Teminat Mektubu", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.teminat_form_goster).pack(side="right")
 
-        ekle_cerceve = ctk.CTkFrame(self.tab_teminat, fg_color=RENK_KART, corner_radius=12)
-        ekle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(10, 5))
-        self.tm_tur = ctk.CTkOptionMenu(satir1, values=["Alınan", "Verilen"], width=100)
-        self.tm_tur.pack(side="left", padx=(0, 8))
-        self.tm_cari = ctk.CTkEntry(satir1, placeholder_text="Cari Adı (Müşteri/Tedarikçi/Banka)", width=250)
-        self.tm_cari.pack(side="left", padx=(0, 8))
-        self.tm_tutar = ctk.CTkEntry(satir1, placeholder_text="Tutar", width=100)
-        self.tm_tutar.pack(side="left", padx=(0, 8))
-        self.tm_pb = ctk.CTkOptionMenu(satir1, values=["TL", "USD", "EUR"], width=80)
-        self.tm_pb.pack(side="left")
-        satir2 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 10))
-        self.tm_banka = ctk.CTkEntry(satir2, placeholder_text="Banka Adı", width=150)
-        self.tm_banka.pack(side="left", padx=(0, 8))
-        self.tm_mektup_no = ctk.CTkEntry(satir2, placeholder_text="Mektup No", width=130)
-        self.tm_mektup_no.pack(side="left", padx=(0, 8))
-        self.tm_baslangic = ctk.CTkEntry(satir2, placeholder_text="Başlangıç (YYYY-AA-GG)", width=150)
-        self.tm_baslangic.pack(side="left", padx=(0, 8))
-        self.tm_bitis = ctk.CTkEntry(satir2, placeholder_text="Bitiş (YYYY-AA-GG)", width=150)
-        self.tm_bitis.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir2, text="+ Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.teminat_ekle_islem).pack(side="left")
-
-        liste_cerceve, self.teminat_tree = tablo_olustur(
-            self.tab_teminat, ["ID", "Tür", "Cari", "Tutar", "Banka", "Mektup No", "Bitiş", "Kalan Gün", "Durum"],
-            [40, 70, 160, 90, 120, 100, 100, 80, 90], height=10)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
-        ctk.CTkButton(self.tab_teminat, text="↩️ Seçileni İade Al", fg_color="#76CCE1", hover_color="#64ADBF",
+        self.teminat_tree = OzelTablo(
+            self.teminat_liste_govde, ["ID", "Tür", "Cari", "Tutar", "Banka", "Mektup No", "Bitiş", "Kalan Gün", "Durum"],
+            [40, 70, 160, 90, 120, 100, 100, 80, 90], height=14, durum_kolonu="Durum")
+        self.teminat_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+        ctk.CTkButton(self.teminat_liste_govde, text="↩️ Seçileni İade Al", fg_color="#76CCE1", hover_color="#64ADBF",
                       command=self.teminat_iade_islem).pack(anchor="w", padx=20, pady=(0, 20))
 
         self.teminat_yukle()
+
+    def _teminat_form_olustur(self):
+        ust = ctk.CTkFrame(self.teminat_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.teminat_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Teminat Mektubu", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=130, height=30,
+                      command=self.teminat_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.teminat_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+
+        satir1 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir1.pack(fill="x", padx=15, pady=(15, 8))
+        self.tm_tur = ctk.CTkOptionMenu(satir1, values=["Alınan", "Verilen"], width=120)
+        self.tm_tur.pack(side="left", padx=(0, 8))
+        self.tm_cari = ctk.CTkEntry(satir1, placeholder_text="Cari Adı (Müşteri/Tedarikçi/Banka)", width=280)
+        self.tm_cari.pack(side="left", padx=(0, 8))
+        self.tm_tutar = ctk.CTkEntry(satir1, placeholder_text="Tutar", width=110)
+        self.tm_tutar.pack(side="left", padx=(0, 8))
+        self.tm_pb = ctk.CTkOptionMenu(satir1, values=["TL", "USD", "EUR"], width=90)
+        self.tm_pb.pack(side="left")
+
+        satir2 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir2.pack(fill="x", padx=15, pady=(0, 15))
+        self.tm_banka = ctk.CTkEntry(satir2, placeholder_text="Banka Adı", width=180)
+        self.tm_banka.pack(side="left", padx=(0, 8))
+        self.tm_mektup_no = ctk.CTkEntry(satir2, placeholder_text="Mektup No", width=150)
+        self.tm_mektup_no.pack(side="left", padx=(0, 8))
+        self.tm_baslangic = ctk.CTkEntry(satir2, placeholder_text="Başlangıç (YYYY-AA-GG)", width=170)
+        self.tm_baslangic.pack(side="left", padx=(0, 8))
+        self.tm_bitis = ctk.CTkEntry(satir2, placeholder_text="Bitiş (YYYY-AA-GG)", width=170)
+        self.tm_bitis.pack(side="left")
 
     def teminat_ekle_islem(self):
         try:
@@ -5559,9 +6731,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/teminat-ekle", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                for e in [self.tm_cari, self.tm_tutar, self.tm_banka, self.tm_mektup_no, self.tm_baslangic, self.tm_bitis]:
-                    e.delete(0, "end")
                 self.teminat_yukle()
+                self.teminat_liste_goster()
+                messagebox.showinfo("Başarılı", "Teminat mektubu eklendi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -5597,34 +6769,71 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_ihracat(self):
-        ust = ctk.CTkFrame(self.tab_ihracat, fg_color="transparent")
-        ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🌍 İhracat / İhraç Kayıtlı Fatura", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
-        ctk.CTkLabel(self.tab_ihracat, text="Not: KDV İstisnalı (0) kesilir - resmi tecil-terkin süreci mali müşavirinizce ayrıca takip edilmelidir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
+        self.ihracat_liste_govde = ctk.CTkFrame(self.tab_ihracat, fg_color="transparent")
+        self.ihracat_form_govde = ctk.CTkFrame(self.tab_ihracat, fg_color="transparent")
+        self._ihracat_liste_olustur()
+        self._ihracat_form_olustur()
+        self.ihracat_liste_goster()
 
-        form = ctk.CTkFrame(self.tab_ihracat, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form, text="Yeni İhraç Kayıtlı Fatura", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(0, 5))
+    def ihracat_liste_goster(self):
+        self.ihracat_form_govde.pack_forget()
+        self.ihracat_liste_govde.pack(fill="both", expand=True)
+
+    def ihracat_form_goster(self):
+        self.ihracat_liste_govde.pack_forget()
+        for e in (self.ih_musteri, self.ih_stok, self.ih_miktar, self.ih_fiyat, self.ih_beyanname,
+                  self.ih_beyanname_tarih, self.ih_ulke, self.ih_teslim):
+            e.delete(0, "end")
+        self.ihracat_form_govde.pack(fill="both", expand=True)
+
+    def _ihracat_liste_olustur(self):
+        ust = ctk.CTkFrame(self.ihracat_liste_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="🌍 İhracat / İhraç Kayıtlı Fatura", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="📤 Yeni İhraç Kayıtlı Fatura", fg_color="#9965F1", hover_color="#8256CD",
+                      command=self.ihracat_form_goster).pack(side="right")
+        ctk.CTkLabel(self.ihracat_liste_govde, text="Not: KDV İstisnalı (0) kesilir - resmi tecil-terkin süreci mali müşavirinizce ayrıca takip edilmelidir.",
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
+
+        self.ihracat_tree = OzelTablo(
+            self.ihracat_liste_govde, ["ID", "Fatura ID", "Müşteri", "Tutar", "Beyanname No", "Beyanname Tarihi", "Ülke", "Teslim Şekli", "Tarih"],
+            [40, 70, 150, 90, 130, 120, 90, 130, 130], height=14)
+        self.ihracat_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+
+        self.ihracat_yukle()
+
+    def _ihracat_form_olustur(self):
+        ust = ctk.CTkFrame(self.ihracat_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.ihracat_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="📤 Yeni İhraç Kayıtlı Fatura", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="📤 Fatura Kes", fg_color="#9965F1", hover_color="#8256CD", width=150, height=30,
+                      command=self.ihrac_fatura_kes_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.ihracat_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+
+        satir1 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir1.pack(fill="x", padx=15, pady=(15, 8))
         mus_frame = ctk.CTkFrame(satir1, fg_color="transparent")
         mus_frame.pack(side="left", padx=(0, 8))
-        self.ih_musteri = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
+        self.ih_musteri = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=100)
         self.ih_musteri.pack(side="left", padx=(0, 4))
         ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.ih_musteri)).pack(side="left")
         stok_frame = ctk.CTkFrame(satir1, fg_color="transparent")
         stok_frame.pack(side="left", padx=(0, 8))
-        self.ih_stok = ctk.CTkEntry(stok_frame, placeholder_text="Stok Kod", width=90)
+        self.ih_stok = ctk.CTkEntry(stok_frame, placeholder_text="Stok Kod", width=100)
         self.ih_stok.pack(side="left", padx=(0, 4))
         ctk.CTkButton(stok_frame, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
                       command=lambda: self.urun_secim_penceresi(self.ih_stok)).pack(side="left")
-        self.ih_miktar = ctk.CTkEntry(satir1, placeholder_text="Miktar", width=80)
+        self.ih_miktar = ctk.CTkEntry(satir1, placeholder_text="Miktar", width=100)
         self.ih_miktar.pack(side="left", padx=(0, 8))
-        self.ih_fiyat = ctk.CTkEntry(satir1, placeholder_text="Birim Fiyat", width=90)
+        self.ih_fiyat = ctk.CTkEntry(satir1, placeholder_text="Birim Fiyat", width=110)
         self.ih_fiyat.pack(side="left")
-        satir2 = ctk.CTkFrame(form, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 10))
+
+        satir2 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir2.pack(fill="x", padx=15, pady=(0, 15))
         self.ih_beyanname = ctk.CTkEntry(satir2, placeholder_text="Gümrük Beyanname No", width=170)
         self.ih_beyanname.pack(side="left", padx=(0, 8))
         self.ih_beyanname_tarih = ctk.CTkEntry(satir2, placeholder_text="Beyanname Tarihi (YYYY-AA-GG)", width=190)
@@ -5632,16 +6841,7 @@ class MainApp(ctk.CTkToplevel):
         self.ih_ulke = ctk.CTkEntry(satir2, placeholder_text="Ülke", width=110)
         self.ih_ulke.pack(side="left", padx=(0, 8))
         self.ih_teslim = ctk.CTkEntry(satir2, placeholder_text="Teslim Şekli (Incoterm)", width=150)
-        self.ih_teslim.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir2, text="📤 Fatura Kes", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.ihrac_fatura_kes_islem).pack(side="left")
-
-        liste_cerceve, self.ihracat_tree = tablo_olustur(
-            self.tab_ihracat, ["ID", "Fatura ID", "Müşteri", "Tutar", "Beyanname No", "Beyanname Tarihi", "Ülke", "Teslim Şekli", "Tarih"],
-            [40, 70, 150, 90, 130, 120, 90, 130, 130], height=10)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-
-        self.ihracat_yukle()
+        self.ih_teslim.pack(side="left")
 
     def ihrac_fatura_kes_islem(self):
         try:
@@ -5657,10 +6857,10 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/ihrac-kayitli-fatura-kes", json=data, headers=self.req_headers(), timeout=10)
             if res.status_code == 200:
-                for e in [self.ih_musteri, self.ih_stok, self.ih_miktar, self.ih_fiyat, self.ih_beyanname, self.ih_beyanname_tarih, self.ih_ulke, self.ih_teslim]:
-                    e.delete(0, "end")
                 self.ihracat_yukle()
-                self.stoklari_yukle()
+                if hasattr(self, "stok_tree"):
+                    self.stoklari_yukle()
+                self.ihracat_liste_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj"))
             else:
                 self.api_hata_goster(res)
@@ -5680,34 +6880,40 @@ class MainApp(ctk.CTkToplevel):
             pass
 
     def init_yasal_takvim(self):
-        ust = ctk.CTkFrame(self.tab_yasal_takvim, fg_color="transparent")
+        self.yasal_takvim_liste_govde = ctk.CTkFrame(self.tab_yasal_takvim, fg_color="transparent")
+        self.yasal_takvim_form_govde = ctk.CTkFrame(self.tab_yasal_takvim, fg_color="transparent")
+        self._yasal_takvim_liste_olustur()
+        self._yasal_takvim_form_olustur()
+        self.yasal_takvim_liste_goster()
+
+    def yasal_takvim_liste_goster(self):
+        self.yasal_takvim_form_govde.pack_forget()
+        self.yasal_takvim_liste_govde.pack(fill="both", expand=True)
+
+    def yasal_takvim_form_goster(self):
+        self.yasal_takvim_liste_govde.pack_forget()
+        for e in (self.yt_beyan_turu, self.yt_son_tarih, self.yt_aciklama):
+            e.delete(0, "end")
+        self.yasal_takvim_form_govde.pack(fill="both", expand=True)
+
+    def _yasal_takvim_liste_olustur(self):
+        ust = ctk.CTkFrame(self.yasal_takvim_liste_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📆 Yasal Takvim (KDV/Muhtasar/SGK vb.)", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📆 Yasal Takvim (KDV/Muhtasar/SGK vb.)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.yasal_takvim_listesi_yukle).pack(side="right")
-        ctk.CTkLabel(self.tab_yasal_takvim,
+        ctk.CTkButton(ust, text="+ Yeni Takvim Kaydı", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.yasal_takvim_form_goster).pack(side="right", padx=(0, 8))
+        ctk.CTkLabel(self.yasal_takvim_liste_govde,
                      text="Son tarihi 7 gün içinde olan Bekliyor kayıtları için 🔔 zil ikonunda otomatik uyarı çıkar.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 8))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 8))
 
-        form = ctk.CTkFrame(self.tab_yasal_takvim, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=10)
-        self.yt_beyan_turu = ctk.CTkEntry(satir1, placeholder_text="Beyan Türü (örn: KDV, Muhtasar, SGK)", width=220)
-        self.yt_beyan_turu.pack(side="left", padx=(0, 8))
-        self.yt_son_tarih = ctk.CTkEntry(satir1, placeholder_text="Son Tarih (YYYY-AA-GG)", width=150)
-        self.yt_son_tarih.pack(side="left", padx=(0, 8))
-        self.yt_aciklama = ctk.CTkEntry(satir1, placeholder_text="Açıklama (opsiyonel)", width=220)
-        self.yt_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir1, text="+ Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.yasal_takvim_ekle_islem).pack(side="left")
+        self.yasal_takvim_tree = OzelTablo(
+            self.yasal_takvim_liste_govde, ["ID", "Beyan Türü", "Son Tarih", "Durum", "Açıklama", "Tamamlanma"],
+            [40, 160, 110, 100, 220, 130], height=14, durum_kolonu="Durum")
+        self.yasal_takvim_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
 
-        liste_cerceve, self.yasal_takvim_tree = tablo_olustur(
-            self.tab_yasal_takvim, ["ID", "Beyan Türü", "Son Tarih", "Durum", "Açıklama", "Tamamlanma"],
-            [40, 160, 110, 100, 220, 130], height=14)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
-
-        alt_satir = ctk.CTkFrame(self.tab_yasal_takvim, fg_color="transparent")
+        alt_satir = ctk.CTkFrame(self.yasal_takvim_liste_govde, fg_color="transparent")
         alt_satir.pack(fill="x", padx=20, pady=(0, 15))
         ctk.CTkButton(alt_satir, text="✅ Seçileni Tamamlandı İşaretle", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.yasal_takvim_tamamla_islem).pack(side="left", padx=(0, 5))
@@ -5715,6 +6921,26 @@ class MainApp(ctk.CTkToplevel):
                       command=self.yasal_takvim_sil_islem).pack(side="left")
 
         self.yasal_takvim_listesi_yukle()
+
+    def _yasal_takvim_form_olustur(self):
+        ust = ctk.CTkFrame(self.yasal_takvim_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.yasal_takvim_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Takvim Kaydı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Ekle", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.yasal_takvim_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.yasal_takvim_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        self.yt_beyan_turu = ctk.CTkEntry(satir, placeholder_text="Beyan Türü (örn: KDV, Muhtasar, SGK)", width=250)
+        self.yt_beyan_turu.pack(side="left", padx=(0, 8))
+        self.yt_son_tarih = ctk.CTkEntry(satir, placeholder_text="Son Tarih (YYYY-AA-GG)", width=180)
+        self.yt_son_tarih.pack(side="left", padx=(0, 8))
+        self.yt_aciklama = ctk.CTkEntry(satir, placeholder_text="Açıklama (opsiyonel)", width=250)
+        self.yt_aciklama.pack(side="left")
 
     def yasal_takvim_ekle_islem(self):
         beyan_turu = self.yt_beyan_turu.get().strip()
@@ -5726,10 +6952,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/yasal-takvim", json=data, headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
-                self.yt_beyan_turu.delete(0, "end")
-                self.yt_son_tarih.delete(0, "end")
-                self.yt_aciklama.delete(0, "end")
                 self.yasal_takvim_listesi_yukle()
+                self.yasal_takvim_liste_goster()
+                messagebox.showinfo("Başarılı", "Takvim kaydı eklendi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -5779,7 +7004,7 @@ class MainApp(ctk.CTkToplevel):
     def init_diger_fisler(self):
         ust = ctk.CTkFrame(self.tab_diger_fisler, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📋 Diğer Muhasebe Fişleri", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📋 Diğer Muhasebe Fişleri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
 
         sekmeler = ctk.CTkTabview(self.tab_diger_fisler, width=900)
         sekmeler.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -5789,50 +7014,68 @@ class MainApp(ctk.CTkToplevel):
 
         # --- Vade Farkı Faturası ---
         vf_tab = sekmeler.tab("Vade Farkı Faturası")
-        vf_form = ctk.CTkFrame(vf_tab, fg_color="transparent")
-        vf_form.pack(fill="x", pady=10)
-        mus_frame = ctk.CTkFrame(vf_form, fg_color="transparent")
-        mus_frame.pack(side="left", padx=(0, 8))
-        self.vf_musteri = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
-        self.vf_musteri.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.vf_musteri)).pack(side="left")
-        self.vf_tutar = ctk.CTkEntry(vf_form, placeholder_text="Tutar", width=100)
-        self.vf_tutar.pack(side="left", padx=(0, 8))
-        self.vf_aciklama = ctk.CTkEntry(vf_form, placeholder_text="Açıklama", width=220)
-        self.vf_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(vf_form, text="+ Ekle", fg_color="#49B772", hover_color="#3E9C61", command=self.vade_farki_ekle_islem).pack(side="left")
-        vf_liste_cerceve, self.vade_farki_tree = tablo_olustur(vf_tab, ["ID", "Müşteri", "Tutar", "Açıklama", "Tarih"], [40, 160, 90, 220, 130], height=10)
-        vf_liste_cerceve.pack(fill="both", expand=True)
+        self.vf_liste_govde = ctk.CTkFrame(vf_tab, fg_color="transparent")
+        self.vf_form_govde = ctk.CTkFrame(vf_tab, fg_color="transparent")
+        self._vf_liste_olustur()
+        self._vf_form_olustur()
+        self.vf_liste_goster()
 
         # --- Kur Farkı Fişi ---
         kf_tab = sekmeler.tab("Kur Farkı Fişi")
-        kf_form = ctk.CTkFrame(kf_tab, fg_color="transparent")
-        kf_form.pack(fill="x", pady=10)
-        self.kf_pb = ctk.CTkOptionMenu(kf_form, values=["USD", "EUR"], width=80)
-        self.kf_pb.pack(side="left", padx=(0, 8))
-        self.kf_doviz_tutar = ctk.CTkEntry(kf_form, placeholder_text="Döviz Tutarı", width=110)
-        self.kf_doviz_tutar.pack(side="left", padx=(0, 8))
-        self.kf_eski_kur = ctk.CTkEntry(kf_form, placeholder_text="Eski Kur", width=90)
-        self.kf_eski_kur.pack(side="left", padx=(0, 8))
-        self.kf_yeni_kur = ctk.CTkEntry(kf_form, placeholder_text="Yeni Kur (boş = otomatik TCMB)", width=170)
-        self.kf_yeni_kur.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(kf_form, text="🔄", width=32, command=self.guncel_kur_cek_islem).pack(side="left", padx=(0, 8))
-        self.kf_aciklama = ctk.CTkEntry(kf_form, placeholder_text="Açıklama", width=160)
-        self.kf_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(kf_form, text="+ Hesapla ve Kaydet", fg_color="#49B772", hover_color="#3E9C61", command=self.kur_farki_ekle_islem).pack(side="left")
-        kf_liste_cerceve, self.kur_farki_tree = tablo_olustur(kf_tab, ["ID", "P.B.", "Döviz Tutarı", "Eski Kur", "Yeni Kur", "Fark (TL)", "Yön", "Tarih"],
-                                                               [40, 60, 100, 80, 80, 100, 70, 130], height=10)
-        kf_liste_cerceve.pack(fill="both", expand=True)
+        self.kf_liste_govde = ctk.CTkFrame(kf_tab, fg_color="transparent")
+        self.kf_form_govde = ctk.CTkFrame(kf_tab, fg_color="transparent")
+        self._kf_liste_olustur()
+        self._kf_form_olustur()
+        self.kf_liste_goster()
 
         # --- Kredi Kartı Fişleri ---
         kk_tab = sekmeler.tab("Kredi Kartı Fişleri")
         ctk.CTkButton(kk_tab, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB", command=self.kredi_karti_fisleri_yukle).pack(anchor="e", pady=(10, 5))
-        kk_liste_cerceve, self.kredi_karti_tree = tablo_olustur(kk_tab, ["ID", "Müşteri", "Tutar", "Açıklama", "Tarih"], [50, 180, 100, 250, 130], height=12)
-        kk_liste_cerceve.pack(fill="both", expand=True)
+        self.kredi_karti_tree = OzelTablo(kk_tab, ["ID", "Müşteri", "Tutar", "Açıklama", "Tarih"], [50, 180, 100, 250, 130], height=12)
+        self.kredi_karti_tree.pack(fill="both", expand=True)
 
         self.vade_farkini_yukle()
         self.kur_farklarini_yukle()
         self.kredi_karti_fisleri_yukle()
+
+    def vf_liste_goster(self):
+        self.vf_form_govde.pack_forget()
+        self.vf_liste_govde.pack(fill="both", expand=True)
+
+    def vf_form_goster(self):
+        self.vf_liste_govde.pack_forget()
+        for e in (self.vf_musteri, self.vf_tutar, self.vf_aciklama):
+            e.delete(0, "end")
+        self.vf_form_govde.pack(fill="both", expand=True)
+
+    def _vf_liste_olustur(self):
+        ctk.CTkButton(self.vf_liste_govde, text="+ Yeni Vade Farkı Faturası", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.vf_form_goster).pack(anchor="w", pady=10)
+        self.vade_farki_tree = OzelTablo(self.vf_liste_govde, ["ID", "Müşteri", "Tutar", "Açıklama", "Tarih"], [40, 160, 90, 220, 130], height=10)
+        self.vade_farki_tree.pack(fill="both", expand=True)
+
+    def _vf_form_olustur(self):
+        ust = ctk.CTkFrame(self.vf_form_govde, fg_color="transparent")
+        ust.pack(fill="x", pady=(10, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.vf_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Vade Farkı Faturası", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Ekle", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.vade_farki_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.vf_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(fill="x", pady=(0, 10))
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        mus_frame = ctk.CTkFrame(satir, fg_color="transparent")
+        mus_frame.pack(side="left", padx=(0, 8))
+        self.vf_musteri = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
+        self.vf_musteri.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.vf_musteri)).pack(side="left")
+        self.vf_tutar = ctk.CTkEntry(satir, placeholder_text="Tutar", width=130)
+        self.vf_tutar.pack(side="left", padx=(0, 8))
+        self.vf_aciklama = ctk.CTkEntry(satir, placeholder_text="Açıklama", width=250)
+        self.vf_aciklama.pack(side="left")
 
     def vade_farki_ekle_islem(self):
         try:
@@ -5844,9 +7087,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/vade-farki-faturasi-ekle", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                for e in [self.vf_musteri, self.vf_tutar, self.vf_aciklama]:
-                    e.delete(0, "end")
                 self.vade_farkini_yukle()
+                self.vf_liste_goster()
+                messagebox.showinfo("Başarılı", "Vade farkı faturası eklendi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -5861,6 +7104,51 @@ class MainApp(ctk.CTkToplevel):
                 self.vade_farki_tree.insert("", "end", values=(v["VadeFarkiID"], v["FirmaAdi"], f"{v['Tutar']:,.2f}", v["Aciklama"], v["Tarih"]))
         except Exception:
             pass
+
+    def kf_liste_goster(self):
+        self.kf_form_govde.pack_forget()
+        self.kf_liste_govde.pack(fill="both", expand=True)
+
+    def kf_form_goster(self):
+        self.kf_liste_govde.pack_forget()
+        for e in (self.kf_doviz_tutar, self.kf_eski_kur, self.kf_yeni_kur, self.kf_aciklama):
+            e.delete(0, "end")
+        self.kf_form_govde.pack(fill="both", expand=True)
+
+    def _kf_liste_olustur(self):
+        ctk.CTkButton(self.kf_liste_govde, text="+ Yeni Kur Farkı Fişi", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.kf_form_goster).pack(anchor="w", pady=10)
+        self.kur_farki_tree = OzelTablo(self.kf_liste_govde, ["ID", "P.B.", "Döviz Tutarı", "Eski Kur", "Yeni Kur", "Fark (TL)", "Yön", "Tarih"],
+                                                               [40, 60, 100, 80, 80, 100, 70, 130], height=10)
+        self.kur_farki_tree.pack(fill="both", expand=True)
+
+    def _kf_form_olustur(self):
+        ust = ctk.CTkFrame(self.kf_form_govde, fg_color="transparent")
+        ust.pack(fill="x", pady=(10, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.kf_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Kur Farkı Fişi", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Hesapla ve Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=160, height=30,
+                      command=self.kur_farki_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.kf_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(fill="x", pady=(0, 10))
+        satir1 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir1.pack(fill="x", padx=15, pady=(15, 8))
+        self.kf_pb = ctk.CTkOptionMenu(satir1, values=["USD", "EUR"], width=100)
+        self.kf_pb.pack(side="left", padx=(0, 8))
+        self.kf_doviz_tutar = ctk.CTkEntry(satir1, placeholder_text="Döviz Tutarı", width=140)
+        self.kf_doviz_tutar.pack(side="left", padx=(0, 8))
+        self.kf_eski_kur = ctk.CTkEntry(satir1, placeholder_text="Eski Kur", width=120)
+        self.kf_eski_kur.pack(side="left", padx=(0, 8))
+        self.kf_yeni_kur = ctk.CTkEntry(satir1, placeholder_text="Yeni Kur (boş = otomatik TCMB)", width=200)
+        self.kf_yeni_kur.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(satir1, text="🔄", width=32, command=self.guncel_kur_cek_islem).pack(side="left")
+
+        satir2 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir2.pack(fill="x", padx=15, pady=(0, 15))
+        self.kf_aciklama = ctk.CTkEntry(satir2, placeholder_text="Açıklama", width=320)
+        self.kf_aciklama.pack(side="left")
 
     def guncel_kur_cek_islem(self):
         try:
@@ -5885,9 +7173,8 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/kur-farki-fisi-ekle", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                for e in [self.kf_doviz_tutar, self.kf_eski_kur, self.kf_yeni_kur, self.kf_aciklama]:
-                    e.delete(0, "end")
                 self.kur_farklarini_yukle()
+                self.kf_liste_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj"))
             else:
                 self.api_hata_goster(res)
@@ -5967,8 +7254,8 @@ class MainApp(ctk.CTkToplevel):
         win.transient(self)
         win.attributes("-topmost", True)
 
-        ctk.CTkLabel(win, text="Favori İşlemlerim", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=(15, 5))
-        ctk.CTkLabel(win, text="Sembollere tıklayarak işlemleri başlatabilirsiniz.", font=("Arial", 11), text_color="gray").pack(pady=(0, 10))
+        ctk.CTkLabel(win, text="Favori İşlemlerim", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=(15, 5))
+        ctk.CTkLabel(win, text="Sembollere tıklayarak işlemleri başlatabilirsiniz.", font=("Segoe UI", 11), text_color="gray").pack(pady=(0, 10))
 
         self.kisayol_liste_frame = ctk.CTkScrollableFrame(win, fg_color=RENK_KART, corner_radius=16)
         self.kisayol_liste_frame.pack(fill="both", expand=True, padx=20, pady=10)
@@ -6029,7 +7316,7 @@ class MainApp(ctk.CTkToplevel):
             if komut:
                 btn = ctk.CTkButton(
                     kart, text=f"{ikon}\n\n{ad}", 
-                    font=("Arial", 14, "bold"), text_color=RENK_METIN,
+                    font=("Segoe UI", 14, "bold"), text_color=RENK_METIN,
                     fg_color="transparent", hover_color="#3f3f46",
                     width=130, height=90, corner_radius=16,
                     command=komut
@@ -6037,7 +7324,7 @@ class MainApp(ctk.CTkToplevel):
             else:
                 btn = ctk.CTkButton(
                     kart, text=f"{ikon}\n\n{ad}", 
-                    font=("Arial", 14, "bold"), text_color="gray",
+                    font=("Segoe UI", 14, "bold"), text_color="gray",
                     fg_color="transparent", hover_color="#3f3f46",
                     width=130, height=90, corner_radius=16
                 )
@@ -6045,7 +7332,7 @@ class MainApp(ctk.CTkToplevel):
             
             ctk.CTkButton(
                 kart, text="Kaldır", fg_color="transparent", hover_color="#F36D6D", text_color="#F36D6D",
-                font=("Arial", 11), width=50, height=20,
+                font=("Segoe UI", 11), width=50, height=20,
                 command=lambda a=ad: self.kisayol_sil(a)
             ).pack(pady=(5, 10))
 
@@ -6065,7 +7352,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(
             hedef_frame, text="⚡ Kişiselleştirilmiş Kısayollarım",
             fg_color="#76CCE1", hover_color="#64ADBF", text_color=RENK_TABAN,
-            font=("Arial", 13, "bold"), height=35,
+            font=("Segoe UI", 13, "bold"), height=35,
             command=self.kisayol_penceresi_ac
         ).pack(anchor="ne")
 
@@ -6075,7 +7362,7 @@ class MainApp(ctk.CTkToplevel):
 
         basliklar = ["Demirbaş Adı", "Kategori", "Alış Tutarı", "Seri No", "Açıklama", "Faydalı Ömür", "Birikmiş Amortisman", "Net Değer", "Lokasyon", ""]
         for col_idx, baslik in enumerate(basliklar):
-            lbl = ctk.CTkLabel(self.demirbas_liste_frame, text=baslik, font=("Arial", 12, "bold"), text_color="#76CCE1")
+            lbl = ctk.CTkLabel(self.demirbas_liste_frame, text=baslik, font=("Segoe UI", 12, "bold"), text_color="#76CCE1")
             lbl.grid(row=0, column=col_idx, padx=15, pady=10, sticky="w")
 
         try:
@@ -6086,19 +7373,19 @@ class MainApp(ctk.CTkToplevel):
                     ctk.CTkLabel(self.demirbas_liste_frame, text="Henüz kayıtlı demirbaş bulunamadı.", text_color=RENK_METIN_SOLUK).grid(row=1, column=0, columnspan=8, pady=20)
                 else:
                     for row_idx, item in enumerate(demirbaslar, start=1):
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("DemirbasAdi", ""), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=0, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("Kategori", ""), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=1, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("DemirbasAdi", ""), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=0, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("Kategori", ""), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=1, padx=15, pady=8, sticky="w")
 
                         tutar = item.get("AlisTutari", 0)
                         tutar_str = f"{tutar:,.2f} TL" if isinstance(tutar, (int, float)) else f"{tutar} TL"
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=tutar_str, font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=2, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=tutar_str, font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=2, padx=15, pady=8, sticky="w")
 
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("SeriNo", "-"), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=3, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("Aciklama", "-"), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=4, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=str(item.get("FaydaliOmurYil") or "-"), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=5, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=f"{item.get('BirikmisAmortisman', 0):,.2f} TL", font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=6, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=f"{item.get('NetDeger', 0):,.2f} TL", font=("Arial", 11, "bold"), text_color="#45C89D").grid(row=row_idx, column=7, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("Lokasyon", "-"), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=8, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("SeriNo", "-"), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=3, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("Aciklama", "-"), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=4, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=str(item.get("FaydaliOmurYil") or "-"), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=5, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=f"{item.get('BirikmisAmortisman', 0):,.2f} TL", font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=6, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=f"{item.get('NetDeger', 0):,.2f} TL", font=("Segoe UI", 11, "bold"), text_color="#45C89D").grid(row=row_idx, column=7, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(self.demirbas_liste_frame, text=item.get("Lokasyon", "-"), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=8, padx=15, pady=8, sticky="w")
                         ctk.CTkButton(self.demirbas_liste_frame, text="🔀 Transfer", width=90, fg_color="#9965F1", hover_color="#8256CD",
                                       command=lambda dm_id=item["ID"], ad=item.get("DemirbasAdi", ""), lok=item.get("Lokasyon", "-"):
                                           self.demirbas_transfer_penceresi(dm_id, ad, lok)).grid(row=row_idx, column=9, padx=15, pady=8)
@@ -6113,8 +7400,8 @@ class MainApp(ctk.CTkToplevel):
         pencere.geometry("420x460")
         pencere.transient(self)
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"🔀 {demirbas_adi}", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(18, 2))
-        ctk.CTkLabel(pencere, text=f"Mevcut Lokasyon: {mevcut_lokasyon or '-'}", font=("Arial", 11), text_color=RENK_METIN_SOLUK).pack(pady=(0, 12))
+        ctk.CTkLabel(pencere, text=f"🔀 {demirbas_adi}", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(18, 2))
+        ctk.CTkLabel(pencere, text=f"Mevcut Lokasyon: {mevcut_lokasyon or '-'}", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(pady=(0, 12))
 
         form = ctk.CTkFrame(pencere, fg_color="transparent")
         form.pack(fill="x", padx=20)
@@ -6140,7 +7427,7 @@ class MainApp(ctk.CTkToplevel):
 
         ctk.CTkButton(form, text="Transfer Et", fg_color="#49B772", hover_color="#3E9C61", command=transfer_et).pack(side="left")
 
-        ctk.CTkLabel(pencere, text="Transfer Geçmişi", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20, pady=(16, 6))
+        ctk.CTkLabel(pencere, text="Transfer Geçmişi", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20, pady=(16, 6))
         gecmis_alani = ctk.CTkScrollableFrame(pencere, fg_color=gecerli_renk(RENK_KART))
         gecmis_alani.pack(fill="both", expand=True, padx=20, pady=(0, 15))
         try:
@@ -6153,8 +7440,8 @@ class MainApp(ctk.CTkToplevel):
         for h in hareketler:
             satir = ctk.CTkFrame(gecmis_alani, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=12)
             satir.pack(fill="x", pady=3, padx=4)
-            ctk.CTkLabel(satir, text=f"{h['EskiLokasyon']} → {h['YeniLokasyon']}", font=("Arial", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
-            ctk.CTkLabel(satir, text=f"{h['Tarih']} — {h['KullaniciAdi']}", font=("Arial", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w", padx=10, pady=(0, 8))
+            ctk.CTkLabel(satir, text=f"{h['EskiLokasyon']} → {h['YeniLokasyon']}", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+            ctk.CTkLabel(satir, text=f"{h['Tarih']} — {h['KullaniciAdi']}", font=("Segoe UI", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w", padx=10, pady=(0, 8))
 
     def amortisman_hesapla_simdi_islem(self):
         try:
@@ -6200,11 +7487,11 @@ class MainApp(ctk.CTkToplevel):
         rozet = ctk.CTkFrame(baslik_alani, width=38, height=38, corner_radius=14, fg_color="#76CCE1")
         rozet.pack(side="left")
         rozet.pack_propagate(False)
-        ctk.CTkLabel(rozet, text="🏢", font=("Arial", 17)).pack(expand=True)
+        ctk.CTkLabel(rozet, text="🏢", font=("Segoe UI", 17)).pack(expand=True)
         yazi_alani = ctk.CTkFrame(baslik_alani, fg_color="transparent")
         yazi_alani.pack(side="left", padx=(10, 0))
-        ctk.CTkLabel(yazi_alani, text="Müşteri Seç", font=("Arial", 15, "bold"), text_color=gecerli_renk(RENK_METIN)).pack(anchor="w")
-        ctk.CTkLabel(yazi_alani, text="Listeden seçin veya arayın", font=("Arial", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w")
+        ctk.CTkLabel(yazi_alani, text="Müşteri Seç", font=("Segoe UI", 15, "bold"), text_color=gecerli_renk(RENK_METIN)).pack(anchor="w")
+        ctk.CTkLabel(yazi_alani, text="Listeden seçin veya arayın", font=("Segoe UI", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w")
 
         try:
             res = requests.get(f"{API}/musteriler", headers=self.req_headers(), timeout=5)
@@ -6238,16 +7525,16 @@ class MainApp(ctk.CTkToplevel):
             avatar.pack(side="left", padx=10, pady=10)
             avatar.pack_propagate(False)
             baş_harf = (m_unvan or "?")[:1].upper()
-            ctk.CTkLabel(avatar, text=baş_harf, font=("Arial", 13, "bold"), text_color="#ffffff").pack(expand=True)
+            ctk.CTkLabel(avatar, text=baş_harf, font=("Segoe UI", 13, "bold"), text_color="#ffffff").pack(expand=True)
 
             metin_alani = ctk.CTkFrame(satir, fg_color="transparent")
             metin_alani.pack(side="left", pady=8, fill="x", expand=True)
-            ctk.CTkLabel(metin_alani, text=m_unvan or "(İsimsiz)", font=("Arial", 13, "bold"),
+            ctk.CTkLabel(metin_alani, text=m_unvan or "(İsimsiz)", font=("Segoe UI", 13, "bold"),
                          text_color=gecerli_renk(RENK_METIN), anchor="w").pack(fill="x")
-            ctk.CTkLabel(metin_alani, text=f"Müşteri ID: {m_id}", font=("Arial", 10),
+            ctk.CTkLabel(metin_alani, text=f"Müşteri ID: {m_id}", font=("Segoe UI", 10),
                          text_color=gecerli_renk(RENK_METIN_SOLUK), anchor="w").pack(fill="x")
 
-            ok_label = ctk.CTkLabel(satir, text="›", font=("Arial", 18, "bold"), text_color=gecerli_renk(RENK_METIN_SOLUK))
+            ok_label = ctk.CTkLabel(satir, text="›", font=("Segoe UI", 18, "bold"), text_color=gecerli_renk(RENK_METIN_SOLUK))
             ok_label.pack(side="right", padx=14)
 
             def sec(event=None):
@@ -6306,11 +7593,11 @@ class MainApp(ctk.CTkToplevel):
         rozet = ctk.CTkFrame(baslik_alani, width=38, height=38, corner_radius=14, fg_color="#76CCE1")
         rozet.pack(side="left")
         rozet.pack_propagate(False)
-        ctk.CTkLabel(rozet, text="🏭", font=("Arial", 17)).pack(expand=True)
+        ctk.CTkLabel(rozet, text="🏭", font=("Segoe UI", 17)).pack(expand=True)
         yazi_alani = ctk.CTkFrame(baslik_alani, fg_color="transparent")
         yazi_alani.pack(side="left", padx=(10, 0))
-        ctk.CTkLabel(yazi_alani, text="Tedarikçi Seç", font=("Arial", 15, "bold"), text_color=gecerli_renk(RENK_METIN)).pack(anchor="w")
-        ctk.CTkLabel(yazi_alani, text="Listeden seçin veya arayın", font=("Arial", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w")
+        ctk.CTkLabel(yazi_alani, text="Tedarikçi Seç", font=("Segoe UI", 15, "bold"), text_color=gecerli_renk(RENK_METIN)).pack(anchor="w")
+        ctk.CTkLabel(yazi_alani, text="Listeden seçin veya arayın", font=("Segoe UI", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w")
 
         try:
             res = requests.get(f"{API}/tedarikciler", headers=self.req_headers(), timeout=5)
@@ -6335,14 +7622,14 @@ class MainApp(ctk.CTkToplevel):
             avatar = ctk.CTkFrame(satir, width=34, height=34, corner_radius=17, fg_color=renk)
             avatar.pack(side="left", padx=10, pady=10)
             avatar.pack_propagate(False)
-            ctk.CTkLabel(avatar, text=(t_unvan or "?")[:1].upper(), font=("Arial", 13, "bold"), text_color="#ffffff").pack(expand=True)
+            ctk.CTkLabel(avatar, text=(t_unvan or "?")[:1].upper(), font=("Segoe UI", 13, "bold"), text_color="#ffffff").pack(expand=True)
             metin_alani = ctk.CTkFrame(satir, fg_color="transparent")
             metin_alani.pack(side="left", pady=8, fill="x", expand=True)
-            ctk.CTkLabel(metin_alani, text=t_unvan or "(İsimsiz)", font=("Arial", 13, "bold"),
+            ctk.CTkLabel(metin_alani, text=t_unvan or "(İsimsiz)", font=("Segoe UI", 13, "bold"),
                          text_color=gecerli_renk(RENK_METIN), anchor="w").pack(fill="x")
-            ctk.CTkLabel(metin_alani, text=f"Tedarikçi ID: {t_id}", font=("Arial", 10),
+            ctk.CTkLabel(metin_alani, text=f"Tedarikçi ID: {t_id}", font=("Segoe UI", 10),
                          text_color=gecerli_renk(RENK_METIN_SOLUK), anchor="w").pack(fill="x")
-            ok_label = ctk.CTkLabel(satir, text="›", font=("Arial", 18, "bold"), text_color=gecerli_renk(RENK_METIN_SOLUK))
+            ok_label = ctk.CTkLabel(satir, text="›", font=("Segoe UI", 18, "bold"), text_color=gecerli_renk(RENK_METIN_SOLUK))
             ok_label.pack(side="right", padx=14)
 
             def sec(event=None):
@@ -6376,7 +7663,94 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(top, text="İptal", fg_color=gecerli_renk(RENK_KENARLIK), hover_color=gecerli_renk(RENK_IKINCIL),
                       text_color=gecerli_renk(RENK_METIN), command=top.destroy).pack(pady=(0, 15))
 
-    def urun_secim_penceresi(self, hedef_kod_entry, hedef_ad_entry=None, hedef_fiyat_entry=None):
+    def personel_secim_penceresi(self, hedef_id_entry, hedef_ad_entry=None):
+        top = ctk.CTkToplevel(self)
+        top.title("Personel Seç")
+        top.geometry("420x520")
+        top.configure(fg_color=gecerli_renk(RENK_TABAN))
+        top.transient(self)
+        top.lift()
+        top.focus_force()
+        top.grab_set()
+        top.after(50, top.lift)
+
+        ctk.CTkFrame(top, height=4, corner_radius=0, fg_color="#76CCE1").pack(fill="x", side="top")
+        baslik_alani = ctk.CTkFrame(top, fg_color="transparent")
+        baslik_alani.pack(fill="x", padx=20, pady=(18, 10))
+        rozet = ctk.CTkFrame(baslik_alani, width=38, height=38, corner_radius=14, fg_color="#76CCE1")
+        rozet.pack(side="left")
+        rozet.pack_propagate(False)
+        ctk.CTkLabel(rozet, text="👤", font=("Segoe UI", 17)).pack(expand=True)
+        yazi_alani = ctk.CTkFrame(baslik_alani, fg_color="transparent")
+        yazi_alani.pack(side="left", padx=(10, 0))
+        ctk.CTkLabel(yazi_alani, text="Personel Seç", font=("Segoe UI", 15, "bold"), text_color=gecerli_renk(RENK_METIN)).pack(anchor="w")
+        ctk.CTkLabel(yazi_alani, text="Listeden seçin veya arayın", font=("Segoe UI", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w")
+
+        try:
+            res = requests.get(f"{API}/personel-listesi", headers=self.req_headers(), timeout=5)
+            personeller = res.json().get("personeller", []) if res.status_code == 200 else []
+        except Exception as e:
+            messagebox.showerror("Bağlantı Hatası", f"Personel listesi çekilemedi: {e}")
+            top.destroy()
+            return
+
+        arama_entry = ctk.CTkEntry(top, placeholder_text="🔍  Ad Soyad'a göre ara...", height=36, corner_radius=12,
+                                    fg_color=gecerli_renk(RENK_TABAN), border_color=gecerli_renk(RENK_KENARLIK))
+        arama_entry.pack(fill="x", padx=20, pady=(0, 12))
+
+        liste_alani = ctk.CTkScrollableFrame(top, fg_color=gecerli_renk(RENK_KART), corner_radius=14)
+        liste_alani.pack(expand=True, fill="both", padx=20, pady=(0, 10))
+        MADALYA_RENKLERI = ["#76CCE1", "#5585EF", "#9965F1", "#42ACA2", "#F36D6D", "#49B772", "#64CCFA", "#BAA5FB"]
+
+        def satir_olustur(p_id, p_ad, p_departman):
+            renk = MADALYA_RENKLERI[abs(hash(str(p_id))) % len(MADALYA_RENKLERI)]
+            satir = ctk.CTkFrame(liste_alani, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=12, cursor="hand2")
+            satir.pack(fill="x", pady=4, padx=2)
+            avatar = ctk.CTkFrame(satir, width=34, height=34, corner_radius=17, fg_color=renk)
+            avatar.pack(side="left", padx=10, pady=10)
+            avatar.pack_propagate(False)
+            ctk.CTkLabel(avatar, text=(p_ad or "?")[:1].upper(), font=("Segoe UI", 13, "bold"), text_color="#ffffff").pack(expand=True)
+            metin_alani = ctk.CTkFrame(satir, fg_color="transparent")
+            metin_alani.pack(side="left", pady=8, fill="x", expand=True)
+            ctk.CTkLabel(metin_alani, text=p_ad or "(İsimsiz)", font=("Segoe UI", 13, "bold"),
+                         text_color=gecerli_renk(RENK_METIN), anchor="w").pack(fill="x")
+            ctk.CTkLabel(metin_alani, text=f"ID: {p_id}" + (f"   ·   {p_departman}" if p_departman else ""), font=("Segoe UI", 10),
+                         text_color=gecerli_renk(RENK_METIN_SOLUK), anchor="w").pack(fill="x")
+            ok_label = ctk.CTkLabel(satir, text="›", font=("Segoe UI", 18, "bold"), text_color=gecerli_renk(RENK_METIN_SOLUK))
+            ok_label.pack(side="right", padx=14)
+
+            def sec(event=None):
+                hedef_id_entry.delete(0, "end")
+                hedef_id_entry.insert(0, p_id)
+                if hedef_ad_entry is not None:
+                    hedef_ad_entry.delete(0, "end")
+                    hedef_ad_entry.insert(0, p_ad or "")
+                top.destroy()
+
+            for widget in (satir, avatar, metin_alani, ok_label) + tuple(metin_alani.winfo_children()):
+                widget.bind("<Button-1>", sec)
+
+        def listeyi_doldur(filtre=""):
+            for w in liste_alani.winfo_children():
+                w.destroy()
+            bulunan = 0
+            for p in personeller:
+                p_id = p.get("PersonelID")
+                p_ad = p.get("AdSoyad") or ""
+                if filtre.lower() in p_ad.lower() or filtre in str(p_id):
+                    satir_olustur(p_id, p_ad, p.get("Departman"))
+                    bulunan += 1
+            if bulunan == 0:
+                ctk.CTkLabel(liste_alani, text="Eşleşen personel bulunamadı.", text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(pady=20)
+
+        listeyi_doldur()
+        arama_entry.bind("<KeyRelease>", lambda e: listeyi_doldur(arama_entry.get().strip()))
+        arama_entry.focus_set()
+
+        ctk.CTkButton(top, text="İptal", fg_color=gecerli_renk(RENK_KENARLIK), hover_color=gecerli_renk(RENK_IKINCIL),
+                      text_color=gecerli_renk(RENK_METIN), command=top.destroy).pack(pady=(0, 15))
+
+    def urun_secim_penceresi(self, hedef_kod_entry, hedef_ad_entry=None, hedef_fiyat_entry=None, on_select=None):
         top = ctk.CTkToplevel(self)
         top.title("Ürün Seç")
         top.geometry("460x540")
@@ -6393,11 +7767,11 @@ class MainApp(ctk.CTkToplevel):
         rozet = ctk.CTkFrame(baslik_alani, width=38, height=38, corner_radius=14, fg_color="#76CCE1")
         rozet.pack(side="left")
         rozet.pack_propagate(False)
-        ctk.CTkLabel(rozet, text="📦", font=("Arial", 17)).pack(expand=True)
+        ctk.CTkLabel(rozet, text="📦", font=("Segoe UI", 17)).pack(expand=True)
         yazi_alani = ctk.CTkFrame(baslik_alani, fg_color="transparent")
         yazi_alani.pack(side="left", padx=(10, 0))
-        ctk.CTkLabel(yazi_alani, text="Depo Ürün Kataloğu", font=("Arial", 15, "bold"), text_color=gecerli_renk(RENK_METIN)).pack(anchor="w")
-        ctk.CTkLabel(yazi_alani, text="Ürün veya kod ile arayın", font=("Arial", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w")
+        ctk.CTkLabel(yazi_alani, text="Depo Ürün Kataloğu", font=("Segoe UI", 15, "bold"), text_color=gecerli_renk(RENK_METIN)).pack(anchor="w")
+        ctk.CTkLabel(yazi_alani, text="Ürün veya kod ile arayın", font=("Segoe UI", 10), text_color=gecerli_renk(RENK_METIN_SOLUK)).pack(anchor="w")
 
         try:
             res = requests.get(f"{API}/stok-listesi", headers=self.req_headers(), timeout=5)
@@ -6424,11 +7798,11 @@ class MainApp(ctk.CTkToplevel):
             satir.pack(fill="x", pady=4, padx=2)
             metin_alani = ctk.CTkFrame(satir, fg_color="transparent")
             metin_alani.pack(side="left", pady=8, padx=12, fill="x", expand=True)
-            ctk.CTkLabel(metin_alani, text=f"{ad}  ({kod})", font=("Arial", 13, "bold"),
+            ctk.CTkLabel(metin_alani, text=f"{ad}  ({kod})", font=("Segoe UI", 13, "bold"),
                          text_color=gecerli_renk(RENK_METIN), anchor="w").pack(fill="x")
-            ctk.CTkLabel(metin_alani, text=f"Depo Miktarı: {mevcut:g}  ·  Fiyat: {fiyat:,.2f} TL", font=("Arial", 10),
+            ctk.CTkLabel(metin_alani, text=f"Depo Miktarı: {mevcut:g}  ·  Fiyat: {fiyat:,.2f} TL", font=("Segoe UI", 10),
                          text_color=gecerli_renk(RENK_METIN_SOLUK), anchor="w").pack(fill="x")
-            ok_label = ctk.CTkLabel(satir, text="›", font=("Arial", 18, "bold"), text_color=gecerli_renk(RENK_METIN_SOLUK))
+            ok_label = ctk.CTkLabel(satir, text="›", font=("Segoe UI", 18, "bold"), text_color=gecerli_renk(RENK_METIN_SOLUK))
             ok_label.pack(side="right", padx=14)
 
             def sec(event=None):
@@ -6441,6 +7815,8 @@ class MainApp(ctk.CTkToplevel):
                     hedef_fiyat_entry.delete(0, "end")
                     hedef_fiyat_entry.insert(0, str(fiyat))
                 top.destroy()
+                if on_select is not None:
+                    on_select(kod, ad)
 
             for widget in (satir, metin_alani, ok_label) + tuple(metin_alani.winfo_children()):
                 widget.bind("<Button-1>", sec)
@@ -6746,8 +8122,8 @@ class MainApp(ctk.CTkToplevel):
         baslik_frame = ctk.CTkFrame(self.tab_doviz, fg_color="transparent")
         baslik_frame.pack(fill="x", padx=20, pady=(20, 5))
         
-        ctk.CTkLabel(baslik_frame, text="Güncel Döviz Kurları (TCMB)", font=("Arial", 16, "bold"), text_color=RENK_METIN).pack(anchor="w")
-        ctk.CTkLabel(baslik_frame, text="Kaynak: Türkiye Cumhuriyet Merkez Bankası - günlük resmi kur listesi", font=("Arial", 11), text_color="gray").pack(anchor="w")
+        ctk.CTkLabel(baslik_frame, text="Güncel Döviz Kurları (TCMB)", font=("Segoe UI", 16, "bold"), text_color=RENK_METIN).pack(anchor="w")
+        ctk.CTkLabel(baslik_frame, text="Kaynak: Türkiye Cumhuriyet Merkez Bankası - günlük resmi kur listesi", font=("Segoe UI", 11), text_color="gray").pack(anchor="w")
 
         # 3. Kartların Yan Yana Duracağı Ana Kapsayıcı (Grid sistemi)
         kartlar_frame = ctk.CTkFrame(self.tab_doviz, fg_color="transparent")
@@ -6788,9 +8164,9 @@ class MainApp(ctk.CTkToplevel):
             kart.grid(row=0, column=col, padx=10, sticky="ew")
             
             # Kart İçeriği (Padding ile yüksekliği otomatik şıklaştırıyoruz)
-            ctk.CTkLabel(kart, text=ayar["isim"], font=("Arial", 13, "bold"), text_color=ayar["renk"]).pack(pady=(25, 15))
-            ctk.CTkLabel(kart, text=f"Alış: {alis} TL", font=("Arial", 12), text_color="#d1d5db").pack(pady=3)
-            ctk.CTkLabel(kart, text=f"Satış: {satis} TL", font=("Arial", 12), text_color="#d1d5db").pack(pady=(3, 25))
+            ctk.CTkLabel(kart, text=ayar["isim"], font=("Segoe UI", 13, "bold"), text_color=ayar["renk"]).pack(pady=(25, 15))
+            ctk.CTkLabel(kart, text=f"Alış: {alis} TL", font=("Segoe UI", 12), text_color="#d1d5db").pack(pady=3)
+            ctk.CTkLabel(kart, text=f"Satış: {satis} TL", font=("Segoe UI", 12), text_color="#d1d5db").pack(pady=(3, 25))
 
             col += 1
 
@@ -6801,12 +8177,12 @@ class MainApp(ctk.CTkToplevel):
         import datetime
         bugun = datetime.datetime.now().strftime("%d.%m.%Y")
         
-        ctk.CTkLabel(alt_frame, text=f"Tarih: {bugun}", font=("Arial", 11), text_color="gray").pack(pady=5)
+        ctk.CTkLabel(alt_frame, text=f"Tarih: {bugun}", font=("Segoe UI", 11), text_color="gray").pack(pady=5)
 
         ctk.CTkButton(
             alt_frame, text="🔄 Kurları Yenile", 
             fg_color="#5585EF", hover_color="#4871CB", text_color=RENK_METIN,
-            font=("Arial", 12, "bold"), height=35,
+            font=("Segoe UI", 12, "bold"), height=35,
             command=self.dovizleri_yukle
         ).pack(pady=5)
         
@@ -6852,7 +8228,7 @@ class MainApp(ctk.CTkToplevel):
         self._menu_cubugu_olustur()
 
         # --- ÜST BAR (MARKA ROZETİ, KULLANICI KARTI, ARAMA) ---
-        top_menu_frame = ctk.CTkFrame(self, height=56, fg_color=RENK_KART, corner_radius=0)
+        top_menu_frame = ctk.CTkFrame(self, height=56, fg_color=RENK_PANEL, corner_radius=0)
         top_menu_frame.pack(side="top", fill="x")
         top_menu_frame.pack_propagate(False)
         alt_cizgi = ctk.CTkFrame(self, height=2, fg_color="#76CCE1", corner_radius=0)
@@ -6868,11 +8244,11 @@ class MainApp(ctk.CTkToplevel):
             marka_rozet = ctk.CTkFrame(marka_alani, width=34, height=34, corner_radius=12, fg_color="#76CCE1")
             marka_rozet.pack(side="left", pady=11)
             marka_rozet.pack_propagate(False)
-            ctk.CTkLabel(marka_rozet, text="NP", font=("Arial", 13, "bold"), text_color=RENK_KART).pack(expand=True)
+            ctk.CTkLabel(marka_rozet, text="NP", font=("Segoe UI", 13, "bold"), text_color=RENK_KART).pack(expand=True)
         marka_yazi = ctk.CTkFrame(marka_alani, fg_color="transparent")
         marka_yazi.pack(side="left", padx=(10, 0))
-        ctk.CTkLabel(marka_yazi, text="NisanPlastikERP", font=("Arial", 16, "bold"), text_color=RENK_METIN_VURGU).pack(anchor="w")
-        ctk.CTkLabel(marka_yazi, text="Kurumsal Kaynak Planlama", font=("Arial", 10), text_color=RENK_ETIKET).pack(anchor="w")
+        ctk.CTkLabel(marka_yazi, text="NisanPlastikERP", font=("Segoe UI", 16, "bold"), text_color=RENK_METIN_VURGU).pack(anchor="w")
+        ctk.CTkLabel(marka_yazi, text="Kurumsal Kaynak Planlama", font=("Segoe UI", 10), text_color=RENK_ETIKET).pack(anchor="w")
         for widget in (marka_alani, marka_rozet, marka_yazi):
             widget.bind("<Button-1>", lambda e: self.sekmeye_git("📊 Finans Özet"))
 
@@ -6881,24 +8257,24 @@ class MainApp(ctk.CTkToplevel):
         kullanici_rozet = ctk.CTkFrame(user_card, width=26, height=26, corner_radius=13, fg_color="#64CCFA")
         kullanici_rozet.pack(side="left", padx=(8, 0), pady=6)
         kullanici_rozet.pack_propagate(False)
-        ctk.CTkLabel(kullanici_rozet, text=self.username[:1].upper(), font=("Arial", 11, "bold"), text_color=RENK_TABAN).pack(expand=True)
+        ctk.CTkLabel(kullanici_rozet, text=self.username[:1].upper(), font=("Segoe UI", 11, "bold"), text_color=RENK_TABAN).pack(expand=True)
         ctk.CTkLabel(user_card, text=f"{self.username.upper()}  ·  Nisan Plastik A.Ş.",
-                     font=("Arial", 12, "bold"), text_color=RENK_METIN).pack(side="left", padx=(8, 10), pady=6)
+                     font=("Segoe UI", 12, "bold"), text_color=RENK_METIN).pack(side="left", padx=(8, 10), pady=6)
         ctk.CTkButton(user_card, text="Çıkış", width=58, height=24, corner_radius=8, fg_color="#F36D6D", hover_color="#CF5D5D",
-                      font=("Arial", 10, "bold"), command=self.oturumu_kapat).pack(side="left", padx=(0, 8), pady=6)
+                      font=("Segoe UI", 10, "bold"), command=self.oturumu_kapat).pack(side="left", padx=(0, 8), pady=6)
 
         self.bildirim_zil_btn = ctk.CTkButton(top_menu_frame, text="🔔", width=38, height=34, corner_radius=12,
-                                               fg_color=RENK_IKINCIL, hover_color=RENK_KENARLIK, text_color=RENK_METIN, font=("Arial", 15),
+                                               fg_color=RENK_IKINCIL, hover_color=RENK_KENARLIK, text_color=RENK_METIN, font=("Segoe UI", 15),
                                                command=self.bildirim_penceresi_ac)
         self.bildirim_zil_btn.pack(side="right", padx=(6, 0), pady=11)
 
         self.tema_buton = ctk.CTkButton(top_menu_frame, text="☀", width=38, height=34, corner_radius=12,
-                                         fg_color=RENK_IKINCIL, hover_color=RENK_KENARLIK, text_color=RENK_METIN, font=("Arial", 15),
+                                         fg_color=RENK_IKINCIL, hover_color=RENK_KENARLIK, text_color=RENK_METIN, font=("Segoe UI", 15),
                                          command=self.tema_degistir_ve_yenile)
         self.tema_buton.pack(side="right", padx=(6, 0), pady=11)
 
         self.yardim_buton = ctk.CTkButton(top_menu_frame, text="❓", width=38, height=34, corner_radius=12,
-                                           fg_color=RENK_IKINCIL, hover_color=RENK_KENARLIK, text_color=RENK_METIN, font=("Arial", 15),
+                                           fg_color=RENK_IKINCIL, hover_color=RENK_KENARLIK, text_color=RENK_METIN, font=("Segoe UI", 15),
                                            command=self.yardim_penceresi_ac)
         self.yardim_buton.pack(side="right", padx=(6, 0), pady=11)
 
@@ -6915,10 +8291,10 @@ class MainApp(ctk.CTkToplevel):
         status_bar.pack(side="bottom", fill="x")
         status_bar.pack_propagate(False)
         self.status_left = ctk.CTkLabel(status_bar, text=f"●  Güvenli Bağlantı (JWT)  ·  Aktif Kullanıcı: {self.username}",
-                                         font=("Arial", 10, "bold"), text_color="#45C89D")
+                                         font=("Segoe UI", 10, "bold"), text_color="#45C89D")
         self.status_left.pack(side="left", padx=14)
         ctk.CTkLabel(status_bar, text="Nisan Plastik ERP v9.0  ·  FastAPI + MSSQL",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(side="right", padx=14)
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(side="right", padx=14)
 
         # ================================================================
         # SOL SİDEBAR + SAĞ İÇERİK ALANI (ERPNext "Desk" tarzı navigasyon)
@@ -6938,7 +8314,7 @@ class MainApp(ctk.CTkToplevel):
         # listesine dahil değil, sidebar_yeniden_diz onu hiç etkilemez), Ana Ekrana
         # (Giriş paneline, tüm kategoriler açık haliyle) dönmek için kullanılır.
         ana_ekran_buton = ctk.CTkButton(sidebar, text="🏠 Ana Ekrana Dön", anchor="w", fg_color=RENK_IKINCIL,
-                                         hover_color=RENK_KENARLIK, text_color=RENK_METIN, font=("Arial", 13, "bold"),
+                                         hover_color=RENK_KENARLIK, text_color=RENK_METIN, font=("Segoe UI", 13, "bold"),
                                          height=38, corner_radius=14, command=lambda: self.ana_ekrana_don())
         ana_ekran_buton.pack(fill="x", padx=8, pady=(8, 4))
 
@@ -6954,6 +8330,11 @@ class MainApp(ctk.CTkToplevel):
         self._sidebar_ogeler = []   # [(widget, "header"), (widget, "konteyner", kategori_adi), ...] - sırayla
         self._kategori_sekmeleri = {}  # kategori_adi -> [sekme_adi, ...] - Giriş paneli/modül modu için
         self._modul_modu_aktif = None  # None ya da modül modunda gösterilen kategori adı
+        self._ozel_tablolar = []  # OzelTablo örnekleri - tema değişince tema_yenile() çağrılabilsin diye
+        self._tum_agaclar = []   # tablo_olustur'un ürettiği ttk.Treeview'lar - tema değişince zebra rengi yenilensin diye
+        self._nav_gecmisi = []   # [("sekme", ad) | ("modul", kategori_adi), ...] - fare geri tuşu için gezinme geçmişi
+        self._nav_geri_ileri_calisiyor = False  # geri git sırasında geçmişe tekrar ekleme yapılmasın diye
+        self._aktif_sekme_adi = None   # sekmeye_git ÇAĞRILMADAN önce de tanımlı olmalı (ilk açılış çağrısı dahil)
 
         # Modül moduna girilince gösterilen, içeriği her seferinde yeniden çizilen tek
         # bir "modül özet" alanı - yeni_sekme'den GEÇMİYOR (kendi sidebar butonu/nav
@@ -6968,25 +8349,45 @@ class MainApp(ctk.CTkToplevel):
             Kapalı bir kategorinin konteyneri hiç paketlenmediği için geride boşluk
             bırakmaz; açık olanlar ise her zaman doğru sırada (kaydedildikleri sırada)
             görünür - önceki sürümde konteyner her durumda hemen paketlendiği için
-            kapalıyken bile boşluk kalıyordu, bu fonksiyon o sorunu kökten çözer."""
-            for oge in self._sidebar_ogeler:
-                widget = oge[0]
-                widget.pack_forget()
-                if oge[1] == "header":
-                    widget.pack(fill="x", padx=8, pady=(16, 4))
-                else:
-                    kategori_adi = oge[2]
-                    if self._kategori_durumlari[kategori_adi]["acik"]:
-                        widget.pack(fill="x")
+            kapalıyken bile boşluk kalıyordu, bu fonksiyon o sorunu kökten çözer.
+
+            İKİ AYRI GEÇİŞ (önce TÜM forget, sonra TÜM pack) ÖNEMLİ: forget+pack'i
+            tek tek iç içe yapmak, kaydırmalı kenar çubuğunun (CTkScrollableFrame,
+            içeride bir Tkinter Canvas kullanıyor) her adımda ayrı ayrı yeniden
+            boyutlanıp çizilmesine yol açıyordu - kullanıcı ekran kaydında bunun bir
+            kategoriden diğerine geçerken bazı satırların kısa süreliğine (~100ms)
+            görünmez kaldığı bir "yarım çizilmiş" görünüm olarak fark etti. Tüm
+            forget'ler bitmeden hiçbir pack başlamayınca, canvas SADECE bir kez
+            (baştan sona nihai halinde) yeniden boyutlanıp çiziliyor.
+
+            Bu iki geçiş TEK BAŞINA yetmedi (kullanıcı hâlâ kısa bir ara-durum
+            görüyordu) - Tk, pack() çağrıları bitince değil SONRAKİ boşta (idle)
+            döngüde geometriyi yeniden hesaplıyor, o yüzden ek olarak
+            _cizim_dondur/_cizim_devam_ettir (WM_SETREDRAW) ile bu ara adım(lar)
+            Windows'a hiç boyatılmıyor."""
+            self._cizim_dondur()
+            try:
+                for oge in self._sidebar_ogeler:
+                    oge[0].pack_forget()
+                for oge in self._sidebar_ogeler:
+                    widget = oge[0]
+                    if oge[1] == "header":
+                        widget.pack(fill="x", padx=8, pady=(16, 4))
+                    else:
+                        kategori_adi = oge[2]
+                        if self._kategori_durumlari[kategori_adi]["acik"]:
+                            widget.pack(fill="x")
+            finally:
+                self._cizim_devam_ettir()
 
         self._sidebar_yeniden_diz_fn = sidebar_yeniden_diz  # modul_moduna_gir/ana_ekrana_don dışarıdan çağırabilsin diye
 
         def kategori_basligi(baslik, varsayilan_acik=True):
             baslik_cercevesi = ctk.CTkFrame(sidebar, fg_color="transparent", cursor="hand2")
             ok_etiketi = ctk.CTkLabel(baslik_cercevesi, text="▾" if varsayilan_acik else "▸",
-                                       font=("Arial", 11, "bold"), text_color="#76CCE1", width=14)
+                                       font=("Segoe UI", 11, "bold"), text_color="#76CCE1", width=14)
             ok_etiketi.pack(side="left")
-            metin_etiketi = ctk.CTkLabel(baslik_cercevesi, text=baslik, font=("Arial", 13, "bold"),
+            metin_etiketi = ctk.CTkLabel(baslik_cercevesi, text=baslik, font=("Segoe UI", 13, "bold"),
                                           text_color="#76CCE1", anchor="w")
             metin_etiketi.pack(side="left", fill="x", expand=True)
 
@@ -7011,7 +8412,7 @@ class MainApp(ctk.CTkToplevel):
             kategori_adi = aktif_kategori["ad"]
             ust_konteyner = self._kategori_durumlari[kategori_adi]["konteyner"] if kategori_adi in self._kategori_durumlari else sidebar
             btn = ctk.CTkButton(ust_konteyner, text=ad, anchor="w", fg_color="transparent", hover_color=RENK_IKINCIL,
-                                 text_color=RENK_METIN, font=("Arial", 13), height=36, corner_radius=12,
+                                 text_color=RENK_METIN, font=("Segoe UI", 13), height=36, corner_radius=12,
                                  command=lambda a=ad: self.sekmeye_git(a))
             # Buton her zaman kendi konteynerine paketlenir (konteyner içindeki sıra hep
             # korunur) - görünürlük konteynerin KENDİSİNİN paketlenip paketlenmemesiyle
@@ -7116,12 +8517,14 @@ class MainApp(ctk.CTkToplevel):
             kategori_basligi("ÜRÜN & MALİYET")
             self.tab_fiyatlandirma = yeni_sekme("💲 Fiyatlandırma")
             self.tab_fiyat_listeleri = yeni_sekme("💰 Fiyat Listeleri")
+            self.tab_kademeli_iskonto = yeni_sekme("🪜 Kademeli İskonto")
             self.tab_satis_tahmini = yeni_sekme("📈 Satış Tahmini")
             self.tab_kar_marji = yeni_sekme("💹 Kâr Marjı Analizi")
             self.tab_siparis_kar = yeni_sekme("💹 Sipariş Kâr Analizi")
             self.tab_fiyat_onerisi = yeni_sekme("🧮 Fiyat Önerisi")
             _kuyruga_al("💲 Fiyatlandırma", self.init_fiyatlandirma)
             _kuyruga_al("💰 Fiyat Listeleri", self.init_fiyat_listeleri)
+            _kuyruga_al("🪜 Kademeli İskonto", self.init_kademeli_iskonto)
             _kuyruga_al("📈 Satış Tahmini", self.init_satis_tahmini)
             _kuyruga_al("💹 Kâr Marjı Analizi", self.init_kar_marji)
             _kuyruga_al("💹 Sipariş Kâr Analizi", self.init_siparis_kar_analizi)
@@ -7321,6 +8724,12 @@ class MainApp(ctk.CTkToplevel):
         self._son_aktivite_zamani = time.time()
         self.bind_all("<Motion>", self._aktivite_zamanini_guncelle, add="+")
         self.bind_all("<Key>", self._aktivite_zamanini_guncelle, add="+")
+        # Fare "geri" tuşu (tarayıcılardaki gibi) - Windows/X11'de Tk'ye XButton1
+        # olarak, event.num == 8 şeklinde gelir (XButton2/ileri = 9). "<Button-8>"
+        # gibi doğrudan bir olay adıyla bağlamak BAZI Tk sürümlerinde "bad button
+        # number" hatasıyla PATLADIĞINDAN (numaralı buton bind'leri 1-5 ile sınırlı
+        # olabiliyor), genel <ButtonPress>'e bağlanıp event.num'u kontrol ediyoruz.
+        self.bind_all("<ButtonPress>", self._mouse_buton_kontrol, add="+")
         self.bind_all("<Button>", self._aktivite_zamanini_guncelle, add="+")
         self.after(min(60000, self._OTURUM_ZAMAN_ASIMI_SANIYE * 1000 // 3 or 1000), self._oturum_zaman_asimi_kontrol_et)
 
@@ -7361,12 +8770,61 @@ class MainApp(ctk.CTkToplevel):
         self._doviz_kurlari_onbellek_zamani = simdi
         return veri
 
+    def _cizim_dondur(self):
+        """Windows'a bu pencereyi YENİDEN ÇİZMEMESİNİ söyler (WM_SETREDRAW).
+        Sidebar gibi çok sayıda widget'ın art arda pack_forget()/pack() edildiği
+        yerlerde, iki geçişli (önce hepsi gizle, sonra hepsi göster) yaklaşım TEK
+        BAŞINA yeterli olmuyordu - Tk, pack() çağrıları SIRASINDA değil, sonraki
+        boşta (idle) döngüde geometriyi yeniden hesaplıyor; ekran o ara adımları da
+        (bazı satırlar boş) boyayabiliyordu. WM_SETREDRAW, Windows'un o ara
+        adımları HİÇ boyamamasını sağlar - _cizim_devam_ettir çağrılana kadar
+        pencere donmuş gibi görünür ama içeride widget'lar normal güncellenir."""
+        try:
+            import ctypes
+            self._redraw_hwnd = self.winfo_id()
+            ctypes.windll.user32.SendMessageW(self._redraw_hwnd, 0x000B, 0, 0)
+        except Exception:
+            self._redraw_hwnd = None
+
+    def _cizim_devam_ettir(self):
+        """_cizim_dondur ile durdurulan çizimi geri açar. Aradaki TÜM ara render
+        adımlarının (donmuşken biriken) tek seferde, son/nihai haliyle ekrana
+        basılması için önce update_idletasks() ile Tk'nin geometri hesaplamalarını
+        (hâlâ görünmezken) BİTİRMESİ sağlanır, sonra pencere yeniden çizime açılıp
+        tam bir yeniden boyama (RedrawWindow) zorlanır."""
+        hwnd = getattr(self, "_redraw_hwnd", None)
+        if not hwnd:
+            return
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        try:
+            import ctypes
+            ctypes.windll.user32.SendMessageW(hwnd, 0x000B, 1, 0)
+            RDW_INVALIDATE, RDW_ERASE, RDW_UPDATENOW, RDW_ALLCHILDREN = 0x1, 0x4, 0x100, 0x80
+            ctypes.windll.user32.RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN)
+        except Exception:
+            pass
+        self._redraw_hwnd = None
+
     def tema_degistir_ve_yenile(self):
         """Açık/Koyu mod arasında geçiş yapar. CTk widget'lar (fg_color=(açık,koyu) ile
         tanımlananlar) otomatik güncellenir; ttk.Treeview ve düz tk.Canvas/tk.Listbox gibi
         widget'lar bunu anlamadığı için rengini elle yeniden hesaplatmamız gerekiyor."""
         tema_degistir()
         treeview_stilini_ayarla()
+        for tablo in self._ozel_tablolar:
+            try:
+                tablo.tema_yenile()
+            except Exception:
+                pass
+        for agac in self._tum_agaclar:
+            try:
+                agac.tag_configure("cift", background=gecerli_renk(RENK_KART))
+                agac.tag_configure("tek", background=gecerli_renk(RENK_ZEBRA))
+            except Exception:
+                pass
         if hasattr(self, "trend_canvas"):
             self.trend_canvas.configure(bg=gecerli_renk(RENK_KART))
         if hasattr(self, "tema_buton"):
@@ -7382,12 +8840,8 @@ class MainApp(ctk.CTkToplevel):
         for w in frame.winfo_children():
             w.destroy()
 
-        ikon_eslemesi = {
-            "GENEL": "🏠", "ÜRETİM": "⚙️", "STOK": "📦", "SATINALMA": "🛒",
-            "ÜRÜN & MALİYET": "💲", "SATIŞ & CRM": "🏢", "FİNANS": "🏦",
-            "MUHASEBE": "📚", "FATURALAR": "📄", "İNSAN KAYNAKLARI": "👥",
-            "ORTAK": "🔗", "SİSTEM": "🔒", "PROJE YÖNETİMİ": "📁",
-        }
+        ikon_eslemesi = self._KATEGORI_IKONLARI
+        rozet_renkleri = self._KATEGORI_ROZET_RENKLERI
 
         ust = ctk.CTkFrame(frame, fg_color="transparent")
         ust.pack(fill="x", padx=30, pady=(28, 6))
@@ -7398,16 +8852,16 @@ class MainApp(ctk.CTkToplevel):
 
         ust_sol = ctk.CTkFrame(ust, fg_color="transparent")
         ust_sol.pack(side="left", anchor="w")
-        ctk.CTkLabel(ust_sol, text=f"Hoş geldin, {getattr(self, 'username', '')} 👋", font=("Arial", 24, "bold"), text_color="#76CCE1").pack(anchor="w")
+        ctk.CTkLabel(ust_sol, text=f"Hoş geldin, {getattr(self, 'username', '')} 👋", font=("Segoe UI", 24, "bold"), text_color="#76CCE1").pack(anchor="w")
         ctk.CTkLabel(ust_sol, text="Bir modül seç - o modülün ekranlarını listeleyen ayrı bir pencere açılır.",
-                     font=("Arial", 13), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(3, 0))
+                     font=("Segoe UI", 13), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(3, 0))
 
         self._giris_ozet_cerceve = ctk.CTkFrame(frame, fg_color=RENK_KART, corner_radius=14)
         self._giris_ozet_cerceve.pack(fill="x", padx=30, pady=(4, 0))
-        ctk.CTkLabel(self._giris_ozet_cerceve, text="🔔 Bugünün Özeti", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=16, pady=(12, 6))
+        ctk.CTkLabel(self._giris_ozet_cerceve, text="🔔 Bugünün Özeti", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=16, pady=(12, 6))
         self._giris_ozet_govde = ctk.CTkFrame(self._giris_ozet_cerceve, fg_color="transparent")
         self._giris_ozet_govde.pack(fill="x", padx=16, pady=(0, 14))
-        ctk.CTkLabel(self._giris_ozet_govde, text="Yükleniyor...", font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
+        ctk.CTkLabel(self._giris_ozet_govde, text="Yükleniyor...", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
         self.after(400, self.giris_ozet_yukle)
 
         kart_alani = ctk.CTkFrame(frame, fg_color="transparent")
@@ -7423,11 +8877,16 @@ class MainApp(ctk.CTkToplevel):
             kart.grid(row=satir, column=sutun, padx=10, pady=10, sticky="nsew")
             kart.grid_propagate(False)
             kart_alani.grid_columnconfigure(sutun, weight=1)
-            ikon_lbl = ctk.CTkLabel(kart, text=ikon, font=("Arial", 34))
-            ikon_lbl.pack(pady=(20, 4))
-            ad_lbl = ctk.CTkLabel(kart, text=kategori_adi, font=("Arial", 14, "bold"), text_color="#76CCE1")
+
+            rozet_bg, rozet_fg = rozet_renkleri.get(kategori_adi, ((RENK_IKINCIL[0], RENK_IKINCIL[1]), ("#76CCE1", "#76CCE1")))
+            rozet = ctk.CTkFrame(kart, width=44, height=44, corner_radius=14, fg_color=rozet_bg)
+            rozet.pack(pady=(18, 6))
+            rozet.pack_propagate(False)
+            ikon_lbl = ctk.CTkLabel(rozet, text=ikon, font=("Segoe UI", 18), text_color=rozet_fg)
+            ikon_lbl.pack(expand=True)
+            ad_lbl = ctk.CTkLabel(kart, text=kategori_adi, font=("Segoe UI", 16, "bold"), text_color=RENK_METIN)
             ad_lbl.pack()
-            sayi_lbl = ctk.CTkLabel(kart, text=f"{ekran_sayisi} ekran", font=("Arial", 10), text_color=RENK_METIN_SOLUK)
+            sayi_lbl = ctk.CTkLabel(kart, text=f"{ekran_sayisi} ekran", font=("Segoe UI", 10), text_color=("#3f3f46", "#a1a1aa"))
             sayi_lbl.pack(pady=(2, 10))
 
             def _hover_gir(e, k=kart):
@@ -7436,7 +8895,7 @@ class MainApp(ctk.CTkToplevel):
             def _hover_cik(e, k=kart):
                 k.configure(border_color=gecerli_renk(RENK_IKINCIL))
 
-            for widget in (kart, ikon_lbl, ad_lbl, sayi_lbl):
+            for widget in (kart, rozet, ikon_lbl, ad_lbl, sayi_lbl):
                 widget.bind("<Button-1>", lambda e, k=kategori_adi: self.modul_moduna_gir(k))
                 widget.bind("<Enter>", _hover_gir)
                 widget.bind("<Leave>", _hover_cik)
@@ -7458,6 +8917,8 @@ class MainApp(ctk.CTkToplevel):
         modül sayfası davranışıyla aynı. Ayrı bir pencere AÇMAZ, doğrudan bir forma
         ATLAMAZ; kullanıcı oradan istediği ekranı seçer. Mevcut tek-pencere
         mimarisine hiç dokunmadan çalışır."""
+        if not self._nav_geri_ileri_calisiyor:
+            self._nav_gecmise_ekle()
         for kat_adi in self._kategori_durumlari:
             self._kategori_ac_kapa_ayarla(kat_adi, kat_adi == kategori_adi)
         self._sidebar_yeniden_diz_fn()
@@ -7467,10 +8928,38 @@ class MainApp(ctk.CTkToplevel):
         self.tab_modul_ozet.tkraise()
         for btn in self._sekme_butonlari.values():
             try:
-                btn.configure(fg_color="transparent", text_color=RENK_METIN, font=("Arial", 12, "normal"))
+                btn.configure(fg_color="transparent", text_color=RENK_METIN, font=("Segoe UI", 12, "normal"))
             except Exception:
                 pass
         self._aktif_sekme_adi = None
+
+    # Giriş ekranındaki kategori kartları (init_giris_paneli) İLE modül özet
+    # sayfasının başlığı (_modul_ozet_doldur) AYNI ikon/renk rozetini kullansın diye
+    # buraya (sınıf seviyesine) taşındı - önceden ikon_eslemesi/rozet_renkleri sadece
+    # init_giris_paneli içinde yerel değişkendi, modül özet sayfası hiç kullanmıyordu
+    # ve düz metin bir başlığı vardı (giriş ekranının/üst barın logolu-rozetli
+    # görünümüyle tutarsızdı).
+    _KATEGORI_IKONLARI = {
+        "GENEL": "🏠", "ÜRETİM": "⚙️", "STOK": "📦", "SATINALMA": "🛒",
+        "ÜRÜN & MALİYET": "💲", "SATIŞ & CRM": "🏢", "FİNANS": "🏦",
+        "MUHASEBE": "📚", "FATURALAR": "📄", "İNSAN KAYNAKLARI": "👥",
+        "ORTAK": "🔗", "SİSTEM": "🔒", "PROJE YÖNETİMİ": "📁",
+    }
+    _KATEGORI_ROZET_RENKLERI = {
+        "GENEL":              (("#E1F5EE", "#085041"), ("#0F6E56", "#5DCAA5")),
+        "ÜRETİM":             (("#EEEDFE", "#3C3489"), ("#534AB7", "#AFA9EC")),
+        "STOK":               (("#FAEEDA", "#633806"), ("#854F0B", "#EF9F27")),
+        "SATINALMA":          (("#FAECE7", "#712B13"), ("#993C1D", "#F0997B")),
+        "ÜRÜN & MALİYET":     (("#FBEAF0", "#72243E"), ("#993556", "#ED93B1")),
+        "SATIŞ & CRM":        (("#E6F1FB", "#0C447C"), ("#185FA5", "#85B7EB")),
+        "PROJE YÖNETİMİ":     (("#F1EFE8", "#444441"), ("#5F5E5A", "#B4B2A9")),
+        "FİNANS":             (("#EAF3DE", "#27500A"), ("#3B6D11", "#97C459")),
+        "MUHASEBE":           (("#EEEDFE", "#3C3489"), ("#534AB7", "#AFA9EC")),
+        "FATURALAR":          (("#E1F5EE", "#085041"), ("#0F6E56", "#5DCAA5")),
+        "İNSAN KAYNAKLARI":   (("#FAEEDA", "#633806"), ("#854F0B", "#EF9F27")),
+        "ORTAK":              (("#E6F1FB", "#0C447C"), ("#185FA5", "#85B7EB")),
+        "SİSTEM":             (("#FCEBEB", "#791F1F"), ("#A32D2D", "#F09595")),
+    }
 
     # kategori_adi -> backend /modul-ozet/{kod} çağrısında kullanılacak ASCII kod
     _MODUL_OZET_KODLARI = {
@@ -7651,7 +9140,7 @@ class MainApp(ctk.CTkToplevel):
         for i, (baslik, ogeler) in enumerate(menu_tanimlari):
             b = ctk.CTkButton(menu_seridi, text=baslik, width=70, height=26, corner_radius=0,
                                fg_color="transparent", hover_color=RENK_IKINCIL, text_color=RENK_METIN_SOLUK,
-                               font=("Arial", 12, "bold"), anchor="w")
+                               font=("Segoe UI", 12, "bold"), anchor="w")
             b.configure(command=lambda buton=b, ogeler=ogeler, baslik=baslik: self._acilir_menu_ac(buton, ogeler, baslik))
             b.pack(side="left", padx=(12 if i == 0 else 0, 0))
 
@@ -7690,7 +9179,7 @@ class MainApp(ctk.CTkToplevel):
 
             ctk.CTkButton(cerceve, text=etiket, anchor="w", width=220, height=30, corner_radius=6,
                           fg_color="transparent", hover_color=RENK_IKINCIL, text_color=RENK_METIN,
-                          font=("Arial", 12), command=_calistir).pack(fill="x", padx=4, pady=2)
+                          font=("Segoe UI", 12), command=_calistir).pack(fill="x", padx=4, pady=2)
 
         self._acik_acilir_menu = pencere
         self._acik_acilir_menu_id = menu_id
@@ -7715,10 +9204,10 @@ class MainApp(ctk.CTkToplevel):
         win.focus_force()
         win.grab_set()
 
-        ctk.CTkLabel(win, text="❓ Yardım / Kullanım Kılavuzu", font=("Arial", 17, "bold"), text_color="#76CCE1").pack(padx=20, pady=(18, 4), anchor="w")
+        ctk.CTkLabel(win, text="❓ Yardım / Kullanım Kılavuzu", font=("Segoe UI", 17, "bold"), text_color="#76CCE1").pack(padx=20, pady=(18, 4), anchor="w")
         ctk.CTkLabel(win, text="Sol menüdeki her ekranın ne işe yaradığını burada bulabilirsiniz. Aramak için ekran adı veya bir anahtar kelime yazın, "
                                "bir satıra tıklayarak doğrudan o ekrana gidebilirsiniz.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=590, justify="left").pack(padx=20, pady=(0, 10), anchor="w")
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=590, justify="left").pack(padx=20, pady=(0, 10), anchor="w")
 
         arama_kutu = ctk.CTkEntry(win, placeholder_text="🔍 Ekran adı veya anahtar kelime ara...", height=36)
         arama_kutu.pack(fill="x", padx=20, pady=(0, 10))
@@ -7743,9 +9232,9 @@ class MainApp(ctk.CTkToplevel):
                         continue
                     bulundu = True
                     if not kategori_gosterildi:
-                        ctk.CTkLabel(kaydirmali, text=kategori_adi, font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=(12, 2))
+                        ctk.CTkLabel(kaydirmali, text=kategori_adi, font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=(12, 2))
                         kategori_gosterildi = True
-                    ctk.CTkLabel(kaydirmali, text=grup_baslik, font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(4, 2))
+                    ctk.CTkLabel(kaydirmali, text=grup_baslik, font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(4, 2))
                     for ekran, aciklama in eslesenler:
                         def _ekrana_git(e=None, ad=ekran):
                             win.destroy()
@@ -7755,12 +9244,12 @@ class MainApp(ctk.CTkToplevel):
                         satir.pack(fill="x", padx=10, pady=3)
                         ic = ctk.CTkFrame(satir, fg_color="transparent")
                         ic.pack(fill="x", padx=10, pady=6)
-                        baslik_lbl = ctk.CTkLabel(ic, text=ekran, font=("Arial", 12, "bold"), anchor="w", width=210, wraplength=205, justify="left")
+                        baslik_lbl = ctk.CTkLabel(ic, text=ekran, font=("Segoe UI", 12, "bold"), anchor="w", width=210, wraplength=205, justify="left")
                         baslik_lbl.pack(side="left", anchor="n")
-                        aciklama_lbl = ctk.CTkLabel(ic, text=aciklama or "(açıklama eklenmemiş)", font=("Arial", 11), text_color=RENK_METIN_SOLUK,
+                        aciklama_lbl = ctk.CTkLabel(ic, text=aciklama or "(açıklama eklenmemiş)", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK,
                                                      anchor="w", wraplength=290, justify="left")
                         aciklama_lbl.pack(side="left", padx=(8, 0), fill="x", expand=True)
-                        ok_lbl = ctk.CTkLabel(ic, text="→", font=("Arial", 13, "bold"), text_color="#76CCE1", width=20)
+                        ok_lbl = ctk.CTkLabel(ic, text="→", font=("Segoe UI", 13, "bold"), text_color="#76CCE1", width=20)
                         ok_lbl.pack(side="right", anchor="n")
                         for widget in (satir, ic, baslik_lbl, aciklama_lbl, ok_lbl):
                             widget.bind("<Button-1>", _ekrana_git)
@@ -7800,11 +9289,11 @@ class MainApp(ctk.CTkToplevel):
                 grup_ekranlari = [e for e in grup_ekranlari if e in ekranlar]
                 if not grup_ekranlari:
                     continue
-                ctk.CTkLabel(konteyner, text=grup_baslik, font=("Arial", 12, "bold"),
+                ctk.CTkLabel(konteyner, text=grup_baslik, font=("Segoe UI", 12, "bold"),
                              text_color="#76CCE1", anchor="w").pack(fill="x", padx=12, pady=(10, 4))
                 for ekran_adi in grup_ekranlari:
                     btn = ctk.CTkButton(konteyner, text=ekran_adi, anchor="w", fg_color="transparent", hover_color=RENK_IKINCIL,
-                                         text_color=RENK_METIN, font=("Arial", 13), height=34, corner_radius=12,
+                                         text_color=RENK_METIN, font=("Segoe UI", 13), height=34, corner_radius=12,
                                          command=lambda a=ekran_adi: self.sekmeye_git(a))
                     btn.pack(fill="x", padx=(22, 8), pady=1)
                     self._sekme_butonlari[ekran_adi] = btn  # sekmeye_git'in aktif-vurgu mantığı YENİ butona işlesin diye
@@ -7816,11 +9305,21 @@ class MainApp(ctk.CTkToplevel):
 
         ekranlar = [e for e in self._kategori_sekmeleri.get(kategori_adi, []) if e != "🏠 Giriş" and e not in self._gizli_ekranlar]
 
+        # Giriş ekranındaki kategori kartlarıyla (init_giris_paneli) AYNI ikon+renkli
+        # rozet burada da kullanılıyor - önceden bu başlık düz metindi, üst bar/giriş
+        # ekranındaki logolu-rozetli görünümle tutarsızdı.
         ust = ctk.CTkFrame(frame, fg_color="transparent")
         ust.pack(fill="x", padx=30, pady=(28, 12))
-        ctk.CTkLabel(ust, text=kategori_adi, font=("Arial", 24, "bold"), text_color="#76CCE1").pack(anchor="w")
-        ctk.CTkLabel(ust, text=f"{len(ekranlar)} ekran - birine tıklayarak açabilirsin.",
-                     font=("Arial", 13), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(3, 0))
+        rozet_bg, rozet_fg = self._KATEGORI_ROZET_RENKLERI.get(kategori_adi, ((RENK_IKINCIL[0], RENK_IKINCIL[1]), ("#76CCE1", "#76CCE1")))
+        rozet = ctk.CTkFrame(ust, width=44, height=44, corner_radius=14, fg_color=rozet_bg)
+        rozet.pack(side="left", padx=(0, 14))
+        rozet.pack_propagate(False)
+        ctk.CTkLabel(rozet, text=self._KATEGORI_IKONLARI.get(kategori_adi, "📁"), font=("Segoe UI", 18), text_color=rozet_fg).pack(expand=True)
+        baslik_yazi = ctk.CTkFrame(ust, fg_color="transparent")
+        baslik_yazi.pack(side="left", fill="x")
+        ctk.CTkLabel(baslik_yazi, text=kategori_adi, font=("Segoe UI", 24, "bold"), text_color="#76CCE1").pack(anchor="w")
+        ctk.CTkLabel(baslik_yazi, text=f"{len(ekranlar)} ekran - birine tıklayarak açabilirsin.",
+                     font=("Segoe UI", 13), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(3, 0))
 
         govde = ctk.CTkScrollableFrame(frame, fg_color="transparent")
         govde.pack(fill="both", expand=True, padx=30, pady=(0, 20))
@@ -7843,14 +9342,14 @@ class MainApp(ctk.CTkToplevel):
                 kart = ctk.CTkFrame(stat_alani, fg_color=RENK_KART, corner_radius=18, border_width=2, border_color="#76CCE1")
                 kart.grid(row=0, column=i, padx=6, sticky="nsew")
                 stat_alani.grid_columnconfigure(i, weight=1)
-                ctk.CTkLabel(kart, text=stat["Etiket"], font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(pady=(14, 3), padx=14)
-                ctk.CTkLabel(kart, text=stat["Deger"], font=("Arial", 18, "bold"), text_color=RENK_METIN).pack(pady=(0, 14), padx=14)
+                ctk.CTkLabel(kart, text=stat["Etiket"], font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(pady=(14, 3), padx=14)
+                ctk.CTkLabel(kart, text=stat["Deger"], font=("Segoe UI", 18, "bold"), text_color=RENK_METIN).pack(pady=(0, 14), padx=14)
 
         if ozet and ozet.get("Grafik"):
             g = ozet["Grafik"]
             grafik_cerceve = ctk.CTkFrame(govde, fg_color=RENK_KART, corner_radius=18)
             grafik_cerceve.pack(fill="x", pady=(0, 15))
-            ctk.CTkLabel(grafik_cerceve, text=g.get("Baslik", ""), font=("Arial", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(10, 4))
+            ctk.CTkLabel(grafik_cerceve, text=g.get("Baslik", ""), font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(10, 4))
             grafik_alani = ctk.CTkFrame(grafik_cerceve, fg_color="transparent", height=200)
             grafik_alani.pack(fill="both", expand=True, padx=12, pady=(0, 12))
             self._modul_grafik_ciz(grafik_alani, g)
@@ -7863,13 +9362,13 @@ class MainApp(ctk.CTkToplevel):
             if not grup_ekranlari:
                 continue
             gruplanan.update(grup_ekranlari)
-            ctk.CTkLabel(govde, text=grup_baslik, font=("Arial", 14, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(6, 6))
+            ctk.CTkLabel(govde, text=grup_baslik, font=("Segoe UI", 14, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(6, 6))
             self._ekran_kart_izgarasi_ciz(govde, grup_ekranlari)
 
         digerleri = [e for e in ekranlar if e not in gruplanan]
         if digerleri:
             if gruplar:
-                ctk.CTkLabel(govde, text="Diğer", font=("Arial", 14, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(6, 6))
+                ctk.CTkLabel(govde, text="Diğer", font=("Segoe UI", 14, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(6, 6))
             self._ekran_kart_izgarasi_ciz(govde, digerleri)
 
     def _ekran_kart_izgarasi_ciz(self, ust_widget, sekme_adlari):
@@ -7882,7 +9381,7 @@ class MainApp(ctk.CTkToplevel):
             kart.grid(row=satir, column=sutun, padx=8, pady=8, sticky="nsew")
             kart.grid_propagate(False)
             kart_alani.grid_columnconfigure(sutun, weight=1)
-            etiket = ctk.CTkLabel(kart, text=sekme_adi, font=("Arial", 13, "bold"), text_color=RENK_METIN, wraplength=200)
+            etiket = ctk.CTkLabel(kart, text=sekme_adi, font=("Segoe UI", 13, "bold"), text_color=RENK_METIN, wraplength=200)
             etiket.pack(expand=True, padx=12, pady=10)
 
             def _hover_gir(e, k=kart):
@@ -7907,6 +9406,12 @@ class MainApp(ctk.CTkToplevel):
         if g.get("Tip") == "pasta" and degerler:
             RENKLER = ["#76CCE1", "#5585EF", "#45C89D", "#9965F1", "#F36D6D", "#F7B341"]
             fig, ax = plt.subplots(figsize=(5, 2.6), facecolor=grafik_bg)
+            # ÖNEMLİ: alttaki çizgi/bar grafik dalı ax.set_facecolor çağırıyordu, bu
+            # pasta dalı ise ÇAĞIRMIYORDU - figürün facecolor'ı (yukarıdaki satır)
+            # sadece dış kenarlığı boyar, ekseni (ax) KAPLAMAZ; matplotlib'in
+            # varsayılan eksen arka planı burada koyu kalıyordu, açık modda bile
+            # pasta grafiğin arkası siyah görünüyordu.
+            ax.set_facecolor(grafik_bg)
             ax.pie(degerler, autopct="%1.0f%%", colors=RENKLER[:len(degerler)],
                    textprops={"color": "white", "fontsize": 9, "weight": "bold"}, pctdistance=0.75)
             ax.legend(etiketler, loc="upper center", bbox_to_anchor=(0.5, -0.05), fontsize=7,
@@ -7931,19 +9436,61 @@ class MainApp(ctk.CTkToplevel):
         canvas.get_tk_widget().pack(fill="both", expand=True)
         plt.close(fig)
 
+    def _nav_gecmise_ekle(self):
+        """Şu an gösterilmekte olan ekranı (sekme ya da modül özeti) geri gitme
+        geçmişine ekler - yeni bir ekrana geçmeden HEMEN ÖNCE çağrılmalı."""
+        if self._modul_modu_aktif is not None:
+            durum = ("modul", self._modul_modu_aktif)
+        elif self._aktif_sekme_adi is not None:
+            durum = ("sekme", self._aktif_sekme_adi)
+        else:
+            return
+        if self._nav_gecmisi and self._nav_gecmisi[-1] == durum:
+            return
+        self._nav_gecmisi.append(durum)
+        if len(self._nav_gecmisi) > 50:
+            del self._nav_gecmisi[0]
+
+    def _mouse_buton_kontrol(self, event):
+        if getattr(event, "num", None) in (8, 9):
+            self.mouse_geri_git(event)
+
+    def mouse_geri_git(self, event=None):
+        """Fare 'geri' tuşuna (tarayıcılardaki gibi) basılınca bir önceki ekrana
+        döner. Windows/X11'de bu tuş Tk'ye Button-8 olarak gelir."""
+        if not self._nav_gecmisi:
+            return
+        tur, deger = self._nav_gecmisi.pop()
+        self._nav_geri_ileri_calisiyor = True
+        try:
+            if tur == "modul":
+                self.modul_moduna_gir(deger)
+            else:
+                self.sekmeye_git(deger)
+        finally:
+            self._nav_geri_ileri_calisiyor = False
+
     def ana_ekrana_don(self):
         """Tüm kategorileri tekrar açar (Giriş panelinin varsayılan hali) ve Giriş
         panelini gösterir - modul_moduna_gir'in tersi."""
+        if not self._nav_geri_ileri_calisiyor:
+            self._nav_gecmise_ekle()
         for kat_adi in self._kategori_durumlari:
             self._kategori_ac_kapa_ayarla(kat_adi, True)
         self._sidebar_yeniden_diz_fn()
         self._modul_modu_aktif = None
-        self.sekmeye_git("🏠 Giriş")
+        self._nav_geri_ileri_calisiyor = True
+        try:
+            self.sekmeye_git("🏠 Giriş")
+        finally:
+            self._nav_geri_ileri_calisiyor = False
 
     def sekmeye_git(self, ad):
         frame = self._sekme_kayitlari.get(ad)
         if frame is None:
             return  # bu kullanıcının rolünde olmayan bir sekme - sessizce yoksay
+        if not self._nav_geri_ileri_calisiyor:
+            self._nav_gecmise_ekle()
         # ÖNCE sekmeyi öne al ve buton vurgusunu güncelle (tıklama ANINDA tepki
         # versin diye) - ekran ilk kez açılıyorsa asıl (yavaş olabilecek) inşa/veri
         # çekme işlemi SONRA yapılır. Aksi halde tıklama, hiçbir görsel geri bildirim
@@ -7962,13 +9509,13 @@ class MainApp(ctk.CTkToplevel):
             onceki_btn = self._sekme_butonlari.get(onceki_aktif_ad)
             if onceki_btn is not None:
                 try:
-                    onceki_btn.configure(fg_color="transparent", text_color=RENK_METIN, font=("Arial", 12, "normal"))
+                    onceki_btn.configure(fg_color="transparent", text_color=RENK_METIN, font=("Segoe UI", 12, "normal"))
                 except Exception:
                     pass
         yeni_btn = self._sekme_butonlari.get(ad)
         if yeni_btn is not None:
             try:
-                yeni_btn.configure(fg_color="#76CCE1", text_color=RENK_TABAN, font=("Arial", 12, "bold"))
+                yeni_btn.configure(fg_color="#76CCE1", text_color=RENK_TABAN, font=("Segoe UI", 12, "bold"))
             except Exception:
                 pass
         self._aktif_sekme_adi = ad
@@ -8138,11 +9685,11 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.get(f"{API}/bildirimler", headers=self.req_headers(), timeout=6)
             if res.status_code != 200:
-                ctk.CTkLabel(self._giris_ozet_govde, text="Özet yüklenemedi.", font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
+                ctk.CTkLabel(self._giris_ozet_govde, text="Özet yüklenemedi.", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
                 return
             veri = res.json()
         except requests.exceptions.RequestException:
-            ctk.CTkLabel(self._giris_ozet_govde, text="Sunucuya ulaşılamadı.", font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
+            ctk.CTkLabel(self._giris_ozet_govde, text="Sunucuya ulaşılamadı.", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(anchor="w")
             return
 
         parcalar = []
@@ -8161,15 +9708,15 @@ class MainApp(ctk.CTkToplevel):
 
         if not parcalar:
             ctk.CTkLabel(self._giris_ozet_govde, text="✅ Dikkat edilmesi gereken bir şey yok, her şey yolunda.",
-                         font=("Arial", 12), text_color="#45C89D").pack(anchor="w")
+                         font=("Segoe UI", 12), text_color="#45C89D").pack(anchor="w")
             return
 
         rozet_satiri = ctk.CTkFrame(self._giris_ozet_govde, fg_color="transparent")
         rozet_satiri.pack(fill="x", anchor="w")
         for metin, renk in parcalar:
-            ctk.CTkLabel(rozet_satiri, text=metin, font=("Arial", 12, "bold"), text_color=renk).pack(side="left", padx=(0, 18), pady=2, anchor="w")
+            ctk.CTkLabel(rozet_satiri, text=metin, font=("Segoe UI", 12, "bold"), text_color=renk).pack(side="left", padx=(0, 18), pady=2, anchor="w")
         ctk.CTkButton(self._giris_ozet_govde, text="Tümünü Gör →", fg_color="transparent", hover_color=RENK_IKINCIL,
-                      text_color="#76CCE1", font=("Arial", 11, "bold"), height=24, width=100, anchor="w",
+                      text_color="#76CCE1", font=("Segoe UI", 11, "bold"), height=24, width=100, anchor="w",
                       command=self.bildirim_penceresi_ac).pack(anchor="w", pady=(6, 0))
 
     def bildirimleri_kontrol_et(self, ilk_giris_uyarisi=None):
@@ -8233,55 +9780,67 @@ class MainApp(ctk.CTkToplevel):
         win.grab_set()
         win.transient(self)
 
-        ctk.CTkLabel(win, text="🔔 Dikkat Edilmesi Gerekenler", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        ctk.CTkLabel(win, text="🔔 Dikkat Edilmesi Gerekenler", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
         kaydirmali = ctk.CTkScrollableFrame(win, width=470, height=430, fg_color=RENK_KART)
         kaydirmali.pack(padx=15, pady=(0, 15), fill="both", expand=True)
 
         bos = True
         if veri["kritik_stok"]:
             bos = False
-            ctk.CTkLabel(kaydirmali, text="⚠️ Kritik Stok", font=("Arial", 13, "bold"), text_color="#F36D6D").pack(anchor="w", pady=(5, 3))
+            ctk.CTkLabel(kaydirmali, text="⚠️ Kritik Stok", font=("Segoe UI", 13, "bold"), text_color="#F36D6D").pack(anchor="w", pady=(5, 3))
             for s in veri["kritik_stok"]:
                 ctk.CTkLabel(kaydirmali, text=f"  • {s['StokAdi']} ({s['StokKod']}) — Mevcut: {s['MevcutMiktar']}",
-                             font=("Arial", 11), anchor="w").pack(anchor="w")
+                             font=("Segoe UI", 11), anchor="w").pack(anchor="w")
 
         if veri["yaklasan_evrak"]:
             bos = False
-            ctk.CTkLabel(kaydirmali, text="📅 Vadesi Yaklaşan Çek/Senet (7 gün)", font=("Arial", 13, "bold"), text_color="#F7B341").pack(anchor="w", pady=(15, 3))
+            ctk.CTkLabel(kaydirmali, text="📅 Vadesi Yaklaşan Çek/Senet (7 gün)", font=("Segoe UI", 13, "bold"), text_color="#F7B341").pack(anchor="w", pady=(15, 3))
             for e in veri["yaklasan_evrak"]:
                 ctk.CTkLabel(kaydirmali, text=f"  • {e['EvrakTipi']} #{e['EvrakNo']} — {e['Tutar']:,.2f} TL — Vade: {e['VadeTarihi']}",
-                             font=("Arial", 11), anchor="w").pack(anchor="w")
+                             font=("Segoe UI", 11), anchor="w").pack(anchor="w")
 
         if veri["gecikmis_cari"]:
             bos = False
-            ctk.CTkLabel(kaydirmali, text="💸 Gecikmiş Görünen Cari Bakiyeler (30+ gün)", font=("Arial", 13, "bold"), text_color="#BAA5FB").pack(anchor="w", pady=(15, 3))
+            ctk.CTkLabel(kaydirmali, text="💸 Gecikmiş Görünen Cari Bakiyeler (30+ gün)", font=("Segoe UI", 13, "bold"), text_color="#BAA5FB").pack(anchor="w", pady=(15, 3))
             for c in veri["gecikmis_cari"]:
                 ctk.CTkLabel(kaydirmali, text=f"  • {c['FirmaAdi']} — Bakiye: {c['NetBakiye']:,.2f} TL",
-                             font=("Arial", 11), anchor="w").pack(anchor="w")
+                             font=("Segoe UI", 11), anchor="w").pack(anchor="w")
 
         if veri.get("yaklasan_arac_belgesi"):
             bos = False
-            ctk.CTkLabel(kaydirmali, text="🚚 Yaklaşan Araç Muayene/Sigorta (30 gün)", font=("Arial", 13, "bold"), text_color="#64CCFA").pack(anchor="w", pady=(15, 3))
+            ctk.CTkLabel(kaydirmali, text="🚚 Yaklaşan Araç Muayene/Sigorta (30 gün)", font=("Segoe UI", 13, "bold"), text_color="#64CCFA").pack(anchor="w", pady=(15, 3))
             for a in veri["yaklasan_arac_belgesi"]:
                 ctk.CTkLabel(kaydirmali, text=f"  • {a['Plaka']} — {a['Tur']} — {a['Tarih']}",
-                             font=("Arial", 11), anchor="w").pack(anchor="w")
+                             font=("Segoe UI", 11), anchor="w").pack(anchor="w")
 
         if veri.get("yaklasan_yasal_takvim"):
             bos = False
-            ctk.CTkLabel(kaydirmali, text="📆 Yaklaşan Yasal Bildirim Tarihleri (7 gün)", font=("Arial", 13, "bold"), text_color="#F36D6D").pack(anchor="w", pady=(15, 3))
+            ctk.CTkLabel(kaydirmali, text="📆 Yaklaşan Yasal Bildirim Tarihleri (7 gün)", font=("Segoe UI", 13, "bold"), text_color="#F36D6D").pack(anchor="w", pady=(15, 3))
             for y in veri["yaklasan_yasal_takvim"]:
                 ctk.CTkLabel(kaydirmali, text=f"  • {y['BeyanTuru']} — Son Tarih: {y['SonTarih']}",
-                             font=("Arial", 11), anchor="w").pack(anchor="w")
+                             font=("Segoe UI", 11), anchor="w").pack(anchor="w")
 
         if veri.get("yaklasan_anlasma"):
             bos = False
-            ctk.CTkLabel(kaydirmali, text="🤝 Süresi Dolan/Yaklaşan Müşteri Anlaşmaları (14 gün)", font=("Arial", 13, "bold"), text_color="#9965F1").pack(anchor="w", pady=(15, 3))
+            ctk.CTkLabel(kaydirmali, text="🤝 Süresi Dolan/Yaklaşan Müşteri Anlaşmaları (14 gün)", font=("Segoe UI", 13, "bold"), text_color="#9965F1").pack(anchor="w", pady=(15, 3))
             for m in veri["yaklasan_anlasma"]:
                 ctk.CTkLabel(kaydirmali, text=f"  • {m['FirmaAdi']} — {m['UrunGrubu']} — %{m['IskontoYuzdesi']:g} — Bitiş: {m['BitisTarihi']}",
-                             font=("Arial", 11), anchor="w").pack(anchor="w")
+                             font=("Segoe UI", 11), anchor="w").pack(anchor="w")
 
         if bos:
-            ctk.CTkLabel(kaydirmali, text="Şu an dikkat edilmesi gereken bir durum yok. 👍", font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(pady=20)
+            ctk.CTkLabel(kaydirmali, text="Şu an dikkat edilmesi gereken bir durum yok. 👍", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(pady=20)
+
+    def _pencere_ortala(self, pencere, genislik, yukseklik):
+        """Bir CTkToplevel'i ekranın ortasında, verilen minimum genişlik/yükseklikte
+        açar - popup'ların ekranın rastgele bir köşesinde küçük belirmesini önler.
+        Tüm yeni-kayıt popup'larında geometry(...) yerine bu kullanılmalı."""
+        pencere.update_idletasks()
+        ekran_genislik = pencere.winfo_screenwidth()
+        ekran_yukseklik = pencere.winfo_screenheight()
+        x = (ekran_genislik - genislik) // 2
+        y = (ekran_yukseklik - yukseklik) // 2
+        pencere.geometry(f"{genislik}x{yukseklik}+{x}+{y}")
+        pencere.minsize(genislik, yukseklik)
 
     def api_hata_goster(self, res):
         if res.status_code == 401:
@@ -8327,7 +9886,7 @@ class MainApp(ctk.CTkToplevel):
         cerceve.pack(fill="both", expand=True)
         for ad in eslesmeler:
             satir = ctk.CTkButton(cerceve, text=ad, anchor="w", fg_color="transparent", hover_color=gecerli_renk(RENK_IKINCIL),
-                                   height=30, font=("Arial", 12),
+                                   height=30, font=("Segoe UI", 12),
                                    command=lambda a=ad: self._komut_paleti_secildi(a))
             satir.pack(fill="x", padx=2, pady=1)
         self._komut_paleti_penceresi = pencere
@@ -8371,15 +9930,65 @@ class MainApp(ctk.CTkToplevel):
             self.sekmeye_git("🏢 Müşteri CRM")
             self.c_id.delete(0, "end")
             self.c_id.insert(0, query)
+            musteri = next((m for m in self._mus_veri_cache if str(m["MusteriID"]) == str(query)), None)
+            self.crm_detay_baslik.configure(text=f"🏢 {musteri['FirmaAdi']}" if musteri else "Müşteri")
             self.cari_bakiye_goster()
+            self.crm_detay_goster()
+            self.search_box.delete(0, "end")
+            return
+
+        # 3) Sayısal değilse müşteri firma adında ara (CRM sekmesi hiç açılmamış
+        # olabilir - önbellek boş kalır diye doğrudan API'den çekiyoruz).
+        try:
+            res = requests.get(f"{API}/musteri-listesi", headers=self.req_headers(), timeout=5)
+            musteriler = res.json().get("musteriler", [])
+        except Exception:
+            musteriler = []
+        mus_eslesmeleri = [m for m in musteriler if query_temiz in m["FirmaAdi"].lower()]
+        if mus_eslesmeleri:
+            musteri = mus_eslesmeleri[0] if len(mus_eslesmeleri) == 1 else min(mus_eslesmeleri, key=lambda m: len(m["FirmaAdi"]))
+            self.sekmeye_git("🏢 Müşteri CRM")
+            self.c_id.delete(0, "end")
+            self.c_id.insert(0, musteri["MusteriID"])
+            self.crm_detay_baslik.configure(text=f"🏢 {musteri['FirmaAdi']}")
+            self.cari_bakiye_goster()
+            self.crm_detay_goster()
             self.search_box.delete(0, "end")
             return
 
         messagebox.showwarning("Arama Sonucu", f"'{query}' ile eşleşen bir ekran ya da müşteri bulunamadı.")
 
     def init_finans(self):
-        finans_frame = ctk.CTkFrame(self.tab_finans, fg_color="transparent")
-        finans_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        self.finans_dashboard_govde = ctk.CTkFrame(self.tab_finans, fg_color="transparent")
+        self.finans_banka_form_govde = ctk.CTkFrame(self.tab_finans, fg_color="transparent")
+        self.finans_cek_form_govde = ctk.CTkFrame(self.tab_finans, fg_color="transparent")
+        self._finans_dashboard_olustur()
+        self._finans_banka_form_olustur()
+        self._finans_cek_form_olustur()
+        self.finans_dashboard_goster()
+
+    def finans_dashboard_goster(self):
+        self.finans_banka_form_govde.pack_forget()
+        self.finans_cek_form_govde.pack_forget()
+        self.finans_dashboard_govde.pack(fill="both", expand=True)
+
+    def finans_banka_form_goster(self):
+        self.finans_dashboard_govde.pack_forget()
+        self.finans_cek_form_govde.pack_forget()
+        for e in (self.b_ad, self.b_sube, self.b_iban):
+            e.delete(0, "end")
+        self.finans_banka_form_govde.pack(fill="both", expand=True)
+
+    def finans_cek_form_goster(self):
+        self.finans_dashboard_govde.pack_forget()
+        self.finans_banka_form_govde.pack_forget()
+        for e in (self.cs_no, self.cs_tutar, self.cs_vade, self.cs_banka):
+            e.delete(0, "end")
+        self._finans_cek_musteri_secim_yukle()
+        self.finans_cek_form_govde.pack(fill="both", expand=True)
+
+    def _finans_dashboard_olustur(self):
+        finans_frame = self.finans_dashboard_govde
 
         ust_frame = ctk.CTkFrame(finans_frame, fg_color="transparent")
         ust_frame.pack(fill="x", pady=(0, 10))
@@ -8388,30 +9997,24 @@ class MainApp(ctk.CTkToplevel):
 
         banka_sol = ctk.CTkFrame(ust_frame, fg_color=RENK_KART, corner_radius=12)
         banka_sol.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        ctk.CTkLabel(banka_sol, text="Banka Hesapları", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
-        
-        hesap_ekle_frame = ctk.CTkFrame(banka_sol, fg_color="transparent")
-        hesap_ekle_frame.pack(fill="x", padx=10, pady=5)
-        self.b_ad = ctk.CTkEntry(hesap_ekle_frame, placeholder_text="Banka Adı", width=120)
-        self.b_ad.pack(side="left", padx=2)
-        self.b_sube = ctk.CTkEntry(hesap_ekle_frame, placeholder_text="Şube", width=100)
-        self.b_sube.pack(side="left", padx=2)
-        self.b_iban = ctk.CTkEntry(hesap_ekle_frame, placeholder_text="IBAN", width=160)
-        self.b_iban.pack(side="left", padx=2)
-        ctk.CTkButton(hesap_ekle_frame, text="Hesap Ekle", width=60, command=self.banka_hesap_ekle_islem).pack(side="left", padx=2)
+        banka_sol_ust = ctk.CTkFrame(banka_sol, fg_color="transparent")
+        banka_sol_ust.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(banka_sol_ust, text="Banka Hesapları", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(banka_sol_ust, text="+ Yeni Banka Hesabı", fg_color="#49B772", hover_color="#3E9C61", width=150,
+                      command=self.finans_banka_form_goster).pack(side="right")
 
-        hb_cerceve, self.banka_tree = tablo_olustur(banka_sol, ["ID", "Banka", "Şube", "IBAN", "Bakiye"], [40, 120, 100, 200, 100], height=4)
-        hb_cerceve.pack(fill="both", expand=True, padx=10, pady=5)
+        self.banka_tree = OzelTablo(banka_sol, ["ID", "Banka", "Şube", "IBAN", "Bakiye"], [40, 120, 100, 200, 100], height=4)
+        self.banka_tree.pack(fill="both", expand=True, padx=10, pady=5)
         ctk.CTkButton(banka_sol, text="🏦 Banka Mutabakatı", fg_color="#64CCFA", hover_color="#55ADD5",
                       command=self.banka_mutabakat_penceresi_ac).pack(fill="x", padx=10, pady=(0, 10))
 
         banka_sag = ctk.CTkFrame(ust_frame, fg_color=RENK_KART, corner_radius=12)
         banka_sag.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        ctk.CTkLabel(banka_sag, text="Banka Hareketi İşle (Havale/EFT)", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
+        ctk.CTkLabel(banka_sag, text="Banka Hareketi İşle (Havale/EFT)", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
         
         h_form = ctk.CTkFrame(banka_sag, fg_color="transparent")
         h_form.pack(fill="x", padx=10, pady=5)
-        self.bh_hesap = ctk.CTkEntry(h_form, placeholder_text="Hesap ID", width=80)
+        self.bh_hesap = ctk.CTkOptionMenu(h_form, values=["(Hesap yükleniyor...)"], width=170)
         self.bh_hesap.grid(row=0, column=0, padx=5, pady=5)
         self.bh_tur = ctk.CTkOptionMenu(h_form, values=["Gelen Havale", "Giden Havale"], width=130)
         self.bh_tur.grid(row=0, column=1, padx=5, pady=5)
@@ -8425,15 +10028,22 @@ class MainApp(ctk.CTkToplevel):
             fg_color="#42ACA2", 
             hover_color="#38928A", 
             text_color="black",
-            font=("Arial", 12, "bold"),
+            font=("Segoe UI", 12, "bold"),
             height=35,
             command=self.demirbas_penceresi_ac
         ).grid(row=6, column=0, columnspan=2, sticky="we", padx=10, pady=(5, 10))
         
-        self.bh_cari = ctk.CTkEntry(h_form, placeholder_text="Müşteri/Ted. ID", width=120)
-        self.bh_cari.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=5)
-        self.bh_ack = ctk.CTkEntry(h_form, placeholder_text="Açıklama", width=200)
-        self.bh_ack.grid(row=1, column=1, columnspan=2, sticky="e", padx=5, pady=5)
+        # Cari seçimi - Gelen Havale (para girişi) genelde bir müşteriden, Giden Havale
+        # (para çıkışı) genelde bir tedarikçiye/karşı tarafa gider; hangi tür seçilirse
+        # o listeden (ID yazmak yerine anahtarla) seçim yapılır. "Yok" bırakılırsa
+        # eskisi gibi tanımsız/genel bir kayıt olarak işlenir.
+        self.bh_cari_turu = ctk.CTkOptionMenu(h_form, values=["Yok", "Müşteri", "Tedarikçi"], width=100,
+                                               command=self._banka_hareket_cari_turu_degisti)
+        self.bh_cari_turu.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.bh_cari = ctk.CTkOptionMenu(h_form, values=["(Önce cari türü seçin)"], width=220)
+        self.bh_cari.grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky="w")
+        self.bh_ack = ctk.CTkEntry(h_form, placeholder_text="Açıklama", width=320)
+        self.bh_ack.grid(row=2, column=0, columnspan=3, sticky="we", padx=5, pady=5)
 
         # VİRMAN BUTONUNUN HEMEN ALTINA EKLEYEBİLİRSİN:
         ctk.CTkButton(
@@ -8450,38 +10060,155 @@ class MainApp(ctk.CTkToplevel):
         # YENİ VİRMAN BUTONU
         ctk.CTkButton(h_form, text="🔄 Hesaplar Arası Virman (Kasa/Banka)", fg_color="#9965F1", hover_color="#8256CD", command=self.virman_penceresi_ac).grid(row=3, column=0, columnspan=3, pady=(0, 10), sticky="we")
 
+        # Banka Hareketleri geçmişi - ÖNCEDEN bu hiç yoktu: Banka Hareketi İşle,
+        # Masraf, Kredi Taksidi gibi işlemler BankaHareketleri tablosuna yazıyordu ama
+        # bunu geri gösteren bir liste hiçbir zaman yapılmamıştı - kullanıcı sadece
+        # hesabın güncel Bakiye'sinin değiştiğini görüyor, işlemin kendisini (kime, ne
+        # zaman, ne kadar) hiçbir yerde bulamıyordu. Kasa Hareketleri ile aynı işlevi
+        # Banka için de sağlar.
+        hareket_frame = ctk.CTkFrame(finans_frame, fg_color=RENK_KART, corner_radius=12)
+        hareket_frame.pack(fill="both", expand=True, pady=(0, 10))
+        hareket_ust = ctk.CTkFrame(hareket_frame, fg_color="transparent")
+        hareket_ust.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(hareket_ust, text="Banka Hareketleri", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        self.bh_liste_hesap = ctk.CTkOptionMenu(hareket_ust, values=["(Hesap yükleniyor...)"], width=200,
+                                                 command=lambda _: self.banka_hareketlerini_yukle())
+        self.bh_liste_hesap.pack(side="left", padx=(15, 5))
+        self.bh_hareket_arama = ctk.CTkEntry(hareket_ust, placeholder_text="Ara (açıklama, işlem türü, cari)...", width=220)
+        self.bh_hareket_arama.pack(side="left", padx=5)
+        self.bh_hareket_arama.bind("<KeyRelease>", lambda e: self._bh_hareket_tree_render())
+        ctk.CTkButton(hareket_ust, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=90, command=self.banka_hareketlerini_yukle).pack(side="right")
+        ctk.CTkButton(hareket_ust, text="🚫 Seçileni İptal Et", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.secili_banka_hareketi_iptal_et).pack(side="right", padx=(0, 8))
+
+        self.bh_hareket_tree = OzelTablo(
+            hareket_frame, ["Tarih", "İşlem Türü", "Tutar", "Açıklama", "Müşteri", "Tedarikçi"],
+            [130, 110, 100, 260, 130, 130], height=6)
+        self.bh_hareket_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.bh_hareket_tree.tag_configure("iptal_edilmis", foreground=("#a1a1aa", "#71717a"))
+        self._bh_hareket_cache = []
+
         alt_frame = ctk.CTkFrame(finans_frame, fg_color=RENK_KART, corner_radius=12)
         alt_frame.pack(fill="both", expand=True)
-        ctk.CTkLabel(alt_frame, text="Çek ve Senet Portföyü", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
-
-        cek_form = ctk.CTkFrame(alt_frame, fg_color="transparent")
-        cek_form.pack(fill="x", padx=10, pady=5)
-        self.cs_tip = ctk.CTkOptionMenu(cek_form, values=["Müşteri Çeki", "Kendi Çekimiz", "Müşteri Senedi"])
-        self.cs_tip.grid(row=0, column=0, padx=5, pady=5)
-        self.cs_no = ctk.CTkEntry(cek_form, placeholder_text="Evrak No")
-        self.cs_no.grid(row=0, column=1, padx=5, pady=5)
-        self.cs_mus = ctk.CTkEntry(cek_form, placeholder_text="Alınan Müşteri ID")
-        self.cs_mus.grid(row=0, column=2, padx=5, pady=5)
-        self.cs_tutar = ctk.CTkEntry(cek_form, placeholder_text="Tutar")
-        self.cs_tutar.grid(row=0, column=3, padx=5, pady=5)
-        self.cs_vade = ctk.CTkEntry(cek_form, placeholder_text="Vade (YYYY-AA-GG)")
-        self.cs_vade.grid(row=0, column=4, padx=5, pady=5)
-        self.cs_banka = ctk.CTkEntry(cek_form, placeholder_text="Banka Bilgisi")
-        self.cs_banka.grid(row=0, column=5, padx=5, pady=5)
-        ctk.CTkButton(cek_form, text="Portföye Ekle", command=self.cek_senet_ekle_islem).grid(row=0, column=6, padx=5, pady=5)
+        cek_ust = ctk.CTkFrame(alt_frame, fg_color="transparent")
+        cek_ust.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(cek_ust, text="Çek ve Senet Portföyü", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(cek_ust, text="+ Yeni Çek/Senet", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.finans_cek_form_goster).pack(side="right")
 
         ciro_frame = ctk.CTkFrame(alt_frame, fg_color="transparent")
         ciro_frame.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(ciro_frame, text="Seçili Çeki Ciro Et -> Tedarikçi ID:").pack(side="left", padx=5)
-        self.cs_ciro_ted = ctk.CTkEntry(ciro_frame, width=80)
+        ctk.CTkLabel(ciro_frame, text="Seçili Çeki Ciro Et -> Tedarikçi:").pack(side="left", padx=5)
+        self.cs_ciro_ted = ctk.CTkOptionMenu(ciro_frame, values=["(Tedarikçi yükleniyor...)"], width=220)
         self.cs_ciro_ted.pack(side="left", padx=5)
         ctk.CTkButton(ciro_frame, text="Ciro İşlemini Tamamla", fg_color="#9965F1", hover_color="#8256CD", command=self.cek_senet_ciro_islem).pack(side="left", padx=5)
+        ctk.CTkButton(ciro_frame, text="💰 Seçili Evrakı Tahsil Et", fg_color="#49B772", hover_color="#3E9C61", command=self.cek_senet_tahsil_penceresi_ac).pack(side="left", padx=5)
+        ctk.CTkButton(ciro_frame, text="❌ Karşılıksız İşaretle", fg_color="#F36D6D", hover_color="#CF5D5D", command=self.cek_senet_karsiliksiz_islem).pack(side="left", padx=5)
         ctk.CTkButton(ciro_frame, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, command=self.finans_verilerini_yukle).pack(side="right", padx=5)
 
-        c_cerceve, self.cek_tree = tablo_olustur(alt_frame, ["Evrak ID", "Tip", "Evrak No", "Alınan Müşteri", "Ciro Edilen", "Tutar", "Vade", "Banka", "Durum"], [60, 100, 100, 150, 150, 100, 100, 120, 100], height=8)
-        c_cerceve.pack(fill="both", expand=True, padx=10, pady=5)
+        self.cek_tree = OzelTablo(alt_frame, ["Evrak ID", "Tip", "Evrak No", "Alınan Müşteri", "Ciro Edilen", "Tutar", "Vade", "Banka", "Durum"], [60, 100, 100, 150, 150, 100, 100, 120, 100], height=8, durum_kolonu="Durum")
+        self.cek_tree.pack(fill="both", expand=True, padx=10, pady=5)
 
+        self._banka_hareket_cari_turu_degisti("Yok")
         self.finans_verilerini_yukle()
+
+    def _finans_banka_form_olustur(self):
+        ust = ctk.CTkFrame(self.finans_banka_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.finans_dashboard_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="🏦 Yeni Banka Hesabı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Hesap Ekle", fg_color="#49B772", hover_color="#3E9C61", width=130, height=30,
+                      command=self.banka_hesap_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.finans_banka_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        self.b_ad = ctk.CTkEntry(satir, placeholder_text="Banka Adı", width=200)
+        self.b_ad.pack(side="left", padx=(0, 8))
+        self.b_sube = ctk.CTkEntry(satir, placeholder_text="Şube", width=180)
+        self.b_sube.pack(side="left", padx=(0, 8))
+        self.b_iban = ctk.CTkEntry(satir, placeholder_text="IBAN", width=260)
+        self.b_iban.pack(side="left")
+
+    def banka_hesap_ekle_islem(self):
+        try:
+            data = {"BankaAdi": self.b_ad.get(), "SubeAdi": self.b_sube.get(), "IbanNo": self.b_iban.get(), "Bakiye": 0.0}
+            res = requests.post(f"{API}/banka-hesap-ekle", json=data, headers=self.req_headers(), timeout=5)
+            if res.status_code == 200:
+                self.finans_verilerini_yukle()
+                self.finans_dashboard_goster()
+                messagebox.showinfo("Başarılı", "Banka hesabı eklendi.")
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Hata", "Sunucuya ulaşılamadı.")
+
+    def _finans_cek_form_olustur(self):
+        ust = ctk.CTkFrame(self.finans_cek_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.finans_dashboard_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="💳 Yeni Çek/Senet", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Portföye Ekle", fg_color="#49B772", hover_color="#3E9C61", width=150, height=30,
+                      command=self.cek_senet_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.finans_cek_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+
+        satir1 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir1.pack(fill="x", padx=15, pady=(15, 8))
+        self.cs_tip = ctk.CTkOptionMenu(satir1, values=["Müşteri Çeki", "Kendi Çekimiz", "Müşteri Senedi"], width=160)
+        self.cs_tip.pack(side="left", padx=(0, 8))
+        self.cs_no = ctk.CTkEntry(satir1, placeholder_text="Evrak No", width=140)
+        self.cs_no.pack(side="left", padx=(0, 8))
+        self.cs_mus = ctk.CTkOptionMenu(satir1, values=["(Seçilmedi - opsiyonel)"], width=220)
+        self.cs_mus.pack(side="left")
+
+        satir2 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir2.pack(fill="x", padx=15, pady=(0, 15))
+        self.cs_tutar = ctk.CTkEntry(satir2, placeholder_text="Tutar", width=120)
+        self.cs_tutar.pack(side="left", padx=(0, 8))
+        self.cs_vade = ctk.CTkEntry(satir2, placeholder_text="Vade (YYYY-AA-GG)", width=160)
+        self.cs_vade.pack(side="left", padx=(0, 8))
+        self.cs_banka = ctk.CTkEntry(satir2, placeholder_text="Banka Bilgisi", width=200)
+        self.cs_banka.pack(side="left")
+
+    def _finans_cek_musteri_secim_yukle(self):
+        try:
+            res = requests.get(f"{API}/musteri-listesi", headers=self.req_headers(), timeout=5)
+            musteriler = res.json().get("musteriler", []) if res.status_code == 200 else []
+        except Exception:
+            musteriler = []
+        secenekler = ["(Seçilmedi - opsiyonel)"] + [f"{m['MusteriID']} - {m['FirmaAdi']}" for m in musteriler]
+        self.cs_mus.configure(values=secenekler)
+        self.cs_mus.set(secenekler[0])
+
+    def cek_senet_ekle_islem(self):
+        try:
+            secili = self.cs_mus.get()
+            m_id = int(secili.split(" - ")[0]) if " - " in secili else None
+            data = {
+                "EvrakTipi": self.cs_tip.get(),
+                "EvrakNo": self.cs_no.get(),
+                "AlinanMusteriID": m_id,
+                "Tutar": float(self.cs_tutar.get()),
+                "VadeTarihi": self.cs_vade.get(),
+                "BankaBilgisi": self.cs_banka.get()
+            }
+            res = requests.post(f"{API}/cek-senet-ekle", json=data, headers=self.req_headers(), timeout=5)
+            if res.status_code == 200:
+                self.finans_verilerini_yukle()
+                self.finans_dashboard_goster()
+                messagebox.showinfo("Başarılı", "Çek/Senet portföye eklendi.")
+            else:
+                self.api_hata_goster(res)
+        except ValueError:
+            messagebox.showwarning("Hata", "Tutar sayısal olmalıdır.")
+        except Exception:
+            pass
 
     def banka_mutabakat_penceresi_ac(self):
         win = ctk.CTkToplevel(self)
@@ -8495,7 +10222,7 @@ class MainApp(ctk.CTkToplevel):
 
         ust = ctk.CTkFrame(win, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(20, 10))
-        ctk.CTkLabel(ust, text="🏦 Banka Mutabakatı", font=("Arial", 16, "bold"), text_color="#64CCFA").pack(side="left")
+        ctk.CTkLabel(ust, text="🏦 Banka Mutabakatı", font=("Segoe UI", 16, "bold"), text_color="#64CCFA").pack(side="left")
 
         secim_satiri = ctk.CTkFrame(win, fg_color="transparent")
         secim_satiri.pack(fill="x", padx=20, pady=(0, 10))
@@ -8519,10 +10246,10 @@ class MainApp(ctk.CTkToplevel):
         except requests.exceptions.RequestException:
             pass
 
-        oneri_cerceve, self.bm_oneri_tree = tablo_olustur(
+        self.bm_oneri_tree = OzelTablo(
             win, ["Ekstre ID", "Ekstre Tarih", "Ekstre Tutar", "Ekstre Açıklama", "Önerilen Hareket", "Hareket Tarih", "Hareket Tutar"],
             [70, 100, 100, 180, 100, 130, 100], height=14)
-        oneri_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self.bm_oneri_tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
         ctk.CTkButton(win, text="✅ Seçili Öneriyi Onayla", fg_color="#49B772", hover_color="#3E9C61",
                       command=self._banka_mutabakat_onayla_islem).pack(anchor="w", padx=20, pady=(0, 20))
@@ -8613,34 +10340,34 @@ class MainApp(ctk.CTkToplevel):
         kart = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=16, border_width=1, border_color=RENK_IKINCIL)
         kart.pack(fill="both", expand=True, padx=25, pady=25)
 
-        ctk.CTkLabel(kart, text="💳 POS / Kredi Kartı Fişi", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=(20, 15))
+        ctk.CTkLabel(kart, text="💳 POS / Kredi Kartı Fişi", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=(20, 15))
 
         # Girdi alanları
-        ctk.CTkLabel(kart, text="Müşteri (Cari) ID", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Müşteri (Cari) ID", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         mus_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 5", width=320, height=35)
         mus_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="İşlemin Yapıldığı Banka / POS Hesap ID", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="İşlemin Yapıldığı Banka / POS Hesap ID", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         banka_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 2", width=320, height=35)
         banka_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Brüt Tutar (TL)", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Brüt Tutar (TL)", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         tutar_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 10000", width=320, height=35)
         tutar_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Banka Komisyon Oranı (%)", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Banka Komisyon Oranı (%)", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         komisyon_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 2.5 (Varsayılan 0)", width=320, height=35)
         komisyon_entry.insert(0, "0.0")
         komisyon_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Açıklama / Fiş No", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Açıklama / Fiş No", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         ack_entry = ctk.CTkEntry(kart, placeholder_text="Örn: Tek çekim POS tahsilatı", width=320, height=35)
         ack_entry.pack(padx=20, pady=(0, 20))
         # Onay Butonu (Pencerenin en altında sabit durur, kaybolmaz)
         ctk.CTkButton(
             win, text="✅ Tahsilatı Onayla ve Kaydet", 
             fg_color="#45C89D", hover_color="#3BAA85", text_color=RENK_METIN,
-            font=("Arial", 13, "bold"), height=42,
+            font=("Segoe UI", 13, "bold"), height=42,
             command=lambda: self.pos_tahsilat_gonder(
                 mus_entry.get(), 
                 banka_entry.get(), 
@@ -8700,33 +10427,33 @@ class MainApp(ctk.CTkToplevel):
         kart = ctk.CTkFrame(win, fg_color=RENK_KART, corner_radius=16, border_width=1, border_color=RENK_IKINCIL)
         kart.pack(fill="both", expand=True, padx=25, pady=25)
 
-        ctk.CTkLabel(kart, text="🏢 Demirbaş / Sabit Kıymet Kartı", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=(20, 15))
+        ctk.CTkLabel(kart, text="🏢 Demirbaş / Sabit Kıymet Kartı", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=(20, 15))
 
-        ctk.CTkLabel(kart, text="Demirbaş Adı", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Demirbaş Adı", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         ad_entry = ctk.CTkEntry(kart, placeholder_text="Örn: Enjeksiyon Makinesi / PC", width=320, height=35)
         ad_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Kategori", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Kategori", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         kat_entry = ctk.CTkEntry(kart, placeholder_text="Örn: Makine Parkuru / Bilişim", width=320, height=35)
         kat_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Alış Tutarı (TL)", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Alış Tutarı (TL)", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         tutar_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 75000", width=320, height=35)
         tutar_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Seri No / Kod", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Seri No / Kod", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         seri_entry = ctk.CTkEntry(kart, placeholder_text="Örn: SN-998234", width=320, height=35)
         seri_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Açıklama", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Açıklama", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         ack_entry = ctk.CTkEntry(kart, placeholder_text="Örn: Üretim hattı 2 için alındı", width=320, height=35)
         ack_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Faydalı Ömür (Yıl, opsiyonel - amortisman için)", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Faydalı Ömür (Yıl, opsiyonel - amortisman için)", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         omur_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 5", width=320, height=35)
         omur_entry.pack(padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(kart, text="Lokasyon (opsiyonel)", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Lokasyon (opsiyonel)", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         lokasyon_entry = ctk.CTkEntry(kart, placeholder_text="Örn: Merkez / Şube 2", width=320, height=35)
         lokasyon_entry.pack(padx=20, pady=(0, 20))
 
@@ -8734,7 +10461,7 @@ class MainApp(ctk.CTkToplevel):
         kaydet_btn = ctk.CTkButton(
             kart, text="Demirbaşı Kaydet", 
             fg_color="#42ACA2", hover_color="#38928A", text_color="black", 
-            font=("Arial", 14, "bold"), height=40
+            font=("Segoe UI", 14, "bold"), height=40
         )
 
         # Saf demirbaş kayıt fonksiyonu (İçinde POS/Komisyon yok!)
@@ -8761,6 +10488,8 @@ class MainApp(ctk.CTkToplevel):
                 if res.status_code == 200:
                     messagebox.showinfo("Başarılı", "Demirbaş başarıyla kaydedildi.")
                     win.destroy()
+                    if hasattr(self, "demirbaslari_tabloya_yukle"):
+                        self.demirbaslari_tabloya_yukle()
                 else:
                     self.api_hata_goster(res)
                     kaydet_btn.configure(state="normal")
@@ -8785,14 +10514,14 @@ class MainApp(ctk.CTkToplevel):
         # Sağ taraftaki boş alanı dolduracak ana frame
         frame = self.tab_demirbas # veya yeni sekme yapısı nasıl kuruluyorsa
         
-        ctk.CTkLabel(frame, text="📋 Kayıtlı Demirbaşlar ve Sabit Kıymetler", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(pady=15, anchor="w", padx=20)
+        ctk.CTkLabel(frame, text="📋 Kayıtlı Demirbaşlar ve Sabit Kıymetler", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(pady=15, anchor="w", padx=20)
 
         liste_frame = ctk.CTkScrollableFrame(frame, fg_color=RENK_KART, corner_radius=16, border_width=1, border_color=RENK_IKINCIL)
         liste_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         basliklar = ["Demirbaş Adı", "Kategori", "Alış Tutarı", "Seri No", "Açıklama"]
         for col_idx, baslik in enumerate(basliklar):
-            lbl = ctk.CTkLabel(liste_frame, text=baslik, font=("Arial", 12, "bold"), text_color="#76CCE1")
+            lbl = ctk.CTkLabel(liste_frame, text=baslik, font=("Segoe UI", 12, "bold"), text_color="#76CCE1")
             lbl.grid(row=0, column=col_idx, padx=15, pady=10, sticky="w")
 
         try:
@@ -8803,15 +10532,15 @@ class MainApp(ctk.CTkToplevel):
                     ctk.CTkLabel(liste_frame, text="Henüz kayıtlı demirbaş bulunamadı.", text_color=RENK_METIN_SOLUK).grid(row=1, column=0, columnspan=5, pady=20)
                 else:
                     for row_idx, item in enumerate(demirbaslar, start=1):
-                        ctk.CTkLabel(liste_frame, text=item.get("DemirbasAdi", ""), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=0, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(liste_frame, text=item.get("Kategori", ""), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=1, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=item.get("DemirbasAdi", ""), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=0, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=item.get("Kategori", ""), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=1, padx=15, pady=8, sticky="w")
                         
                         tutar = item.get("AlisTutari", 0)
                         tutar_str = f"{tutar:,.2f} TL" if isinstance(tutar, (int, float)) else f"{tutar} TL"
-                        ctk.CTkLabel(liste_frame, text=tutar_str, font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=2, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=tutar_str, font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=2, padx=15, pady=8, sticky="w")
                         
-                        ctk.CTkLabel(liste_frame, text=item.get("SeriNo", "-"), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=3, padx=15, pady=8, sticky="w")
-                        ctk.CTkLabel(liste_frame, text=item.get("Aciklama", "-"), font=("Arial", 11), text_color=RENK_METIN).grid(row=row_idx, column=4, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=item.get("SeriNo", "-"), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=3, padx=15, pady=8, sticky="w")
+                        ctk.CTkLabel(liste_frame, text=item.get("Aciklama", "-"), font=("Segoe UI", 11), text_color=RENK_METIN).grid(row=row_idx, column=4, padx=15, pady=8, sticky="w")
             else:
                 self.api_hata_goster(res)
         except Exception as e:
@@ -8837,22 +10566,22 @@ class MainApp(ctk.CTkToplevel):
         kart.pack(fill="both", expand=True, padx=25, pady=25)
 
         # 1. Başlık
-        ctk.CTkLabel(kart, text="🔄 Virman (Transfer) İşlemi", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=(20, 15))
+        ctk.CTkLabel(kart, text="🔄 Virman (Transfer) İşlemi", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=(20, 15))
 
         # 2. Girdi alanları (Önce kutular oluşturuluyor ki fonksiyon bunları okuyabilsin)
-        ctk.CTkLabel(kart, text="Çıkış Yapılacak (Gönderen) Hesap ID", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Çıkış Yapılacak (Gönderen) Hesap ID", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         gonderen_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 1 (Kasa)", width=320, height=35)
         gonderen_entry.pack(padx=20, pady=(0, 12))
 
-        ctk.CTkLabel(kart, text="Giriş Yapılacak (Alan) Hesap ID", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Giriş Yapılacak (Alan) Hesap ID", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         alan_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 2 (Ziraat Bankası)", width=320, height=35)
         alan_entry.pack(padx=20, pady=(0, 12))
 
-        ctk.CTkLabel(kart, text="Transfer Tutarı (TL)", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Transfer Tutarı (TL)", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         tutar_entry = ctk.CTkEntry(kart, placeholder_text="Örn: 5000", width=320, height=35)
         tutar_entry.pack(padx=20, pady=(0, 12))
 
-        ctk.CTkLabel(kart, text="Açıklama", font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
+        ctk.CTkLabel(kart, text="Açıklama", font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20)
         ack_entry = ctk.CTkEntry(kart, placeholder_text="Örn: Kasadan Ziraat'e para yatırma", width=320, height=35)
         ack_entry.pack(padx=20, pady=(0, 20))
 
@@ -8893,7 +10622,7 @@ class MainApp(ctk.CTkToplevel):
             fg_color="#42ACA2", 
             hover_color="#38928A", 
             text_color="black", 
-            font=("Arial", 14, "bold"), 
+            font=("Segoe UI", 14, "bold"), 
             height=40, 
             command=virman_kaydet
         )
@@ -8901,75 +10630,47 @@ class MainApp(ctk.CTkToplevel):
 
         self.after(100, lambda: gonderen_entry.focus_set())
 
-    def banka_hesap_ekle_islem(self):
-        try:
-            data = {"BankaAdi": self.b_ad.get(), "SubeAdi": self.b_sube.get(), "IbanNo": self.b_iban.get(), "Bakiye": 0.0}
-            res = requests.post(f"{API}/banka-hesap-ekle", json=data, headers=self.req_headers(), timeout=5)
-            if res.status_code == 200:
-                self.b_ad.delete(0, 'end')
-                self.b_sube.delete(0, 'end')
-                self.b_iban.delete(0, 'end')
-                self.finans_verilerini_yukle()
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Hata", "Sunucuya ulaşılamadı.")
-
     def banka_hareket_islem(self):
         try:
+            hesap_secili = self.bh_hesap.get()
+            hesap_id = int(hesap_secili.split(" - ")[0])
+        except (ValueError, IndexError):
+            messagebox.showwarning("Hesap Seçilmedi", "Lütfen geçerli bir banka hesabı seçin.")
+            return
+        try:
             tur = self.bh_tur.get()
-            cari_str = self.bh_cari.get().strip()
             data = {
-                "HesapID": int(self.bh_hesap.get()),
+                "HesapID": hesap_id,
                 "IslemTuru": tur,
                 "Tutar": float(self.bh_tutar.get()),
                 "Aciklama": self.bh_ack.get()
             }
-            if cari_str:
-                if tur == "Gelen Havale":
-                    data["MusteriID"] = int(cari_str)
+            cari_turu = self.bh_cari_turu.get()
+            cari_secili = self.bh_cari.get()
+            if cari_turu != "Yok" and " - " in cari_secili:
+                cari_id_str, cari_ad = cari_secili.split(" - ", 1)
+                cari_id = int(cari_id_str)
+                if cari_turu == "Müşteri":
+                    data["MusteriID"] = cari_id
                 else:
-                    data["TedarikciID"] = int(cari_str)
+                    data["TedarikciID"] = cari_id
+                onek = f"{cari_turu} ({cari_ad}): "
+                if not data["Aciklama"].startswith(onek):
+                    data["Aciklama"] = f"{onek}{data['Aciklama']}" if data["Aciklama"] else onek.rstrip(": ")
 
             res = requests.post(f"{API}/banka-hareket-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.bh_hesap.delete(0, 'end')
                 self.bh_tutar.delete(0, 'end')
-                self.bh_cari.delete(0, 'end')
                 self.bh_ack.delete(0, 'end')
+                self.bh_cari_turu.set("Yok")
+                self._banka_hareket_cari_turu_degisti("Yok")
                 self.finans_verilerini_yukle()
                 self.tahsilatlari_yukle()
                 messagebox.showinfo("Başarılı", "Banka hareketi işlendi.")
             else:
                 self.api_hata_goster(res)
         except ValueError:
-            messagebox.showwarning("Hata", "Hesap ID, Tutar ve Cari ID sayısal olmalıdır.")
-        except Exception:
-            pass
-
-    def cek_senet_ekle_islem(self):
-        try:
-            m_id = self.cs_mus.get().strip()
-            data = {
-                "EvrakTipi": self.cs_tip.get(),
-                "EvrakNo": self.cs_no.get(),
-                "AlinanMusteriID": int(m_id) if m_id else None,
-                "Tutar": float(self.cs_tutar.get()),
-                "VadeTarihi": self.cs_vade.get(),
-                "BankaBilgisi": self.cs_banka.get()
-            }
-            res = requests.post(f"{API}/cek-senet-ekle", json=data, headers=self.req_headers(), timeout=5)
-            if res.status_code == 200:
-                self.cs_no.delete(0, 'end')
-                self.cs_mus.delete(0, 'end')
-                self.cs_tutar.delete(0, 'end')
-                self.cs_vade.delete(0, 'end')
-                self.cs_banka.delete(0, 'end')
-                self.finans_verilerini_yukle()
-            else:
-                self.api_hata_goster(res)
-        except ValueError:
-            messagebox.showwarning("Hata", "Tutar ve Müşteri ID (varsa) sayısal olmalıdır.")
+            messagebox.showwarning("Hata", "Tutar sayısal olmalıdır.")
         except Exception:
             pass
 
@@ -8979,34 +10680,175 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showinfo("Seçim Yok", "Lütfen ciro edilecek çeki seçin.")
             return
         evrak_id = self.cek_tree.item(secili[0])["values"][0]
-        ted_id = self.cs_ciro_ted.get().strip()
-        if not ted_id:
-            messagebox.showwarning("Hata", "Ciro edilecek Tedarikçi ID girilmelidir.")
+        ted_secili = self.cs_ciro_ted.get()
+        if " - " not in ted_secili:
+            messagebox.showwarning("Hata", "Ciro edilecek bir tedarikçi seçin.")
             return
-            
-        if not messagebox.askyesno("Onay", f"Evrak #{evrak_id}, Tedarikçi #{ted_id}'ye ciro edilecek. Onaylıyor musunuz?"):
+        ted_id = ted_secili.split(" - ")[0]
+
+        if not messagebox.askyesno("Onay", f"Evrak #{evrak_id}, \"{ted_secili}\" tedarikçisine ciro edilecek. Onaylıyor musunuz?"):
             return
-            
+
         try:
             data = {"EvrakID": int(evrak_id), "VerilenTedarikciID": int(ted_id)}
             res = requests.put(f"{API}/cek-senet-ciro", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.cs_ciro_ted.delete(0, 'end')
                 self.finans_verilerini_yukle()
             else:
                 self.api_hata_goster(res)
         except Exception:
             pass
 
+    def cek_senet_tahsil_penceresi_ac(self):
+        """ÖNCEDEN elimizdeki bir çek/senetin vadesi geldiğinde bankaya/kasaya tahsil
+        edilmesinin hiçbir karşılığı yoktu - evrak sonsuza kadar 'Portföyde' kalırdı."""
+        secili = self.cek_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen tahsil edilecek evrakı listeden seçin.")
+            return
+        vals = self.cek_tree.item(secili[0])["values"]
+        evrak_id, evrak_no, durum = vals[0], vals[2], vals[8]
+        if durum != "Portföyde":
+            messagebox.showwarning("İşlem Yapılamaz", f"Bu evrak zaten '{durum}' durumunda - sadece Portföyde olan evraklar tahsil edilebilir.")
+            return
+
+        try:
+            kasalar = requests.get(f"{API}/kasalar", headers=self.req_headers(), timeout=5).json().get("kasalar", [])
+        except Exception:
+            kasalar = []
+        try:
+            banka_hesaplari = requests.get(f"{API}/banka-hesaplari", headers=self.req_headers(), timeout=5).json().get("hesaplar", [])
+        except Exception:
+            banka_hesaplari = []
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title(f"Çek/Senet Tahsili: {evrak_no}")
+        pencere.geometry("400x220")
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="Nereye tahsil edilecek?", font=("Segoe UI", 12, "bold")).pack(padx=15, pady=(15, 5), anchor="w")
+        hedef_secim = ctk.CTkOptionMenu(pencere, values=(
+            [f"Kasa: {k['KasaID']} - {k['Ad']}" for k in kasalar] +
+            [f"Banka: {b['HesapID']} - {b['BankaAdi']}" for b in banka_hesaplari]
+        ) or ["(Kasa/Banka hesabı bulunamadı)"], width=340)
+        hedef_secim.pack(padx=15, pady=(0, 15))
+
+        def onayla():
+            secim = hedef_secim.get()
+            if ":" not in secim:
+                messagebox.showwarning("Hata", "Geçerli bir hedef seçin.")
+                return
+            hedef_tip_ham, kalan = secim.split(":", 1)
+            hedef_id = kalan.strip().split(" - ")[0]
+            hedef_tip = "Kasa" if hedef_tip_ham.strip() == "Kasa" else "Banka"
+            try:
+                res = requests.put(f"{API}/cek-senet-tahsil/{evrak_id}", json={"HedefTip": hedef_tip, "HedefID": int(hedef_id)},
+                                    headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.finans_verilerini_yukle()
+                    messagebox.showinfo("Başarılı", res.json()["mesaj"])
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="💰 Tahsil Et", fg_color="#49B772", hover_color="#3E9C61", command=onayla).pack()
+
+    def cek_senet_karsiliksiz_islem(self):
+        """ÖNCEDEN karşılıksız çıkan bir çek/senedin hiçbir karşılığı yoktu -
+        arayüz Durum listesi 'Karşılıksız'ı gösteriyordu ama üretecek yol yoktu."""
+        secili = self.cek_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen karşılıksız işaretlenecek evrakı listeden seçin.")
+            return
+        vals = self.cek_tree.item(secili[0])["values"]
+        evrak_id, evrak_no, durum = vals[0], vals[2], vals[8]
+        if durum != "Portföyde":
+            messagebox.showwarning("İşlem Yapılamaz", f"Bu evrak zaten '{durum}' durumunda - sadece Portföyde olan evraklar karşılıksız işaretlenebilir.")
+            return
+        aciklama = simpledialog.askstring("Karşılıksız İşaretle", f"{evrak_no} neden karşılıksız çıktı? (opsiyonel)")
+        if not messagebox.askyesno("Onay", f"{evrak_no} karşılıksız işaretlenecek - müşteri borcu yeniden açılacak. Emin misiniz?"):
+            return
+        try:
+            res = requests.put(f"{API}/cek-senet-karsiliksiz/{evrak_id}", json={"Aciklama": aciklama or ""}, headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                self.finans_verilerini_yukle()
+                messagebox.showinfo("Başarılı", res.json()["mesaj"])
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
     def finans_verilerini_yukle(self):
         try:
             res = requests.get(f"{API}/banka-hesaplari", headers=self.req_headers(), timeout=5)
+            hesaplar = res.json().get("hesaplar", []) if res.status_code == 200 else []
             for i in self.banka_tree.get_children():
                 self.banka_tree.delete(i)
-            for h in res.json().get("hesaplar", []):
+            for h in hesaplar:
                 self.banka_tree.insert("", "end", values=(h["HesapID"], h["BankaAdi"], h["SubeAdi"], h["IbanNo"], f"{h['Bakiye']:,.2f} TL"))
         except Exception:
-            pass
+            hesaplar = []
+
+        secenekler = [f"{h['HesapID']} - {h['BankaAdi']} {h.get('SubeAdi') or ''}".strip() for h in hesaplar] or ["(Kayıtlı banka hesabı yok)"]
+
+        if hasattr(self, "bh_hesap"):
+            self._bh_hesap_cache = hesaplar
+            mevcut = self.bh_hesap.get()
+            self.bh_hesap.configure(values=secenekler)
+            if mevcut not in secenekler:
+                self.bh_hesap.set(secenekler[0])
+
+        if hasattr(self, "bh_liste_hesap"):
+            mevcut_liste = self.bh_liste_hesap.get()
+            self.bh_liste_hesap.configure(values=secenekler)
+            if mevcut_liste not in secenekler:
+                self.bh_liste_hesap.set(secenekler[0])
+            self.banka_hareketlerini_yukle()
+
+    def banka_hareketlerini_yukle(self):
+        if not hasattr(self, "bh_hareket_tree"):
+            return
+        secili = self.bh_liste_hesap.get()
+        if " - " not in secili:
+            self._bh_hareket_cache = []
+            self._bh_hareket_tree_render()
+            return
+        hesap_id = secili.split(" - ")[0]
+        try:
+            res = requests.get(f"{API}/banka-hareketleri/{hesap_id}", headers=self.req_headers(), timeout=5)
+            self._bh_hareket_cache = res.json().get("hareketler", []) if res.status_code == 200 else []
+        except Exception:
+            self._bh_hareket_cache = []
+        self._bh_hareket_tree_render()
+
+    def _bh_hareket_tree_render(self):
+        if not hasattr(self, "bh_hareket_tree"):
+            return
+        for i in self.bh_hareket_tree.get_children():
+            self.bh_hareket_tree.delete(i)
+        arama = self.bh_hareket_arama.get().strip().lower() if hasattr(self, "bh_hareket_arama") else ""
+        for h in self._bh_hareket_cache:
+            if arama and arama not in str(h.get("Aciklama", "")).lower() and arama not in str(h.get("IslemTuru", "")).lower() \
+                    and arama not in str(h.get("Musteri", "")).lower() and arama not in str(h.get("Tedarikci", "")).lower():
+                continue
+            etiket = ("iptal_edilmis",) if h.get("Durum") == "İptal" else ()
+            self.bh_hareket_tree.insert("", "end", iid=str(h["HareketID"]), tags=etiket, values=(h["Tarih"], h["IslemTuru"], f"{h['Tutar']:,.2f}",
+                                                            h["Aciklama"], h["Musteri"], h["Tedarikci"]))
+
+    def secili_banka_hareketi_iptal_et(self):
+        secili = self.bh_hareket_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen iptal etmek istediğiniz hareketi listeden seçin.")
+            return
+        hareket_id = secili[0]
+        self._hareket_iptal_penceresi_ac(
+            f"Banka Hareketi İptal: #{hareket_id}", f"{API}/banka-hareket-iptal/{hareket_id}", self.banka_hareketlerini_yukle,
+            "⚠️ Bu hareket silinmez, 'İptal' olarak işaretlenir; banka hesap bakiyesi geri alınır ve ters (storno) bir muhasebe kaydı atılır.")
 
         try:
             res = requests.get(f"{API}/cek-senet-listesi", headers=self.req_headers(), timeout=5)
@@ -9018,16 +10860,112 @@ class MainApp(ctk.CTkToplevel):
         except Exception:
             pass
 
+        if hasattr(self, "cs_ciro_ted"):
+            try:
+                res = requests.get(f"{API}/tedarikci-listesi", headers=self.req_headers(), timeout=5)
+                tedarikciler = res.json().get("tedarikciler", []) if res.status_code == 200 else []
+            except Exception:
+                tedarikciler = []
+            secenekler = [f"{t['TedarikciID']} - {t['FirmaAdi']}" for t in tedarikciler] or ["(Kayıtlı tedarikçi yok)"]
+            mevcut = self.cs_ciro_ted.get()
+            self.cs_ciro_ted.configure(values=secenekler)
+            if mevcut not in secenekler:
+                self.cs_ciro_ted.set(secenekler[0])
+
+    def _banka_hareket_cari_turu_degisti(self, secim):
+        if secim == "Yok":
+            self.bh_cari.configure(values=["(Cari seçilmedi - genel kayıt)"])
+            self.bh_cari.set("(Cari seçilmedi - genel kayıt)")
+            return
+        try:
+            uc = "musteri-listesi" if secim == "Müşteri" else "tedarikci-listesi"
+            res = requests.get(f"{API}/{uc}", headers=self.req_headers(), timeout=5)
+            kayitlar = res.json() if res.status_code == 200 else []
+            if isinstance(kayitlar, dict):
+                kayitlar = kayitlar.get("musteriler") or kayitlar.get("tedarikciler") or []
+        except Exception:
+            kayitlar = []
+        id_alani = "MusteriID" if secim == "Müşteri" else "TedarikciID"
+        secenekler = [f"{k[id_alani]} - {k.get('FirmaAdi') or ''}".strip() for k in kayitlar] or [f"(Kayıtlı {secim.lower()} yok)"]
+        self.bh_cari.configure(values=secenekler)
+        self.bh_cari.set(secenekler[0])
+
     def init_uretim(self):
         self.gecici_bilesenler = []
-        
-        sol_frame = ctk.CTkFrame(self.tab_uretim, fg_color="transparent")
+        self.uretim_liste_govde = ctk.CTkFrame(self.tab_uretim, fg_color="transparent")
+        self.uretim_recete_form_govde = ctk.CTkFrame(self.tab_uretim, fg_color="transparent")
+        self.uretim_emir_form_govde = ctk.CTkFrame(self.tab_uretim, fg_color="transparent")
+        self._uretim_liste_olustur()
+        self._uretim_recete_form_olustur()
+        self._uretim_emir_form_olustur()
+        self.uretim_liste_goster()
+        self.uretim_verilerini_yukle()
+
+    def uretim_liste_goster(self):
+        self.uretim_recete_form_govde.pack_forget()
+        self.uretim_emir_form_govde.pack_forget()
+        self.uretim_liste_govde.pack(fill="both", expand=True)
+
+    def uretim_recete_form_goster(self):
+        self.uretim_liste_govde.pack_forget()
+        self.uretim_emir_form_govde.pack_forget()
+        for e in (self.u_mamul, self.u_aciklama, self.u_iscilik, self.u_ham, self.u_ham_mik, self.u_ham_fire):
+            e.delete(0, "end")
+        self.gecici_bilesenler = []
+        for i in self.bilesen_tree.get_children():
+            self.bilesen_tree.delete(i)
+        self.uretim_recete_form_govde.pack(fill="both", expand=True)
+
+    def uretim_emir_form_goster(self):
+        self.uretim_liste_govde.pack_forget()
+        self.uretim_recete_form_govde.pack_forget()
+        for e in (self.e_recete, self.e_mik):
+            e.delete(0, "end")
+        self.uretim_emir_form_govde.pack(fill="both", expand=True)
+
+    def _uretim_liste_olustur(self):
+        sol_frame = ctk.CTkFrame(self.uretim_liste_govde, fg_color="transparent")
         sol_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
 
-        ctk.CTkLabel(sol_frame, text="1. Yeni Üretim Reçetesi (BOM) Oluştur", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", pady=(0,5))
+        sol_ust = ctk.CTkFrame(sol_frame, fg_color="transparent")
+        sol_ust.pack(fill="x", pady=(0, 5))
+        ctk.CTkLabel(sol_ust, text="Kayıtlı Reçeteler (BOM)", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(sol_ust, text="+ Yeni Reçete", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.uretim_recete_form_goster).pack(side="right")
 
-        form_frame = ctk.CTkFrame(sol_frame, fg_color=RENK_KART, corner_radius=12)
-        form_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(sol_frame, text="İşçilik/Genel Gider'i değiştirmek için çift tıklayın", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(0, 5))
+        self.recete_tree = OzelTablo(sol_frame, ["ID", "Mamul Kodu", "Stok Adı", "İşçilik/Birim", "Tarih"], [50, 100, 160, 110, 100], height=15)
+        self.recete_tree.pack(fill="both", expand=True, pady=5)
+        self.recete_tree.bind("<Double-Button-1>", self.recete_iscilik_duzenle)
+
+        sag_frame = ctk.CTkFrame(self.uretim_liste_govde, fg_color="transparent")
+        sag_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+
+        sag_ust = ctk.CTkFrame(sag_frame, fg_color="transparent")
+        sag_ust.pack(fill="x", pady=(0, 5))
+        ctk.CTkLabel(sag_ust, text="Üretim İş Emirleri", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(sag_ust, text="+ Yeni İş Emri", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.uretim_emir_form_goster).pack(side="right")
+
+        buton_satiri = ctk.CTkFrame(sag_frame, fg_color="transparent")
+        buton_satiri.pack(fill="x", pady=(0, 5))
+        ctk.CTkButton(buton_satiri, text="✅ Seçili Emri Tamamla (Stokları Güncelle)", fg_color="#45C89D", hover_color="#3BAA85", command=self.uretim_tamamla_islem).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="🔄 Listeyi Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, command=self.uretim_verilerini_yukle).pack(side="left", padx=5)
+
+        self.emir_tree = OzelTablo(sag_frame, ["Emir ID", "Mamul Adı", "Miktar", "Durum", "Tarih"], [70, 180, 80, 100, 130], height=15, durum_kolonu="Durum")
+        self.emir_tree.pack(fill="both", expand=True, pady=5)
+
+    def _uretim_recete_form_olustur(self):
+        ust = ctk.CTkFrame(self.uretim_recete_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=10, pady=(10, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.uretim_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Üretim Reçetesi (BOM)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Reçeteyi Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=160, height=30,
+                      command=self.recete_kaydet).pack(side="right")
+
+        form_frame = ctk.CTkFrame(self.uretim_recete_form_govde, fg_color=RENK_KART, corner_radius=12)
+        form_frame.pack(fill="x", padx=10, pady=(0, 10))
         self.u_mamul = ctk.CTkEntry(form_frame, placeholder_text="Mamul Stok Kodu")
         self.u_mamul.grid(row=0, column=0, padx=10, pady=10)
         self.u_aciklama = ctk.CTkEntry(form_frame, placeholder_text="Reçete Açıklaması", width=200)
@@ -9036,7 +10974,7 @@ class MainApp(ctk.CTkToplevel):
         self.u_iscilik.grid(row=0, column=2, padx=10, pady=10)
 
         bil_frame = ctk.CTkFrame(form_frame, fg_color=RENK_IKINCIL, corner_radius=8)
-        bil_frame.grid(row=1, column=0, columnspan=2, pady=10, padx=10, sticky="we")
+        bil_frame.grid(row=1, column=0, columnspan=3, pady=10, padx=10, sticky="we")
         ctk.CTkLabel(bil_frame, text="Hammaddeler:").grid(row=0, column=0, padx=5)
         self.u_ham = ctk.CTkEntry(bil_frame, placeholder_text="Hammadde Kodu", width=120)
         self.u_ham.grid(row=0, column=1, padx=5, pady=5)
@@ -9046,38 +10984,23 @@ class MainApp(ctk.CTkToplevel):
         self.u_ham_fire.grid(row=0, column=3, padx=5, pady=5)
         ctk.CTkButton(bil_frame, text="Bileşen Ekle", width=90, fg_color="#5585EF", hover_color="#4871CB", command=self.recete_bilesen_ekle).grid(row=0, column=4, padx=5)
 
-        b_cerceve, self.bilesen_tree = tablo_olustur(sol_frame, ["Hammadde Kodu", "Birim Miktar", "Fire %"], [150, 100, 100], height=4)
-        b_cerceve.pack(fill="x", pady=5)
+        self.bilesen_tree = OzelTablo(self.uretim_recete_form_govde, ["Hammadde Kodu", "Birim Miktar", "Fire %"], [150, 100, 100], height=6)
+        self.bilesen_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        ctk.CTkButton(sol_frame, text="💾 Reçeteyi Veritabanına Kaydet", fg_color="#49B772", hover_color="#3E9C61", command=self.recete_kaydet).pack(pady=10)
+    def _uretim_emir_form_olustur(self):
+        ust = ctk.CTkFrame(self.uretim_emir_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=10, pady=(10, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.uretim_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Üretim İş Emri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
 
-        ctk.CTkLabel(sol_frame, text="Kayıtlı Reçeteler (İşçilik/Genel Gider'i değiştirmek için çift tıklayın)", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(10,0))
-        r_cerceve, self.recete_tree = tablo_olustur(sol_frame, ["ID", "Mamul Kodu", "Stok Adı", "İşçilik/Birim", "Tarih"], [50, 100, 160, 110, 100], height=8)
-        r_cerceve.pack(fill="both", expand=True, pady=5)
-        self.recete_tree.bind("<Double-Button-1>", self.recete_iscilik_duzenle)
-
-        sag_frame = ctk.CTkFrame(self.tab_uretim, fg_color="transparent")
-        sag_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
-
-        ctk.CTkLabel(sag_frame, text="2. Üretim İş Emirleri", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", pady=(0,5))
-
-        emir_form = ctk.CTkFrame(sag_frame, fg_color=RENK_KART, corner_radius=12)
-        emir_form.pack(fill="x", pady=5)
+        emir_form = ctk.CTkFrame(self.uretim_emir_form_govde, fg_color=RENK_KART, corner_radius=12)
+        emir_form.pack(fill="x", padx=10, pady=(0, 10))
         self.e_recete = ctk.CTkEntry(emir_form, placeholder_text="Reçete ID (Listeden Bakınız)")
         self.e_recete.grid(row=0, column=0, padx=10, pady=10)
         self.e_mik = ctk.CTkEntry(emir_form, placeholder_text="Üretilecek Miktar")
         self.e_mik.grid(row=0, column=1, padx=10, pady=10)
         ctk.CTkButton(emir_form, text="Atölyeye Emir Ver", fg_color="#76CCE1", hover_color="#64ADBF", command=self.uretim_emri_ver_islem).grid(row=0, column=2, padx=10, pady=10)
-
-        buton_satiri = ctk.CTkFrame(sag_frame, fg_color="transparent")
-        buton_satiri.pack(fill="x", pady=10)
-        ctk.CTkButton(buton_satiri, text="✅ Seçili Emri Tamamla (Stokları Güncelle)", fg_color="#45C89D", hover_color="#3BAA85", command=self.uretim_tamamla_islem).pack(side="left", padx=5)
-        ctk.CTkButton(buton_satiri, text="🔄 Listeyi Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, command=self.uretim_verilerini_yukle).pack(side="left", padx=5)
-
-        e_cerceve, self.emir_tree = tablo_olustur(sag_frame, ["Emir ID", "Mamul Adı", "Miktar", "Durum", "Tarih"], [70, 180, 80, 100, 130], height=15)
-        e_cerceve.pack(fill="both", expand=True, pady=5)
-
-        self.uretim_verilerini_yukle()
 
     def recete_bilesen_ekle(self):
         ham = self.u_ham.get().strip()
@@ -9110,13 +11033,8 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/recete-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.u_mamul.delete(0, 'end')
-                self.u_aciklama.delete(0, 'end')
-                self.u_iscilik.delete(0, 'end')
-                self.gecici_bilesenler = []
-                for i in self.bilesen_tree.get_children():
-                    self.bilesen_tree.delete(i)
                 self.uretim_verilerini_yukle()
+                self.uretim_liste_goster()
                 messagebox.showinfo("Başarılı", "Yeni Üretim Reçetesi (BOM) sisteme kaydedildi.")
             else:
                 self.api_hata_goster(res)
@@ -9180,9 +11098,9 @@ class MainApp(ctk.CTkToplevel):
             data = {"ReceteID": int(self.e_recete.get()), "PlanlananMiktar": float(self.e_mik.get())}
             res = requests.post(f"{API}/uretim-emri-ver", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.e_recete.delete(0, 'end')
-                self.e_mik.delete(0, 'end')
                 self.uretim_verilerini_yukle()
+                self.uretim_liste_goster()
+                messagebox.showinfo("Başarılı", "Üretim emri verildi.")
             else:
                 self.api_hata_goster(res)
         except ValueError:
@@ -9207,23 +11125,23 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        ctk.CTkLabel(pencere, text=f"Üretim Emri #{emir_id} Tamamla", font=("Arial", 15, "bold"), text_color="#76CCE1").pack(pady=(18, 5))
-        ctk.CTkLabel(pencere, text=f"{urun_adi}  —  Planlanan: {planlanan}", font=("Arial", 12)).pack(pady=(0, 15))
+        ctk.CTkLabel(pencere, text=f"Üretim Emri #{emir_id} Tamamla", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(18, 5))
+        ctk.CTkLabel(pencere, text=f"{urun_adi}  —  Planlanan: {planlanan}", font=("Segoe UI", 12)).pack(pady=(0, 15))
 
         form = ctk.CTkFrame(pencere, fg_color=gecerli_renk(RENK_KART), corner_radius=12)
         form.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form, text="Gerçekleşen Miktar:", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(form, text="Gerçekleşen Miktar:", font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(10, 2))
         gerceklesen_entry = ctk.CTkEntry(form, placeholder_text=f"Boş bırakılırsa {planlanan} kabul edilir")
         gerceklesen_entry.pack(fill="x", padx=12, pady=(0, 8))
-        ctk.CTkLabel(form, text="Fire Miktarı (opsiyonel, boşsa otomatik hesaplanır):", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(0, 2))
+        ctk.CTkLabel(form, text="Fire Miktarı (opsiyonel, boşsa otomatik hesaplanır):", font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(0, 2))
         fire_entry = ctk.CTkEntry(form)
         fire_entry.pack(fill="x", padx=12, pady=(0, 8))
-        ctk.CTkLabel(form, text="Fire Nedeni:", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(0, 2))
+        ctk.CTkLabel(form, text="Fire Nedeni:", font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(0, 2))
         fire_neden_entry = ctk.CTkEntry(form, placeholder_text="Örn: Makine ayarı, kalite hatası...")
         fire_neden_entry.pack(fill="x", padx=12, pady=(0, 10))
 
         ctk.CTkLabel(pencere, text="⚠️ İlgili hammaddeler stoktan düşülecek, mamul stoğa eklenecek.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=380).pack(pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=380).pack(pady=(0, 10))
 
         def tamamla():
             data = {}
@@ -9260,26 +11178,43 @@ class MainApp(ctk.CTkToplevel):
 
     # ================= ÜRETİM SİPARİŞ FİŞİ (kullanıcılar arası devredilebilir) =================
     def init_uretim_fisi(self):
-        form = ctk.CTkFrame(self.tab_uretim_fisi, fg_color=RENK_KART, corner_radius=12)
-        form.pack(pady=10, padx=10, fill="x")
-        self.uf_urun = ctk.CTkEntry(form, placeholder_text="Ürün Adı (örn: 17 mikron 1.5kg Streç)", width=260)
-        self.uf_urun.grid(row=0, column=0, padx=10, pady=10)
-        self.uf_miktar = ctk.CTkEntry(form, placeholder_text="Miktar", width=100)
-        self.uf_miktar.grid(row=0, column=1, padx=10, pady=10)
-        self.uf_birim = ctk.CTkOptionMenu(form, values=["KG", "ADET", "RULO", "PAKET", "MT"], width=100)
-        self.uf_birim.grid(row=0, column=2, padx=10, pady=10)
-        self.uf_atanan = ctk.CTkEntry(form, placeholder_text="Atanacak Kullanıcı (boş=atanmamış)", width=200)
-        self.uf_atanan.grid(row=1, column=0, padx=10, pady=10)
-        self.uf_oncelik = ctk.CTkOptionMenu(form, values=["Normal", "Acil"], width=100)
-        self.uf_oncelik.grid(row=1, column=1, padx=10, pady=10)
-        self.uf_notlar = ctk.CTkEntry(form, placeholder_text="Notlar (opsiyonel)", width=260)
-        self.uf_notlar.grid(row=1, column=2, padx=10, pady=10)
-        ctk.CTkButton(form, text="🧾 Fiş Oluştur", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.uretim_fisi_olustur_islem).grid(row=1, column=3, padx=10, pady=10)
+        self.uf_liste_govde = ctk.CTkFrame(self.tab_uretim_fisi, fg_color="transparent")
+        self.uf_form_govde = ctk.CTkFrame(self.tab_uretim_fisi, fg_color="transparent")
+        self._uretim_fisi_liste_olustur()
+        self._uretim_fisi_form_olustur()
+        self.uretim_fisi_liste_goster()
 
-        buton_satiri = ctk.CTkFrame(self.tab_uretim_fisi, fg_color="transparent")
+    def uretim_fisi_liste_goster(self):
+        self.uf_form_govde.pack_forget()
+        self.uf_liste_govde.pack(fill="both", expand=True)
+
+    def uretim_fisi_form_goster(self):
+        self.uf_liste_govde.pack_forget()
+        for e in (self.uf_urun, self.uf_miktar, self.uf_atanan, self.uf_notlar):
+            e.delete(0, "end")
+        self.uf_form_govde.pack(fill="both", expand=True)
+
+    def _uretim_fisi_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.uf_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="🧾 Üretim Sipariş Fişleri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni Fiş", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.uretim_fisi_form_goster).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.uf_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.uf_arama = ctk.CTkEntry(arama_bar, placeholder_text="Ürün, oluşturan veya atanan kişiye göre ara...", width=320)
+        self.uf_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.uf_arama.bind("<KeyRelease>", lambda e: self._uretim_fisi_tree_render())
+        ctk.CTkLabel(arama_bar, text="Durum:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 6))
+        self.uf_durum_filtre = ctk.CTkOptionMenu(arama_bar, values=["Tümü", "Bekliyor", "Üretimde", "Tamamlandı", "İptal"],
+                                                  width=130, command=lambda _: self._uretim_fisi_tree_render())
+        self.uf_durum_filtre.pack(side="left", padx=(0, 12), pady=10)
+
+        buton_satiri = ctk.CTkFrame(self.uf_liste_govde, fg_color="transparent")
         buton_satiri.pack(pady=(0, 5), padx=10, fill="x")
-        ctk.CTkLabel(buton_satiri, text="Seçili fiş için:", font=("Arial", 11)).pack(side="left", padx=(5, 10))
+        ctk.CTkLabel(buton_satiri, text="Seçili fiş için:", font=("Segoe UI", 11)).pack(side="left", padx=(5, 10))
         ctk.CTkButton(buton_satiri, text="🔁 Başka Kullanıcıya Devret", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.uretim_fisi_devret_islem).pack(side="left", padx=4)
         ctk.CTkButton(buton_satiri, text="🏗️ Üretimde", fg_color="#F7B341", hover_color="#D29837",
@@ -9293,11 +11228,43 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
                       command=self.uretim_fisi_listele).pack(side="left", padx=4)
 
-        f_cerceve, self.uretim_fisi_tree = tablo_olustur(
-            self.tab_uretim_fisi, ["ID", "Ürün", "Miktar", "Oluşturan", "Atanan", "Durum", "Öncelik", "Tarih"],
-            [50, 220, 90, 110, 110, 100, 80, 130], height=16)
-        f_cerceve.pack(pady=10, padx=10, fill="both", expand=True)
+        self.uretim_fisi_tree = OzelTablo(
+            self.uf_liste_govde, ["ID", "Ürün", "Miktar", "Oluşturan", "Atanan", "Durum", "Öncelik", "Tarih"],
+            [50, 220, 90, 110, 110, 100, 80, 130], height=16, durum_kolonu="Durum")
+        self.uretim_fisi_tree.pack(pady=(0, 10), padx=10, fill="both", expand=True)
+        # Durum sütunu artık düz metin değil, renkli - satır etiketleri zaten
+        # _uretim_fisi_tree_render'da set ediliyordu ama buraya kadar hiç
+        # görsel karşılığı yoktu.
+        self.uretim_fisi_tree.tag_configure("Bekliyor", foreground=RENK_BEKLIYOR)
+        self.uretim_fisi_tree.tag_configure("Onaylandı", foreground=RENK_TAMAM)
+        self.uretim_fisi_tree.tag_configure("İptal", foreground=RENK_IPTAL)
+        self._uf_veri_cache = []
         self.uretim_fisi_listele()
+
+    def _uretim_fisi_form_olustur(self):
+        ust = ctk.CTkFrame(self.uf_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.uretim_fisi_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Üretim Fişi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="🧾 Fiş Oluştur", fg_color="#49B772", hover_color="#3E9C61", width=120, height=30,
+                      command=self.uretim_fisi_olustur_islem).pack(side="right")
+
+        form = ctk.CTkFrame(self.uf_form_govde, fg_color=RENK_KART, corner_radius=12)
+        form.pack(fill="x", padx=20, pady=(0, 10))
+        form.grid_columnconfigure((0, 1, 2), weight=1, uniform="uf_col")
+        self.uf_urun = ctk.CTkEntry(form, placeholder_text="Ürün Adı (örn: 17 mikron 1.5kg Streç)", width=260)
+        self.uf_urun.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        self.uf_miktar = ctk.CTkEntry(form, placeholder_text="Miktar", width=100)
+        self.uf_miktar.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        self.uf_birim = ctk.CTkOptionMenu(form, values=["KG", "ADET", "RULO", "PAKET", "MT"], width=100)
+        self.uf_birim.grid(row=0, column=2, padx=10, pady=10, sticky="w")
+        self.uf_atanan = ctk.CTkEntry(form, placeholder_text="Atanacak Kullanıcı (boş=atanmamış)", width=200)
+        self.uf_atanan.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+        self.uf_oncelik = ctk.CTkOptionMenu(form, values=["Normal", "Acil"], width=100)
+        self.uf_oncelik.grid(row=1, column=1, padx=10, pady=10, sticky="w")
+        self.uf_notlar = ctk.CTkEntry(form, placeholder_text="Notlar (opsiyonel)", width=260)
+        self.uf_notlar.grid(row=1, column=2, padx=10, pady=10, sticky="ew")
 
     def uretim_fisi_olustur_islem(self):
         urun = self.uf_urun.get().strip()
@@ -9315,9 +11282,8 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/uretim-fisi-olustur", json=data, headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
-                for e in (self.uf_urun, self.uf_miktar, self.uf_atanan, self.uf_notlar):
-                    e.delete(0, "end")
                 self.uretim_fisi_listele()
+                self.uretim_fisi_liste_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj", "Fiş oluşturuldu."))
             else:
                 self.api_hata_goster(res)
@@ -9329,16 +11295,29 @@ class MainApp(ctk.CTkToplevel):
             res = requests.get(f"{API}/uretim-fisi-listesi", headers=self.req_headers(), timeout=5)
             if res.status_code != 200:
                 return
-            for i in self.uretim_fisi_tree.get_children():
-                self.uretim_fisi_tree.delete(i)
-            DURUM_RENK = {"Bekliyor": "Bekliyor", "Üretimde": "Bekliyor", "Tamamlandı": "Onaylandı", "İptal": "İptal"}
-            for f in res.json()["fisler"]:
-                tag = DURUM_RENK.get(f["Durum"], "Bekliyor")
-                self.uretim_fisi_tree.insert("", "end", iid=str(f["FisID"]), tags=(tag,),
-                                              values=(f["FisID"], f["UrunAdi"], f"{f['Miktar']} {f['Birim']}",
-                                                      f["OlusturanKullanici"], f["AtananKullanici"], f["Durum"], f["Oncelik"], f["Tarih"]))
+            self._uf_veri_cache = res.json().get("fisler", [])
         except Exception:
-            pass
+            self._uf_veri_cache = []
+        self._uretim_fisi_tree_render()
+
+    def _uretim_fisi_tree_render(self):
+        if not hasattr(self, "uretim_fisi_tree"):
+            return
+        for i in self.uretim_fisi_tree.get_children():
+            self.uretim_fisi_tree.delete(i)
+        DURUM_RENK = {"Bekliyor": "Bekliyor", "Üretimde": "Bekliyor", "Tamamlandı": "Onaylandı", "İptal": "İptal"}
+        arama = self.uf_arama.get().strip().lower() if hasattr(self, "uf_arama") else ""
+        durum_secim = self.uf_durum_filtre.get() if hasattr(self, "uf_durum_filtre") else "Tümü"
+        for f in self._uf_veri_cache:
+            if durum_secim != "Tümü" and f["Durum"] != durum_secim:
+                continue
+            if arama and arama not in str(f.get("UrunAdi", "")).lower() and arama not in str(f.get("OlusturanKullanici", "")).lower() \
+                    and arama not in str(f.get("AtananKullanici", "")).lower():
+                continue
+            tag = DURUM_RENK.get(f["Durum"], "Bekliyor")
+            self.uretim_fisi_tree.insert("", "end", iid=str(f["FisID"]), tags=(tag,),
+                                          values=(f["FisID"], f["UrunAdi"], f"{f['Miktar']} {f['Birim']}",
+                                                  f["OlusturanKullanici"], f["AtananKullanici"], f["Durum"], f["Oncelik"], f["Tarih"]))
 
     def uretim_fisi_devret_islem(self):
         secili = self.uretim_fisi_tree.selection()
@@ -9351,10 +11330,10 @@ class MainApp(ctk.CTkToplevel):
         win.geometry("360x220")
         win.grab_set()
         win.transient(self)
-        ctk.CTkLabel(win, text="Devredilecek Kullanıcı Adı", font=("Arial", 13, "bold")).pack(pady=(20, 5))
+        ctk.CTkLabel(win, text="Devredilecek Kullanıcı Adı", font=("Segoe UI", 13, "bold")).pack(pady=(20, 5))
         yeni_kullanici_entry = ctk.CTkEntry(win, width=260)
         yeni_kullanici_entry.pack(pady=5)
-        ctk.CTkLabel(win, text="Açıklama (opsiyonel)", font=("Arial", 11)).pack(pady=(10, 5))
+        ctk.CTkLabel(win, text="Açıklama (opsiyonel)", font=("Segoe UI", 11)).pack(pady=(10, 5))
         aciklama_entry = ctk.CTkEntry(win, width=260)
         aciklama_entry.pack(pady=5)
 
@@ -9413,7 +11392,7 @@ class MainApp(ctk.CTkToplevel):
         win.geometry("480x400")
         win.grab_set()
         win.transient(self)
-        ctk.CTkLabel(win, text=f"🕓 Fiş #{secili[0]} Devir Geçmişi", font=("Arial", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        ctk.CTkLabel(win, text=f"🕓 Fiş #{secili[0]} Devir Geçmişi", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
         kaydirmali = ctk.CTkScrollableFrame(win, width=440, height=300, fg_color=RENK_KART)
         kaydirmali.pack(padx=15, pady=(0, 15), fill="both", expand=True)
         if not gecmis:
@@ -9421,29 +11400,29 @@ class MainApp(ctk.CTkToplevel):
         for h in gecmis:
             satir = ctk.CTkFrame(kaydirmali, fg_color=RENK_IKINCIL, corner_radius=8)
             satir.pack(fill="x", pady=4, padx=4)
-            ctk.CTkLabel(satir, text=f"{h['Kimden']}  →  {h['Kime']}", font=("Arial", 12, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
-            ctk.CTkLabel(satir, text=f"{h['Aciklama']}  ·  {h['Tarih']}", font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(0, 8))
+            ctk.CTkLabel(satir, text=f"{h['Kimden']}  →  {h['Kime']}", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+            ctk.CTkLabel(satir, text=f"{h['Aciklama']}  ·  {h['Tarih']}", font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(0, 8))
 
     def init_lot_takibi(self):
         ust = ctk.CTkFrame(self.tab_lot_takibi, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🏷️ Lot/Parti Takibi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🏷️ Lot/Parti Takibi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.lotlari_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_lot_takibi,
                      text="Her üretim emri tamamlandığında otomatik bir Lot No üretilir. Aşağıdan bir lottan müşteriye "
                           "sevkiyat kaydedebilir, ya da bir Lot No/Müşteri ile 'hangi ürün kime gitti' sorgulayabilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        liste_cerceve, self.lot_tree = tablo_olustur(
+        self.lot_tree = OzelTablo(
             self.tab_lot_takibi, ["Lot No", "Ürün", "Üretim Emri", "Üretilen", "Kalan", "Üretim Tarihi", "Kalite Durumu"],
             [200, 160, 90, 80, 80, 130, 100], height=8)
-        liste_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        self.lot_tree.pack(fill="x", padx=20, pady=(0, 10))
         self.lot_tree.bind("<Double-Button-1>", self.lot_sevkiyat_gecmisi_goster)
 
         sevk_cerceve = ctk.CTkFrame(self.tab_lot_takibi, fg_color=RENK_KART, corner_radius=12)
         sevk_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(sevk_cerceve, text="Seçili Lottan Sevkiyat Kaydet", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(sevk_cerceve, text="Seçili Lottan Sevkiyat Kaydet", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         sevk_satiri = ctk.CTkFrame(sevk_cerceve, fg_color="transparent")
         sevk_satiri.pack(fill="x", padx=10, pady=(0, 10))
         mus_frame = ctk.CTkFrame(sevk_satiri, fg_color="transparent")
@@ -9460,7 +11439,7 @@ class MainApp(ctk.CTkToplevel):
 
         sorgu_cerceve = ctk.CTkFrame(self.tab_lot_takibi, fg_color=RENK_KART, corner_radius=12)
         sorgu_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        ctk.CTkLabel(sorgu_cerceve, text="🔍 İzlenebilirlik Sorgusu", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(sorgu_cerceve, text="🔍 İzlenebilirlik Sorgusu", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         sorgu_satiri = ctk.CTkFrame(sorgu_cerceve, fg_color="transparent")
         sorgu_satiri.pack(fill="x", padx=10, pady=(0, 10))
         self.lot_sorgu_no = ctk.CTkEntry(sorgu_satiri, placeholder_text="Lot No ile ara (örn. LOT-PP001-...)", width=280)
@@ -9474,9 +11453,9 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(sorgu_satiri, text="Sorgula", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.lot_sorgula_islem).pack(side="left")
 
-        sorgu_liste_cerceve, self.lot_sorgu_tree = tablo_olustur(
+        self.lot_sorgu_tree = OzelTablo(
             sorgu_cerceve, ["Lot No", "Ürün", "Müşteri", "Miktar", "Belge No", "Sevk Tarihi"], [200, 150, 150, 80, 120, 140], height=8)
-        sorgu_liste_cerceve.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.lot_sorgu_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         self.lotlari_yukle()
 
@@ -9538,9 +11517,9 @@ class MainApp(ctk.CTkToplevel):
         pencere.lift()
         pencere.focus_force()
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"🏷️ {lot_no} — Sevkiyat Geçmişi", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
-        cerceve, tree = tablo_olustur(pencere, ["Müşteri", "Miktar", "Belge No", "Sevk Tarihi"], [180, 80, 130, 150], height=10)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        ctk.CTkLabel(pencere, text=f"🏷️ {lot_no} — Sevkiyat Geçmişi", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        tree = OzelTablo(pencere, ["Müşteri", "Miktar", "Belge No", "Sevk Tarihi"], [180, 80, 130, 150], height=10)
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 15))
         try:
             res = requests.get(f"{API}/lot-sevkiyatlari/{secili[0]}", headers=self.req_headers(), timeout=6)
             for s in res.json().get("sevkiyatlar", []):
@@ -9577,18 +11556,35 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_kalite_kontrol(self):
-        ust = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color="transparent")
+        self.kalite_kontrol_dashboard_govde = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color="transparent")
+        self.kalite_toplanti_form_govde = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color="transparent")
+        self._kalite_kontrol_dashboard_olustur()
+        self._kalite_toplanti_form_olustur()
+        self.kalite_kontrol_dashboard_goster()
+
+    def kalite_kontrol_dashboard_goster(self):
+        self.kalite_toplanti_form_govde.pack_forget()
+        self.kalite_kontrol_dashboard_govde.pack(fill="both", expand=True)
+
+    def kalite_toplanti_form_goster(self):
+        self.kalite_kontrol_dashboard_govde.pack_forget()
+        self.kt_katilimcilar.delete(0, "end")
+        self.kt_gundem.delete("1.0", "end")
+        self.kalite_toplanti_form_govde.pack(fill="both", expand=True)
+
+    def _kalite_kontrol_dashboard_olustur(self):
+        ust = ctk.CTkFrame(self.kalite_kontrol_dashboard_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="✅ Kalite Kontrol", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="✅ Kalite Kontrol", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=lambda: (self.kalite_kontrol_listesini_yukle(), self.uygunsuzluk_listesini_yukle())).pack(side="right")
-        ctk.CTkLabel(self.tab_kalite_kontrol,
+        ctk.CTkLabel(self.kalite_kontrol_dashboard_govde,
                      text="Bir üretim lotu için ölçüm/gözlem sonucu kaydedin. REDDEDİLEN lotlar sevkiyata kapatılır "
                           "(Lot Takibi ekranında sevkiyat engellenir); hiç kontrol edilmemiş lotlar için sevkiyat sırasında "
                           "onay istenir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        form = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color=RENK_KART, corner_radius=12)
+        form = ctk.CTkFrame(self.kalite_kontrol_dashboard_govde, fg_color=RENK_KART, corner_radius=12)
         form.pack(fill="x", padx=20, pady=(0, 10))
         satir1 = ctk.CTkFrame(form, fg_color="transparent")
         satir1.pack(fill="x", padx=10, pady=(10, 2))
@@ -9597,7 +11593,7 @@ class MainApp(ctk.CTkToplevel):
         self.kk_lot_id = ctk.CTkEntry(lot_frame, placeholder_text="Lot ID", width=70)
         self.kk_lot_id.pack(side="left", padx=(0, 4))
         ctk.CTkButton(lot_frame, text="🔍", width=32, command=self.lot_secim_penceresi_kalite).pack(side="left")
-        self.kk_lot_etiket = ctk.CTkLabel(satir1, text="(lot seçilmedi)", font=("Arial", 11), text_color=RENK_METIN_SOLUK)
+        self.kk_lot_etiket = ctk.CTkLabel(satir1, text="(lot seçilmedi)", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK)
         self.kk_lot_etiket.pack(side="left", padx=(0, 12))
         self.kk_kontrol_turu = ctk.CTkOptionMenu(satir1, values=["OLCUM", "GOZLEM"], width=110)
         self.kk_kontrol_turu.pack(side="left", padx=(0, 8))
@@ -9606,7 +11602,7 @@ class MainApp(ctk.CTkToplevel):
         satir2 = ctk.CTkFrame(form, fg_color="transparent")
         satir2.pack(fill="x", padx=10, pady=(5, 2))
         ctk.CTkLabel(satir2, text="Ölçüm (Kontrol Türü='OLCUM' iken doldurun; GÖZLEM'de boş bırakılabilir):",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(0, 3))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", pady=(0, 3))
         satir2b = ctk.CTkFrame(form, fg_color="transparent")
         satir2b.pack(fill="x", padx=10, pady=(0, 5))
         self.kk_olculen = ctk.CTkEntry(satir2b, placeholder_text="Ölçülen Değer (örn: 1.52)", width=140)
@@ -9626,54 +11622,65 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(satir3, text="⚠️ Uygunsuzluk Aç", fg_color="#F36D6D", hover_color="#CF5D5D",
                       command=self.uygunsuzluk_ekle_penceresi).pack(side="left")
 
-        kk_cerceve, self.kalite_kontrol_tree = tablo_olustur(
-            self.tab_kalite_kontrol, ["Kontrol ID", "Lot No", "Ürün", "Tür", "Sonuç", "Ölçülen", "Kontrol Eden", "Tarih"],
+        self.kalite_kontrol_tree = OzelTablo(
+            self.kalite_kontrol_dashboard_govde, ["Kontrol ID", "Lot No", "Ürün", "Tür", "Sonuç", "Ölçülen", "Kontrol Eden", "Tarih"],
             [80, 180, 150, 80, 100, 90, 110, 130], height=8)
-        kk_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self.kalite_kontrol_tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(self.tab_kalite_kontrol, text="Uygunsuzluklar (NCR)", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(5, 0))
-        uyg_buton_satiri = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color="transparent")
+        ctk.CTkLabel(self.kalite_kontrol_dashboard_govde, text="Uygunsuzluklar (NCR)", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(5, 0))
+        uyg_buton_satiri = ctk.CTkFrame(self.kalite_kontrol_dashboard_govde, fg_color="transparent")
         uyg_buton_satiri.pack(fill="x", padx=20, pady=(5, 5))
         ctk.CTkButton(uyg_buton_satiri, text="🔒 Seçileni Kapat", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.uygunsuzluk_kapat_islem).pack(side="left")
-        uyg_cerceve, self.uygunsuzluk_tree = tablo_olustur(
-            self.tab_kalite_kontrol, ["ID", "Lot ID", "Hata Kodu", "Şiddet", "Durum", "Açan", "Açılış", "Kapanış"],
-            [50, 70, 140, 80, 90, 110, 130, 130], height=6)
-        uyg_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self.uygunsuzluk_tree = OzelTablo(
+            self.kalite_kontrol_dashboard_govde, ["ID", "Lot ID", "Hata Kodu", "Şiddet", "Durum", "Açan", "Açılış", "Kapanış"],
+            [50, 70, 140, 80, 90, 110, 130, 130], height=6, durum_kolonu="Durum")
+        self.uygunsuzluk_tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(self.tab_kalite_kontrol, text="Toplantı Kayıtları", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=22, pady=(5, 0))
-        toplanti_form = ctk.CTkFrame(self.tab_kalite_kontrol, fg_color=RENK_KART, corner_radius=12)
-        toplanti_form.pack(fill="x", padx=20, pady=(5, 5))
-        toplanti_satiri = ctk.CTkFrame(toplanti_form, fg_color="transparent")
-        toplanti_satiri.pack(fill="x", padx=10, pady=10)
-        self.kt_katilimcilar = ctk.CTkEntry(toplanti_satiri, placeholder_text="Katılımcılar (örn: Ali, Veli)", width=220)
-        self.kt_katilimcilar.pack(side="left", padx=(0, 8))
-        self.kt_gundem = ctk.CTkEntry(toplanti_satiri, placeholder_text="Gündem ve Kararlar", width=400)
-        self.kt_gundem.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(toplanti_satiri, text="+ Kaydet", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.kalite_toplanti_ekle_islem).pack(side="left")
+        toplanti_ust = ctk.CTkFrame(self.kalite_kontrol_dashboard_govde, fg_color="transparent")
+        toplanti_ust.pack(fill="x", padx=20, pady=(5, 0))
+        ctk.CTkLabel(toplanti_ust, text="Toplantı Kayıtları", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(toplanti_ust, text="+ Yeni Toplantı Kaydı", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.kalite_toplanti_form_goster).pack(side="right")
 
-        kt_cerceve, self.kalite_toplanti_tree = tablo_olustur(
-            self.tab_kalite_kontrol, ["ID", "Tarih", "Katılımcılar", "Gündem ve Kararlar", "Kaydeden"],
+        self.kalite_toplanti_tree = OzelTablo(
+            self.kalite_kontrol_dashboard_govde, ["ID", "Tarih", "Katılımcılar", "Gündem ve Kararlar", "Kaydeden"],
             [40, 130, 180, 400, 100], height=5)
-        kt_cerceve.pack(fill="x", padx=20, pady=(0, 20))
+        self.kalite_toplanti_tree.pack(fill="x", padx=20, pady=(0, 20))
 
         self.kalite_kontrol_listesini_yukle()
         self.uygunsuzluk_listesini_yukle()
         self.kalite_toplanti_listesini_yukle()
 
+    def _kalite_toplanti_form_olustur(self):
+        ust = ctk.CTkFrame(self.kalite_toplanti_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.kalite_kontrol_dashboard_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="📋 Yeni Kalite Toplantı Kaydı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.kalite_toplanti_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.kalite_toplanti_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        self.kt_katilimcilar = ctk.CTkEntry(kart, placeholder_text="Katılımcılar (örn: Ali, Veli)", width=320)
+        self.kt_katilimcilar.pack(padx=15, pady=(15, 8))
+        self.kt_gundem = ctk.CTkTextbox(kart, width=320, height=100)
+        self.kt_gundem.pack(padx=15, pady=(0, 5))
+        ctk.CTkLabel(kart, text="Gündem ve Kararlar", font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(pady=(0, 15))
+
     def kalite_toplanti_ekle_islem(self):
-        gundem = self.kt_gundem.get().strip()
-        if not gundem:
+        gundem_metni = self.kt_gundem.get("1.0", "end").strip()
+        if not gundem_metni:
             messagebox.showwarning("Eksik Bilgi", "Gündem ve kararları girin.")
             return
-        data = {"Katilimcilar": self.kt_katilimcilar.get().strip() or None, "GundemVeKararlar": gundem}
+        data = {"Katilimcilar": self.kt_katilimcilar.get().strip() or None, "GundemVeKararlar": gundem_metni}
         try:
             res = requests.post(f"{API}/kalite-toplanti", json=data, headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
-                self.kt_katilimcilar.delete(0, "end")
-                self.kt_gundem.delete(0, "end")
                 self.kalite_toplanti_listesini_yukle()
+                self.kalite_kontrol_dashboard_goster()
+                messagebox.showinfo("Başarılı", "Toplantı kaydı eklendi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -9703,9 +11710,9 @@ class MainApp(ctk.CTkToplevel):
         top.lift()
         top.focus_force()
         top.grab_set()
-        ctk.CTkLabel(top, text="🏷️ Kalite Kontrolü Yapılacak Lotu Seçin", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
-        cerceve, tree = tablo_olustur(top, ["Lot ID", "Lot No", "Ürün", "Kalan", "Kalite Durumu"], [60, 180, 150, 70, 100], height=15)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        ctk.CTkLabel(top, text="🏷️ Kalite Kontrolü Yapılacak Lotu Seçin", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        tree = OzelTablo(top, ["Lot ID", "Lot No", "Ürün", "Kalan", "Kalite Durumu"], [60, 180, 150, 70, 100], height=15)
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 10))
         try:
             res = requests.get(f"{API}/lot-listesi", headers=self.req_headers(), timeout=6)
             for l in res.json().get("lotlar", []):
@@ -9782,7 +11789,7 @@ class MainApp(ctk.CTkToplevel):
         pencere.lift()
         pencere.focus_force()
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text="⚠️ Yeni Uygunsuzluk Kaydı", font=("Arial", 14, "bold"), text_color="#F36D6D").pack(pady=(15, 10))
+        ctk.CTkLabel(pencere, text="⚠️ Yeni Uygunsuzluk Kaydı", font=("Segoe UI", 14, "bold"), text_color="#F36D6D").pack(pady=(15, 10))
         lot_entry = ctk.CTkEntry(pencere, placeholder_text="Lot ID", width=200)
         lot_entry.pack(pady=5)
         if secili_lot:
@@ -9852,17 +11859,47 @@ class MainApp(ctk.CTkToplevel):
             pass
 
     def init_uretim_planlama(self):
-        ust = ctk.CTkFrame(self.tab_uretim_planlama, fg_color="transparent")
+        self.uretim_planlama_dashboard_govde = ctk.CTkFrame(self.tab_uretim_planlama, fg_color="transparent")
+        self.makine_bakim_form_govde = ctk.CTkFrame(self.tab_uretim_planlama, fg_color="transparent")
+        self.enerji_tuketim_form_govde = ctk.CTkFrame(self.tab_uretim_planlama, fg_color="transparent")
+        self._up_hatlar_cache = []
+        self._uretim_planlama_dashboard_olustur()
+        self._makine_bakim_form_olustur()
+        self._enerji_tuketim_form_olustur()
+        self.uretim_planlama_dashboard_goster()
+
+    def uretim_planlama_dashboard_goster(self):
+        self.makine_bakim_form_govde.pack_forget()
+        self.enerji_tuketim_form_govde.pack_forget()
+        self.uretim_planlama_dashboard_govde.pack(fill="both", expand=True)
+
+    def makine_bakim_form_goster(self):
+        self.uretim_planlama_dashboard_govde.pack_forget()
+        self.enerji_tuketim_form_govde.pack_forget()
+        self.bk_aciklama.delete(0, "end")
+        self._makine_bakim_hat_secim_guncelle()
+        self.makine_bakim_form_govde.pack(fill="both", expand=True)
+
+    def enerji_tuketim_form_goster(self):
+        self.uretim_planlama_dashboard_govde.pack_forget()
+        self.makine_bakim_form_govde.pack_forget()
+        for e in (self.en_baslangic, self.en_bitis, self.en_kwh, self.en_birim_fiyat):
+            e.delete(0, "end")
+        self._enerji_tuketim_hat_secim_guncelle()
+        self.enerji_tuketim_form_govde.pack(fill="both", expand=True)
+
+    def _uretim_planlama_dashboard_olustur(self):
+        ust = ctk.CTkFrame(self.uretim_planlama_dashboard_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📅 Üretim Planlama / Kapasite Çizelgesi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📅 Üretim Planlama / Kapasite Çizelgesi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.uretim_planlama_yenile).pack(side="right")
         ctk.CTkButton(ust, text="🔥 Fire Raporu", fg_color="#F36D6D", hover_color="#CF5D5D",
                       command=self.fire_raporu_penceresi).pack(side="right", padx=(0, 8))
 
-        hat_cerceve = ctk.CTkFrame(self.tab_uretim_planlama, fg_color=RENK_KART, corner_radius=12)
+        hat_cerceve = ctk.CTkFrame(self.uretim_planlama_dashboard_govde, fg_color=RENK_KART, corner_radius=12)
         hat_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(hat_cerceve, text="Üretim Hatları", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(hat_cerceve, text="Üretim Hatları", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         hat_ekle_satiri = ctk.CTkFrame(hat_cerceve, fg_color="transparent")
         hat_ekle_satiri.pack(fill="x", padx=10, pady=(0, 10))
         self.up_yeni_hat_entry = ctk.CTkEntry(hat_ekle_satiri, placeholder_text="Yeni Hat Adı (Örn: Ekstrüzyon Hattı)", width=250)
@@ -9870,54 +11907,36 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(hat_ekle_satiri, text="+ Hat Ekle", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.uretim_hatti_ekle_islem).pack(side="left")
 
-        bakim_cerceve = ctk.CTkFrame(self.tab_uretim_planlama, fg_color=RENK_KART, corner_radius=12)
+        bakim_cerceve = ctk.CTkFrame(self.uretim_planlama_dashboard_govde, fg_color=RENK_KART, corner_radius=12)
         bakim_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(bakim_cerceve, text="🔧 Makine Bakım / Arıza Kaydı", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        bakim_satiri = ctk.CTkFrame(bakim_cerceve, fg_color="transparent")
-        bakim_satiri.pack(fill="x", padx=10, pady=(0, 5))
-        self.bk_hat_secim = ctk.CTkOptionMenu(bakim_satiri, values=["Yükleniyor..."], width=180)
-        self.bk_hat_secim.pack(side="left", padx=(0, 8))
-        self.bk_tur_secim = ctk.CTkOptionMenu(bakim_satiri, values=["Periyodik Bakım", "Arıza"], width=140)
-        self.bk_tur_secim.pack(side="left", padx=(0, 8))
-        self.bk_aciklama = ctk.CTkEntry(bakim_satiri, placeholder_text="Açıklama", width=220)
-        self.bk_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(bakim_satiri, text="+ Kayıt Aç", fg_color="#76CCE1", hover_color="#64ADBF",
-                      command=self.makine_bakim_ekle_islem).pack(side="left")
-        bakim_liste_cerceve, self.bakim_tree = tablo_olustur(
-            bakim_cerceve, ["ID", "Hat", "Tür", "Başlangıç", "Bitiş", "Açıklama", "Durum"], [40, 130, 110, 120, 120, 180, 90], height=5)
-        bakim_liste_cerceve.pack(fill="x", padx=10, pady=(5, 5))
+        bakim_ust = ctk.CTkFrame(bakim_cerceve, fg_color="transparent")
+        bakim_ust.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(bakim_ust, text="🔧 Makine Bakım / Arıza Kaydı", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkButton(bakim_ust, text="+ Yeni Kayıt", fg_color="#49B772", hover_color="#3E9C61", width=120,
+                      command=self.makine_bakim_form_goster).pack(side="right")
+        self.bakim_tree = OzelTablo(
+            bakim_cerceve, ["ID", "Hat", "Tür", "Başlangıç", "Bitiş", "Açıklama", "Durum"], [40, 130, 110, 120, 120, 180, 90], height=5, durum_kolonu="Durum")
+        self.bakim_tree.pack(fill="x", padx=10, pady=(5, 5))
         ctk.CTkButton(bakim_cerceve, text="✅ Seçileni Tamamla", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.makine_bakim_tamamla_islem).pack(anchor="w", padx=10, pady=(0, 10))
 
-        enerji_cerceve = ctk.CTkFrame(self.tab_uretim_planlama, fg_color=RENK_KART, corner_radius=12)
+        enerji_cerceve = ctk.CTkFrame(self.uretim_planlama_dashboard_govde, fg_color=RENK_KART, corner_radius=12)
         enerji_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(enerji_cerceve, text="⚡ Enerji Tüketimi / Maliyeti", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        enerji_satiri1 = ctk.CTkFrame(enerji_cerceve, fg_color="transparent")
-        enerji_satiri1.pack(fill="x", padx=10, pady=(0, 5))
-        self.en_hat_secim = ctk.CTkOptionMenu(enerji_satiri1, values=["Yükleniyor..."], width=180)
-        self.en_hat_secim.pack(side="left", padx=(0, 8))
-        self.en_baslangic = ctk.CTkEntry(enerji_satiri1, placeholder_text="Başlangıç (YYYY-AA-GG)", width=140)
-        self.en_baslangic.pack(side="left", padx=(0, 8))
-        self.en_bitis = ctk.CTkEntry(enerji_satiri1, placeholder_text="Bitiş (YYYY-AA-GG)", width=140)
-        self.en_bitis.pack(side="left", padx=(0, 8))
-        enerji_satiri2 = ctk.CTkFrame(enerji_cerceve, fg_color="transparent")
-        enerji_satiri2.pack(fill="x", padx=10, pady=(0, 5))
-        self.en_kwh = ctk.CTkEntry(enerji_satiri2, placeholder_text="Tüketim (kWh)", width=140)
-        self.en_kwh.pack(side="left", padx=(0, 8))
-        self.en_birim_fiyat = ctk.CTkEntry(enerji_satiri2, placeholder_text="Birim Fiyat (TL/kWh)", width=150)
-        self.en_birim_fiyat.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(enerji_satiri2, text="+ Kayıt Ekle", fg_color="#76CCE1", hover_color="#64ADBF",
-                      command=self.enerji_tuketim_ekle_islem).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(enerji_satiri2, text="📊 Maliyet Raporu", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.enerji_maliyet_raporu_goster).pack(side="left")
-        enerji_liste_cerceve, self.enerji_tree = tablo_olustur(
+        enerji_ust = ctk.CTkFrame(enerji_cerceve, fg_color="transparent")
+        enerji_ust.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(enerji_ust, text="⚡ Enerji Tüketimi / Maliyeti", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkButton(enerji_ust, text="📊 Maliyet Raporu", fg_color="#9965F1", hover_color="#8256CD",
+                      command=self.enerji_maliyet_raporu_goster).pack(side="right")
+        ctk.CTkButton(enerji_ust, text="+ Yeni Kayıt", fg_color="#49B772", hover_color="#3E9C61", width=120,
+                      command=self.enerji_tuketim_form_goster).pack(side="right", padx=(0, 8))
+        self.enerji_tree = OzelTablo(
             enerji_cerceve, ["ID", "Hat", "Başlangıç", "Bitiş", "kWh", "TL/kWh", "Toplam Maliyet"],
             [40, 130, 100, 100, 80, 80, 110], height=5)
-        enerji_liste_cerceve.pack(fill="x", padx=10, pady=(5, 10))
+        self.enerji_tree.pack(fill="x", padx=10, pady=(5, 10))
 
-        planla_cerceve = ctk.CTkFrame(self.tab_uretim_planlama, fg_color=RENK_KART, corner_radius=12)
+        planla_cerceve = ctk.CTkFrame(self.uretim_planlama_dashboard_govde, fg_color=RENK_KART, corner_radius=12)
         planla_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(planla_cerceve, text="Üretim Emrini Çizelgeye Ekle", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(planla_cerceve, text="Üretim Emrini Çizelgeye Ekle", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         planla_satiri = ctk.CTkFrame(planla_cerceve, fg_color="transparent")
         planla_satiri.pack(fill="x", padx=10, pady=(0, 10))
         self.up_emir_id = ctk.CTkEntry(planla_satiri, placeholder_text="Üretim Emri ID", width=110)
@@ -9931,14 +11950,69 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(planla_satiri, text="📌 Planla", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.uretim_emri_planla_islem).pack(side="left")
 
-        ctk.CTkLabel(self.tab_uretim_planlama, text="Hat Bazlı Çizelge", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 0))
-        self.up_cizelge_alani = ctk.CTkScrollableFrame(self.tab_uretim_planlama, fg_color="transparent")
+        ctk.CTkLabel(self.uretim_planlama_dashboard_govde, text="Hat Bazlı Çizelge", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 0))
+        self.up_cizelge_alani = ctk.CTkScrollableFrame(self.uretim_planlama_dashboard_govde, fg_color="transparent")
         self.up_cizelge_alani.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
-        self._up_hatlar_cache = []
         self.uretim_planlama_yenile()
         self.makine_bakimlarini_yukle()
         self.enerji_tuketimlerini_yukle()
+
+    def _makine_bakim_form_olustur(self):
+        ust = ctk.CTkFrame(self.makine_bakim_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.uretim_planlama_dashboard_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="🔧 Yeni Makine Bakım/Arıza Kaydı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Kayıt Aç", fg_color="#49B772", hover_color="#3E9C61", width=130, height=30,
+                      command=self.makine_bakim_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.makine_bakim_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        self.bk_hat_secim = ctk.CTkOptionMenu(satir, values=["Yükleniyor..."], width=180)
+        self.bk_hat_secim.pack(side="left", padx=(0, 8))
+        self.bk_tur_secim = ctk.CTkOptionMenu(satir, values=["Periyodik Bakım", "Arıza"], width=140)
+        self.bk_tur_secim.pack(side="left", padx=(0, 8))
+        self.bk_aciklama = ctk.CTkEntry(satir, placeholder_text="Açıklama", width=250)
+        self.bk_aciklama.pack(side="left")
+
+    def _makine_bakim_hat_secim_guncelle(self):
+        hat_isimleri = [h["HatAdi"] for h in self._up_hatlar_cache] or ["Hat Yok"]
+        self.bk_hat_secim.configure(values=hat_isimleri)
+        self.bk_hat_secim.set(hat_isimleri[0])
+
+    def _enerji_tuketim_form_olustur(self):
+        ust = ctk.CTkFrame(self.enerji_tuketim_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.uretim_planlama_dashboard_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="⚡ Yeni Enerji Tüketim Kaydı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Kayıt Ekle", fg_color="#49B772", hover_color="#3E9C61", width=130, height=30,
+                      command=self.enerji_tuketim_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.enerji_tuketim_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        satir1 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir1.pack(fill="x", padx=15, pady=(15, 8))
+        self.en_hat_secim = ctk.CTkOptionMenu(satir1, values=["Yükleniyor..."], width=180)
+        self.en_hat_secim.pack(side="left", padx=(0, 8))
+        self.en_baslangic = ctk.CTkEntry(satir1, placeholder_text="Başlangıç (YYYY-AA-GG)", width=150)
+        self.en_baslangic.pack(side="left", padx=(0, 8))
+        self.en_bitis = ctk.CTkEntry(satir1, placeholder_text="Bitiş (YYYY-AA-GG)", width=150)
+        self.en_bitis.pack(side="left")
+        satir2 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir2.pack(fill="x", padx=15, pady=(0, 15))
+        self.en_kwh = ctk.CTkEntry(satir2, placeholder_text="Tüketim (kWh)", width=150)
+        self.en_kwh.pack(side="left", padx=(0, 8))
+        self.en_birim_fiyat = ctk.CTkEntry(satir2, placeholder_text="Birim Fiyat (TL/kWh)", width=170)
+        self.en_birim_fiyat.pack(side="left")
+
+    def _enerji_tuketim_hat_secim_guncelle(self):
+        hat_isimleri = [h["HatAdi"] for h in self._up_hatlar_cache] or ["Hat Yok"]
+        self.en_hat_secim.configure(values=hat_isimleri)
+        self.en_hat_secim.set(hat_isimleri[0])
 
     def uretim_hatti_ekle_islem(self):
         ad = self.up_yeni_hat_entry.get().strip()
@@ -9993,12 +12067,6 @@ class MainApp(ctk.CTkToplevel):
             self.up_hat_secim.configure(values=hat_isimleri)
             if hatlar:
                 self.up_hat_secim.set(hat_isimleri[0])
-            self.bk_hat_secim.configure(values=hat_isimleri)
-            if hatlar:
-                self.bk_hat_secim.set(hat_isimleri[0])
-            self.en_hat_secim.configure(values=hat_isimleri)
-            if hatlar:
-                self.en_hat_secim.set(hat_isimleri[0])
 
             emir_res = requests.get(f"{API}/uretim-emirleri", headers=self.req_headers(), timeout=5)
             emirler = emir_res.json().get("emirler", []) if emir_res.status_code == 200 else []
@@ -10015,11 +12083,11 @@ class MainApp(ctk.CTkToplevel):
         for hat in hatlar:
             hat_kart = ctk.CTkFrame(self.up_cizelge_alani, fg_color=RENK_KART, corner_radius=12)
             hat_kart.pack(fill="x", pady=6)
-            ctk.CTkLabel(hat_kart, text=f"🏭 {hat['HatAdi']}", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(10, 5))
+            ctk.CTkLabel(hat_kart, text=f"🏭 {hat['HatAdi']}", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(anchor="w", padx=12, pady=(10, 5))
 
             bu_hattaki_emirler = [e for e in emirler if e.get("HatID") == hat["HatID"]]
             if not bu_hattaki_emirler:
-                ctk.CTkLabel(hat_kart, text="Bu hatta planlanmış üretim emri yok.", font=("Arial", 10),
+                ctk.CTkLabel(hat_kart, text="Bu hatta planlanmış üretim emri yok.", font=("Segoe UI", 10),
                              text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=20, pady=(0, 10))
                 continue
 
@@ -10028,29 +12096,25 @@ class MainApp(ctk.CTkToplevel):
                 emir_satiri = ctk.CTkFrame(hat_kart, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=8, border_width=2, border_color=renk)
                 emir_satiri.pack(fill="x", padx=12, pady=3)
                 ctk.CTkLabel(emir_satiri, text=f"#{emir['EmirID']} — {emir['StokAdi']} ({emir['PlanlananMiktar']:g})",
-                             font=("Arial", 11, "bold")).pack(side="left", padx=10, pady=6)
+                             font=("Segoe UI", 11, "bold")).pack(side="left", padx=10, pady=6)
                 tarih_metni = f"{emir.get('PlaniBaslangic') or '?'} → {emir.get('PlaniBitis') or '?'}"
-                ctk.CTkLabel(emir_satiri, text=f"{tarih_metni}  ·  {emir['Durum']}", font=("Arial", 10),
+                ctk.CTkLabel(emir_satiri, text=f"{tarih_metni}  ·  {emir['Durum']}", font=("Segoe UI", 10),
                              text_color=RENK_METIN_SOLUK).pack(side="right", padx=10)
             ctk.CTkLabel(hat_kart, text="", height=1).pack()
 
     def init_stok_sayim(self):
         ust = ctk.CTkFrame(self.tab_stok_sayim, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🧮 Fiziksel Stok Sayımı", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🧮 Fiziksel Stok Sayımı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
 
-        baslat_cerceve = ctk.CTkFrame(self.tab_stok_sayim, fg_color=RENK_KART, corner_radius=12)
-        baslat_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        baslat_satiri = ctk.CTkFrame(baslat_cerceve, fg_color="transparent")
-        baslat_satiri.pack(fill="x", padx=10, pady=10)
-        self.ss_aciklama = ctk.CTkEntry(baslat_satiri, placeholder_text="Açıklama (Örn: Yıl Sonu Sayımı)", width=300)
-        self.ss_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(baslat_satiri, text="+ Yeni Sayım Başlat", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.stok_sayim_baslat_islem).pack(side="left")
+        ust_buton_satiri = ctk.CTkFrame(self.tab_stok_sayim, fg_color="transparent")
+        ust_buton_satiri.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkButton(ust_buton_satiri, text="+ Yeni Sayım Başlat", fg_color="#9965F1", hover_color="#8256CD",
+                      command=self.stok_sayim_baslat_penceresi_ac).pack(side="left")
 
-        liste_cerceve, self.sayim_tree = tablo_olustur(
-            self.tab_stok_sayim, ["ID", "Tarih", "Durum", "Açıklama", "Kullanıcı", "Tamamlanma"], [40, 130, 90, 200, 100, 130], height=6)
-        liste_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        self.sayim_tree = OzelTablo(
+            self.tab_stok_sayim, ["ID", "Tarih", "Durum", "Açıklama", "Kullanıcı", "Tamamlanma"], [40, 130, 90, 200, 100, 130], height=6, durum_kolonu="Durum")
+        self.sayim_tree.pack(fill="x", padx=20, pady=(0, 10))
         self.sayim_tree.bind("<Double-Button-1>", self.stok_sayim_detay_ac)
 
         alt_buton_satiri = ctk.CTkFrame(self.tab_stok_sayim, fg_color="transparent")
@@ -10058,24 +12122,42 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(alt_buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
                       command=self.stok_sayimlarini_yukle).pack(side="left")
         ctk.CTkLabel(alt_buton_satiri, text="Bir sayıma çift tıklayarak sayım değerlerini girin.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(side="left", padx=10)
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(side="left", padx=10)
 
         self.stok_sayimlarini_yukle()
 
-    def stok_sayim_baslat_islem(self):
-        if not messagebox.askyesno("Onay", "Yeni bir sayım başlatılacak. Bu an itibariyle tüm ürünlerin sistem miktarları dondurulacak. Devam edilsin mi?"):
-            return
-        try:
-            res = requests.post(f"{API}/stok-sayim-baslat", json={"Aciklama": self.ss_aciklama.get().strip() or None},
-                                 headers=self.req_headers(), timeout=10)
-            if res.status_code == 200:
-                self.ss_aciklama.delete(0, "end")
-                self.stok_sayimlarini_yukle()
-                messagebox.showinfo("Başarılı", res.json().get("mesaj"))
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+    def stok_sayim_baslat_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Stok Sayımı")
+        self._pencere_ortala(pencere, 440, 280)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="🧮 Yeni Stok Sayımı Başlat", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        ctk.CTkLabel(pencere, text="Başlatıldığı an itibariyle tüm ürünlerin sistem miktarları dondurulur.",
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=380, justify="left").pack(pady=(0, 10), padx=20)
+        ss_aciklama = ctk.CTkEntry(pencere, placeholder_text="Açıklama (Örn: Yıl Sonu Sayımı)", width=320)
+        ss_aciklama.pack(pady=5)
+
+        def baslat():
+            if not messagebox.askyesno("Onay", "Yeni bir sayım başlatılacak. Bu an itibariyle tüm ürünlerin sistem miktarları dondurulacak. Devam edilsin mi?"):
+                return
+            try:
+                res = requests.post(f"{API}/stok-sayim-baslat", json={"Aciklama": ss_aciklama.get().strip() or None},
+                                     headers=self.req_headers(), timeout=10)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.stok_sayimlarini_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="+ Sayımı Başlat", fg_color="#9965F1", hover_color="#8256CD",
+                      command=baslat).pack(pady=(15, 10), padx=20, fill="x")
 
     def stok_sayimlarini_yukle(self):
         try:
@@ -10105,11 +12187,11 @@ class MainApp(ctk.CTkToplevel):
 
         ust = ctk.CTkFrame(pencere, fg_color="transparent")
         ust.pack(fill="x", padx=15, pady=(15, 5))
-        ctk.CTkLabel(ust, text=f"🧮 Sayım #{sayim_id} — {durum}", font=("Arial", 15, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text=f"🧮 Sayım #{sayim_id} — {durum}", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(side="left")
         sadece_farkli_var = ctk.BooleanVar(value=False)
 
-        cerceve, tree = tablo_olustur(pencere, ["Stok Kod", "Ürün", "Sistem", "Sayılan", "Fark"], [100, 220, 90, 90, 90], height=15)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        tree = OzelTablo(pencere, ["Stok Kod", "Ürün", "Sistem", "Sayılan", "Fark"], [100, 220, 90, 90, 90], height=15)
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 10))
 
         def listeyi_yukle():
             try:
@@ -10130,7 +12212,9 @@ class MainApp(ctk.CTkToplevel):
             giris_satiri = ctk.CTkFrame(pencere, fg_color="transparent")
             giris_satiri.pack(fill="x", padx=15, pady=(0, 10))
             ss_stok_kod = ctk.CTkEntry(giris_satiri, placeholder_text="Stok Kod", width=120)
-            ss_stok_kod.pack(side="left", padx=(0, 8))
+            ss_stok_kod.pack(side="left", padx=(0, 4))
+            ctk.CTkButton(giris_satiri, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
+                          command=lambda: self.urun_secim_penceresi(ss_stok_kod)).pack(side="left", padx=(0, 8))
             ss_sayilan = ctk.CTkEntry(giris_satiri, placeholder_text="Sayılan Miktar", width=120)
             ss_sayilan.pack(side="left", padx=(0, 8))
 
@@ -10176,26 +12260,26 @@ class MainApp(ctk.CTkToplevel):
     def init_negatif_stok(self):
         ust = ctk.CTkFrame(self.tab_negatif_stok, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="⚠️ Negatif Stok Tespit/Düzeltme", font=("Arial", 18, "bold"), text_color="#F36D6D").pack(side="left")
+        ctk.CTkLabel(ust, text="⚠️ Negatif Stok Tespit/Düzeltme", font=("Segoe UI", 18, "bold"), text_color="#F36D6D").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.negatif_stoklari_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_negatif_stok,
                      text="Fiziksel olarak imkansız (eksi) stok miktarları burada listelenir - genelde stok kontrolü yapılmadan "
                           "yapılan toplu faturalama ya da veri girişi hatasından kaynaklanır. Düzeltme, gerçek fiziksel sayımınıza "
                           "göre yapılmalı ve Yevmiye'ye otomatik işlenir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        liste_cerceve, self.negatif_stok_tree = tablo_olustur(
+        self.negatif_stok_tree = OzelTablo(
             self.tab_negatif_stok, ["Stok Kod", "Ürün", "Mevcut Miktar", "Rezerve", "Birim"], [110, 250, 120, 90, 70], height=14)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self.negatif_stok_tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
         self.negatif_stok_tree.tag_configure("negatif", foreground="#F36D6D")
 
         duzelt_cerceve = ctk.CTkFrame(self.tab_negatif_stok, fg_color=RENK_KART, corner_radius=12)
         duzelt_cerceve.pack(fill="x", padx=20, pady=(0, 20))
-        ctk.CTkLabel(duzelt_cerceve, text="Seçili Stoğu Düzelt", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(duzelt_cerceve, text="Seçili Stoğu Düzelt", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         satir = ctk.CTkFrame(duzelt_cerceve, fg_color="transparent")
         satir.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkLabel(satir, text="Gerçek (Sayılan) Miktar:", font=("Arial", 11)).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(satir, text="Gerçek (Sayılan) Miktar:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
         self.ns_yeni_miktar = ctk.CTkEntry(satir, placeholder_text="Örn: 0", width=120)
         self.ns_yeni_miktar.pack(side="left", padx=(0, 8))
         self.ns_aciklama = ctk.CTkEntry(satir, placeholder_text="Açıklama (örn: fiziksel sayım sonucu)", width=280)
@@ -10245,17 +12329,70 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_konsinye(self):
-        ust = ctk.CTkFrame(self.tab_konsinye, fg_color="transparent")
-        ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📤 Konsinye Stok Takibi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
-        ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
-                      command=self.konsinye_yukle).pack(side="right")
+        self.kon_liste_govde = ctk.CTkFrame(self.tab_konsinye, fg_color="transparent")
+        self.kon_form_govde = ctk.CTkFrame(self.tab_konsinye, fg_color="transparent")
+        self._konsinye_liste_olustur()
+        self._konsinye_form_olustur()
+        self.konsinye_liste_goster()
 
-        ekle_cerceve = ctk.CTkFrame(self.tab_konsinye, fg_color=RENK_KART, corner_radius=12)
+    def konsinye_liste_goster(self):
+        self.kon_form_govde.pack_forget()
+        self.kon_liste_govde.pack(fill="both", expand=True)
+
+    def konsinye_form_goster(self):
+        self.kon_liste_govde.pack_forget()
+        for e in (self.kon_musteri, self.kon_stok, self.kon_miktar, self.kon_fiyat):
+            e.delete(0, "end")
+        self.kon_form_govde.pack(fill="both", expand=True)
+
+    def _konsinye_liste_olustur(self):
+        ust = ctk.CTkFrame(self.kon_liste_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="📤 Konsinye Stok Takibi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Konsinye Çıkış", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.konsinye_form_goster).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.kon_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=20, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.kon_arama = ctk.CTkEntry(arama_bar, placeholder_text="Müşteri, stok kodu veya ürün adına göre ara...", width=320)
+        self.kon_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.kon_arama.bind("<KeyRelease>", lambda e: self._konsinye_tree_render())
+        ctk.CTkLabel(arama_bar, text="Durum:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 6))
+        self.kon_durum_filtre = ctk.CTkOptionMenu(arama_bar, values=["Tümü", "Beklemede", "Satıldı", "İade Edildi"],
+                                                   width=140, command=lambda _: self._konsinye_tree_render())
+        self.kon_durum_filtre.pack(side="left", padx=(0, 12), pady=10)
+
+        self.konsinye_tree = OzelTablo(
+            self.kon_liste_govde, ["ID", "Müşteri", "Stok Kod", "Ürün", "Miktar", "Fiyat", "Çıkış Tarihi", "Durum"],
+            [40, 160, 90, 160, 70, 80, 130, 90], height=13, durum_kolonu="Durum")
+        self.konsinye_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+
+        alt_buton_satiri = ctk.CTkFrame(self.kon_liste_govde, fg_color="transparent")
+        alt_buton_satiri.pack(fill="x", padx=20, pady=(0, 20))
+        ctk.CTkButton(alt_buton_satiri, text="✅ Satıldı Olarak İşaretle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.konsinye_satildi_islem).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(alt_buton_satiri, text="↩️ İade Al", fg_color="#76CCE1", hover_color="#64ADBF",
+                      command=self.konsinye_iade_islem).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(alt_buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.konsinye_yukle).pack(side="left")
+
+        self._kon_veri_cache = []
+        self.konsinye_yukle()
+
+    def _konsinye_form_olustur(self):
+        ust = ctk.CTkFrame(self.kon_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.konsinye_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Konsinye Çıkış", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="📤 Konsinyeye Gönder", fg_color="#49B772", hover_color="#3E9C61", width=160, height=30,
+                      command=self.konsinye_cikis_islem).pack(side="right")
+
+        ekle_cerceve = ctk.CTkFrame(self.kon_form_govde, fg_color=RENK_KART, corner_radius=12)
         ekle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(ekle_cerceve, text="Yeni Konsinye Çıkış", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         ekle_satiri = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        ekle_satiri.pack(fill="x", padx=10, pady=(0, 10))
+        ekle_satiri.pack(fill="x", padx=10, pady=10)
         mus_frame = ctk.CTkFrame(ekle_satiri, fg_color="transparent")
         mus_frame.pack(side="left", padx=(0, 8))
         self.kon_musteri = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
@@ -10271,22 +12408,6 @@ class MainApp(ctk.CTkToplevel):
         self.kon_miktar.pack(side="left", padx=(0, 8))
         self.kon_fiyat = ctk.CTkEntry(ekle_satiri, placeholder_text="Birim Fiyat", width=90)
         self.kon_fiyat.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(ekle_satiri, text="📤 Konsinyeye Gönder", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.konsinye_cikis_islem).pack(side="left")
-
-        liste_cerceve, self.konsinye_tree = tablo_olustur(
-            self.tab_konsinye, ["ID", "Müşteri", "Stok Kod", "Ürün", "Miktar", "Fiyat", "Çıkış Tarihi", "Durum"],
-            [40, 160, 90, 160, 70, 80, 130, 90], height=13)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
-
-        alt_buton_satiri = ctk.CTkFrame(self.tab_konsinye, fg_color="transparent")
-        alt_buton_satiri.pack(fill="x", padx=20, pady=(0, 20))
-        ctk.CTkButton(alt_buton_satiri, text="✅ Satıldı Olarak İşaretle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.konsinye_satildi_islem).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(alt_buton_satiri, text="↩️ İade Al", fg_color="#76CCE1", hover_color="#64ADBF",
-                      command=self.konsinye_iade_islem).pack(side="left")
-
-        self.konsinye_yukle()
 
     def konsinye_cikis_islem(self):
         try:
@@ -10298,12 +12419,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/konsinye-cikis-ekle", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                self.kon_musteri.delete(0, "end")
-                self.kon_stok.delete(0, "end")
-                self.kon_miktar.delete(0, "end")
-                self.kon_fiyat.delete(0, "end")
                 self.konsinye_yukle()
                 self.stoklari_yukle()
+                self.konsinye_liste_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj"))
             else:
                 self.api_hata_goster(res)
@@ -10313,15 +12431,28 @@ class MainApp(ctk.CTkToplevel):
     def konsinye_yukle(self):
         try:
             res = requests.get(f"{API}/konsinye-listesi", headers=self.req_headers(), timeout=5)
-            for i in self.konsinye_tree.get_children():
-                self.konsinye_tree.delete(i)
-            DURUM_ETIKET = {"Beklemede": "bekliyor", "Satıldı": "tamam", "İade Edildi": "iptal"}
-            for k in res.json().get("konsinyeler", []):
-                self.konsinye_tree.insert("", "end", iid=str(k["KonsinyeID"]), tags=(DURUM_ETIKET.get(k["Durum"], ""),),
-                                           values=(k["KonsinyeID"], k["FirmaAdi"], k["StokKod"], k["StokAdi"],
-                                                   f"{k['Miktar']:g}", f"{k['BirimFiyat']:,.2f}", k["CikisTarihi"], k["Durum"]))
+            self._kon_veri_cache = res.json().get("konsinyeler", [])
         except Exception:
-            pass
+            self._kon_veri_cache = []
+        self._konsinye_tree_render()
+
+    def _konsinye_tree_render(self):
+        if not hasattr(self, "konsinye_tree"):
+            return
+        for i in self.konsinye_tree.get_children():
+            self.konsinye_tree.delete(i)
+        DURUM_ETIKET = {"Beklemede": "bekliyor", "Satıldı": "tamam", "İade Edildi": "iptal"}
+        arama = self.kon_arama.get().strip().lower() if hasattr(self, "kon_arama") else ""
+        durum_secim = self.kon_durum_filtre.get() if hasattr(self, "kon_durum_filtre") else "Tümü"
+        for k in self._kon_veri_cache:
+            if durum_secim != "Tümü" and k["Durum"] != durum_secim:
+                continue
+            if arama and arama not in str(k.get("FirmaAdi", "")).lower() and arama not in str(k.get("StokKod", "")).lower() \
+                    and arama not in str(k.get("StokAdi", "")).lower():
+                continue
+            self.konsinye_tree.insert("", "end", iid=str(k["KonsinyeID"]), tags=(DURUM_ETIKET.get(k["Durum"], ""),),
+                                       values=(k["KonsinyeID"], k["FirmaAdi"], k["StokKod"], k["StokAdi"],
+                                               f"{k['Miktar']:g}", f"{k['BirimFiyat']:,.2f}", k["CikisTarihi"], k["Durum"]))
 
     def konsinye_satildi_islem(self):
         secili = self.konsinye_tree.selection()
@@ -10364,10 +12495,10 @@ class MainApp(ctk.CTkToplevel):
         pencere.lift()
         pencere.focus_force()
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text="🔥 Üretim Fire Raporu", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
-        cerceve, tree = tablo_olustur(pencere, ["Emir ID", "Ürün", "Planlanan", "Gerçekleşen", "Fire", "Fire %", "Neden", "Tarih"],
+        ctk.CTkLabel(pencere, text="🔥 Üretim Fire Raporu", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        tree = OzelTablo(pencere, ["Emir ID", "Ürün", "Planlanan", "Gerçekleşen", "Fire", "Fire %", "Neden", "Tarih"],
                                        [60, 150, 80, 90, 70, 60, 150, 130], height=15)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 15))
         try:
             res = requests.get(f"{API}/uretim-fire-raporu", headers=self.req_headers(), timeout=8)
             for f in res.json().get("fireler", []):
@@ -10389,8 +12520,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/makine-bakim-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.bk_aciklama.delete(0, "end")
                 self.makine_bakimlarini_yukle()
+                self.uretim_planlama_dashboard_goster()
+                messagebox.showinfo("Başarılı", "Bakım/arıza kaydı açıldı.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -10429,23 +12561,22 @@ class MainApp(ctk.CTkToplevel):
         if hat_id is None:
             messagebox.showwarning("Eksik Bilgi", "Bir üretim hattı seçin.")
             return
-        baslangic, bitis = self.en_baslangic.get().strip(), self.en_bitis.get().strip()
-        if not baslangic or not bitis:
+        bas_str, bit_str = self.en_baslangic.get().strip(), self.en_bitis.get().strip()
+        if not bas_str or not bit_str:
             messagebox.showwarning("Eksik Bilgi", "Başlangıç ve bitiş tarihlerini YYYY-AA-GG formatında girin.")
             return
         try:
-            kwh = float(self.en_kwh.get())
-            birim_fiyat = float(self.en_birim_fiyat.get())
+            kwh_deger = float(self.en_kwh.get())
+            birim_fiyat_deger = float(self.en_birim_fiyat.get())
         except ValueError:
             messagebox.showwarning("Hatalı Değer", "Tüketim ve birim fiyat sayısal olmalıdır.")
             return
-        data = {"HatID": hat_id, "BaslangicTarihi": baslangic, "BitisTarihi": bitis, "TuketimKWh": kwh, "BirimFiyatKWh": birim_fiyat}
+        data = {"HatID": hat_id, "BaslangicTarihi": bas_str, "BitisTarihi": bit_str, "TuketimKWh": kwh_deger, "BirimFiyatKWh": birim_fiyat_deger}
         try:
             res = requests.post(f"{API}/enerji-tuketim-ekle", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                for e in (self.en_baslangic, self.en_bitis, self.en_kwh, self.en_birim_fiyat):
-                    e.delete(0, "end")
                 self.enerji_tuketimlerini_yukle()
+                self.uretim_planlama_dashboard_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kayıt eklendi."))
             else:
                 self.api_hata_goster(res)
@@ -10472,12 +12603,12 @@ class MainApp(ctk.CTkToplevel):
         pencere.lift()
         pencere.focus_force()
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text="📊 Hat Bazlı Enerji Maliyet Raporu", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 5))
+        ctk.CTkLabel(pencere, text="📊 Hat Bazlı Enerji Maliyet Raporu", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 5))
         ctk.CTkLabel(pencere, text="'Birim Başına Maliyet' sadece o hatta HatID'si atanmış, tamamlanmış üretim emri varsa hesaplanabilir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=580, justify="left").pack(pady=(0, 10))
-        cerceve, tree = tablo_olustur(pencere, ["Hat", "Toplam kWh", "Toplam Maliyet", "Üretim Miktarı", "Birim Başına Maliyet"],
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=580, justify="left").pack(pady=(0, 10))
+        tree = OzelTablo(pencere, ["Hat", "Toplam kWh", "Toplam Maliyet", "Üretim Miktarı", "Birim Başına Maliyet"],
                                        [140, 100, 120, 110, 140], height=10)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 15))
         try:
             res = requests.get(f"{API}/enerji-maliyet-raporu", headers=self.req_headers(), timeout=8)
             for r in res.json().get("rapor", []):
@@ -10490,7 +12621,7 @@ class MainApp(ctk.CTkToplevel):
     def init_ana_takvim(self):
         ust = ctk.CTkFrame(self.tab_ana_takvim, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📅 Ana Takvim - Tüm Vadeler Tek Ekranda", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📅 Ana Takvim - Tüm Vadeler Tek Ekranda", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.ana_takvimi_yukle).pack(side="right")
         self.at_gun_secim = ctk.CTkOptionMenu(ust, values=["30 gün", "60 gün", "90 gün", "180 gün"], width=110,
@@ -10501,7 +12632,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkLabel(self.tab_ana_takvim,
                      text="Kredi taksitleri, teminat mektubu bitişleri, sözleşme/belge vadeleri, planlı makine bakımları ve tahmini "
                           "fatura vadeleri (30 gün standart vade varsayımıyla) tek bir zaman çizelgesinde birleştirilir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         self.at_liste_alani = ctk.CTkScrollableFrame(self.tab_ana_takvim, fg_color="transparent")
         self.at_liste_alani.pack(fill="both", expand=True, padx=20, pady=(0, 20))
@@ -10520,7 +12651,7 @@ class MainApp(ctk.CTkToplevel):
 
         if not olaylar:
             ctk.CTkLabel(self.at_liste_alani, text="✅ Önümüzdeki dönemde takip edilmesi gereken bir vade bulunamadı.",
-                         font=("Arial", 13), text_color=RENK_METIN_SOLUK).pack(pady=30)
+                         font=("Segoe UI", 13), text_color=RENK_METIN_SOLUK).pack(pady=30)
             return
 
         ONEM_RENK = {"Yüksek": "#F36D6D", "Orta": "#F7B341", "Düşük": "#6b7280"}
@@ -10535,25 +12666,25 @@ class MainApp(ctk.CTkToplevel):
         for tarih in sorted(gruplu.keys()):
             baslik_metni = f"📌 {tarih}" + (" — BUGÜN" if tarih == bugun else "")
             baslik_renk = "#76CCE1" if tarih == bugun else RENK_METIN_SOLUK
-            ctk.CTkLabel(self.at_liste_alani, text=baslik_metni, font=("Arial", 13, "bold"), text_color=baslik_renk).pack(anchor="w", pady=(10, 4))
+            ctk.CTkLabel(self.at_liste_alani, text=baslik_metni, font=("Segoe UI", 13, "bold"), text_color=baslik_renk).pack(anchor="w", pady=(10, 4))
             for olay in gruplu[tarih]:
                 satir = ctk.CTkFrame(self.at_liste_alani, fg_color=RENK_KART, corner_radius=12)
                 satir.pack(fill="x", pady=2)
                 ikon = TUR_IKON.get(olay["Tur"], "📌")
-                ctk.CTkLabel(satir, text=f"{ikon} {olay['Baslik']}", font=("Arial", 12), anchor="w").pack(side="left", padx=12, pady=8)
-                ctk.CTkLabel(satir, text=olay["Detay"], font=("Arial", 11, "bold"), text_color="#45C89D").pack(side="right", padx=12)
+                ctk.CTkLabel(satir, text=f"{ikon} {olay['Baslik']}", font=("Segoe UI", 12), anchor="w").pack(side="left", padx=12, pady=8)
+                ctk.CTkLabel(satir, text=olay["Detay"], font=("Segoe UI", 11, "bold"), text_color="#45C89D").pack(side="right", padx=12)
                 rozet = ctk.CTkFrame(satir, fg_color=ONEM_RENK.get(olay["Onem"], "#6b7280"), corner_radius=8)
                 rozet.pack(side="right", padx=(0, 10))
-                ctk.CTkLabel(rozet, text=olay["Onem"], font=("Arial", 10, "bold"), text_color=RENK_METIN).pack(padx=8, pady=2)
+                ctk.CTkLabel(rozet, text=olay["Onem"], font=("Segoe UI", 10, "bold"), text_color=RENK_METIN).pack(padx=8, pady=2)
 
     def init_donem_karsilastirma(self):
         ust = ctk.CTkFrame(self.tab_donem_karsilastirma, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📊 Geçmiş Dönem Karşılaştırmalı Analiz", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📊 Geçmiş Dönem Karşılaştırmalı Analiz", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.donem_karsilastirmasini_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_donem_karsilastirma, text="Not: Bu ayın verisi henüz tamamlanmamış olabilir - ay bitmeden yapılan karşılaştırma eksik gösterebilir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900).pack(anchor="w", padx=22, pady=(0, 10))
 
         kart_alani = ctk.CTkFrame(self.tab_donem_karsilastirma, fg_color="transparent")
         kart_alani.pack(fill="x", padx=20, pady=(0, 15))
@@ -10570,13 +12701,13 @@ class MainApp(ctk.CTkToplevel):
 
         buyume_cerceve = ctk.CTkFrame(self.tab_donem_karsilastirma, fg_color=RENK_KART, corner_radius=12)
         buyume_cerceve.pack(fill="x", padx=20, pady=(0, 15))
-        self.dk_buyume_label = ctk.CTkLabel(buyume_cerceve, text="", font=("Arial", 13, "bold"), justify="left")
+        self.dk_buyume_label = ctk.CTkLabel(buyume_cerceve, text="", font=("Segoe UI", 13, "bold"), justify="left")
         self.dk_buyume_label.pack(anchor="w", padx=14, pady=14)
 
-        ctk.CTkLabel(self.tab_donem_karsilastirma, text="Bu Ay En Çok Satan 10 Ürün", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 5))
-        liste_cerceve, self.dk_en_cok_satan_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_donem_karsilastirma, text="Bu Ay En Çok Satan 10 Ürün", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 5))
+        self.dk_en_cok_satan_tree = OzelTablo(
             self.tab_donem_karsilastirma, ["Stok Kod", "Ürün", "Toplam Miktar", "Toplam Tutar"], [110, 260, 120, 130], height=10)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.dk_en_cok_satan_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self.donem_karsilastirmasini_yukle()
 
@@ -10594,10 +12725,10 @@ class MainApp(ctk.CTkToplevel):
         def kart_doldur(kart, baslik, veri_parcasi):
             for w in kart.winfo_children():
                 w.destroy()
-            ctk.CTkLabel(kart, text=baslik, font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12, pady=(12, 4))
-            ctk.CTkLabel(kart, text=f"{veri_parcasi['Ciro']:,.2f} TL", font=("Arial", 16, "bold"), text_color="#45C89D").pack(anchor="w", padx=12)
+            ctk.CTkLabel(kart, text=baslik, font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12, pady=(12, 4))
+            ctk.CTkLabel(kart, text=f"{veri_parcasi['Ciro']:,.2f} TL", font=("Segoe UI", 16, "bold"), text_color="#45C89D").pack(anchor="w", padx=12)
             ctk.CTkLabel(kart, text=f"{veri_parcasi['FaturaSayisi']} fatura · {veri_parcasi['SiparisSayisi']} sipariş",
-                         font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12, pady=(2, 12))
+                         font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12, pady=(2, 12))
 
         kart_doldur(self.dk_bu_ay_kart, "Bu Ay", veri["BuAy"])
         kart_doldur(self.dk_gecen_ay_kart, "Geçen Ay", veri["GecenAy"])
@@ -10642,9 +12773,9 @@ class MainApp(ctk.CTkToplevel):
 
         ust_baslik = ctk.CTkFrame(dash_frame, fg_color="transparent")
         ust_baslik.pack(fill="x", pady=(0, 15))
-        ctk.CTkLabel(ust_baslik, text="Yönetici Finansal Gösterge Paneli (KPI)", font=("Arial", 19, "bold")).pack(side="left")
+        ctk.CTkLabel(ust_baslik, text="Yönetici Finansal Gösterge Paneli (KPI)", font=("Segoe UI", 19, "bold")).pack(side="left")
         ctk.CTkButton(ust_baslik, text="⚙️ Dashboard'ı Özelleştir", fg_color=RENK_KENARLIK, hover_color=RENK_IKINCIL,
-                      text_color=RENK_METIN, font=("Arial", 11, "bold"), height=28,
+                      text_color=RENK_METIN, font=("Segoe UI", 11, "bold"), height=28,
                       command=self.dashboard_ozellestir_penceresi_ac).pack(side="right")
 
         self._dashboard_kart_alani = ctk.CTkFrame(dash_frame, fg_color="transparent")
@@ -10662,21 +12793,21 @@ class MainApp(ctk.CTkToplevel):
 
         grafik_cerceve = ctk.CTkFrame(alt_panel, fg_color=RENK_KART, corner_radius=14)
         grafik_cerceve.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        ctk.CTkLabel(grafik_cerceve, text="📈 Son 12 Ay Ciro Trendi", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(12, 4), anchor="w", padx=14)
+        ctk.CTkLabel(grafik_cerceve, text="📈 Son 12 Ay Ciro Trendi", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(12, 4), anchor="w", padx=14)
         self.trend_grafik_alani = ctk.CTkFrame(grafik_cerceve, fg_color="transparent", height=220)
         self.trend_grafik_alani.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
         top_cerceve = ctk.CTkFrame(alt_panel, fg_color=RENK_KART, corner_radius=14)
         top_cerceve.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        ctk.CTkLabel(top_cerceve, text="🏆 Bu Ay En Çok Satan Ürünler", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(12, 8), anchor="w", padx=14)
+        ctk.CTkLabel(top_cerceve, text="🏆 Bu Ay En Çok Satan Ürünler", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(12, 8), anchor="w", padx=14)
         self.top_urun_frame = ctk.CTkFrame(top_cerceve, fg_color="transparent")
         self.top_urun_frame.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
-        ctk.CTkLabel(dash_frame, text="⚠️ Kritik Stok Uyarıları (Minimum Seviye Altı)", font=("Arial", 15, "bold"), text_color="#F36D6D").pack(pady=(15, 5), anchor="w")
-        kritik_cerceve, self.kritik_tree = tablo_olustur(
+        ctk.CTkLabel(dash_frame, text="⚠️ Kritik Stok Uyarıları (Minimum Seviye Altı)", font=("Segoe UI", 15, "bold"), text_color="#F36D6D").pack(pady=(15, 5), anchor="w")
+        self.kritik_tree = OzelTablo(
             dash_frame, ["Stok Kod", "Stok Adı", "Mevcut", "Min. Seviye", "Birim"],
             [110, 260, 100, 100, 90], height=5)
-        kritik_cerceve.pack(fill="x", pady=5)
+        self.kritik_tree.pack(fill="x", pady=5)
 
         self.after(200, self.dashboard_yukle)
 
@@ -10701,8 +12832,8 @@ class MainApp(ctk.CTkToplevel):
             kart = ctk.CTkFrame(self._dashboard_kart_alani, fg_color=RENK_KART, corner_radius=14, border_width=2, border_color=renk)
             kart.grid(row=satir, column=sutun, padx=8, pady=5, sticky="nsew")
             self._dashboard_kart_alani.grid_columnconfigure(sutun, weight=1)
-            ctk.CTkLabel(kart, text=baslik, font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(pady=(14, 4), padx=14)
-            deger_label = ctk.CTkLabel(kart, text="—", font=("Arial", 22, "bold"), text_color=renk)
+            ctk.CTkLabel(kart, text=baslik, font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(pady=(14, 4), padx=14)
+            deger_label = ctk.CTkLabel(kart, text="—", font=("Segoe UI", 22, "bold"), text_color=renk)
             deger_label.pack(pady=(0, 14), padx=14)
             self.kpi_labels[anahtar] = deger_label
 
@@ -10735,8 +12866,8 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        ctk.CTkLabel(pencere, text="⚙️ Hangi kartlar görünsün, hangi sırada?", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(padx=15, pady=(15, 5), anchor="w")
-        ctk.CTkLabel(pencere, text="Kutuyu işaretle/kaldır, ok tuşlarıyla sırasını değiştir.", font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(padx=15, pady=(0, 10), anchor="w")
+        ctk.CTkLabel(pencere, text="⚙️ Hangi kartlar görünsün, hangi sırada?", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(padx=15, pady=(15, 5), anchor="w")
+        ctk.CTkLabel(pencere, text="Kutuyu işaretle/kaldır, ok tuşlarıyla sırasını değiştir.", font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(padx=15, pady=(0, 10), anchor="w")
 
         liste_alani = ctk.CTkScrollableFrame(pencere, fg_color=RENK_KART)
         liste_alani.pack(fill="both", expand=True, padx=15, pady=(0, 10))
@@ -10754,7 +12885,7 @@ class MainApp(ctk.CTkToplevel):
                     secili_durumu[a] = v.get()
 
                 ctk.CTkCheckBox(satir, text=baslik, variable=var, command=degisti,
-                                font=("Arial", 12), text_color=renk).pack(side="left", padx=(5, 10))
+                                font=("Segoe UI", 12), text_color=renk).pack(side="left", padx=(5, 10))
 
                 def yukari(i=idx):
                     if i > 0:
@@ -10938,7 +13069,7 @@ class MainApp(ctk.CTkToplevel):
     def init_stok_ozet(self):
         ust = ctk.CTkFrame(self.tab_stok_ozet, fg_color="transparent")
         ust.pack(fill="x", padx=16, pady=(16, 8))
-        ctk.CTkLabel(ust, text="📊 Stok Özeti", font=("Arial", 20, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📊 Stok Özeti", font=("Segoe UI", 20, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, width=90,
                       command=self.stok_ozet_yukle).pack(side="right")
 
@@ -10965,13 +13096,13 @@ class MainApp(ctk.CTkToplevel):
             kart = ctk.CTkFrame(stat_alani, fg_color=RENK_KART, corner_radius=18, border_width=2, border_color="#76CCE1")
             kart.grid(row=0, column=i, padx=6, sticky="nsew")
             stat_alani.grid_columnconfigure(i, weight=1)
-            ctk.CTkLabel(kart, text=stat["Etiket"], font=("Arial", 12), text_color=RENK_METIN_SOLUK).pack(pady=(14, 3), padx=14)
-            ctk.CTkLabel(kart, text=stat["Deger"], font=("Arial", 18, "bold"), text_color=RENK_METIN).pack(pady=(0, 14), padx=14)
+            ctk.CTkLabel(kart, text=stat["Etiket"], font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK).pack(pady=(14, 3), padx=14)
+            ctk.CTkLabel(kart, text=stat["Deger"], font=("Segoe UI", 18, "bold"), text_color=RENK_METIN).pack(pady=(0, 14), padx=14)
 
         if veri.get("Grafik"):
             grafik_cerceve = ctk.CTkFrame(self.stok_ozet_govde, fg_color=RENK_KART, corner_radius=18)
             grafik_cerceve.pack(fill="x", pady=(0, 15))
-            ctk.CTkLabel(grafik_cerceve, text=veri["Grafik"].get("Baslik", ""), font=("Arial", 13, "bold"),
+            ctk.CTkLabel(grafik_cerceve, text=veri["Grafik"].get("Baslik", ""), font=("Segoe UI", 13, "bold"),
                          text_color="#76CCE1").pack(anchor="w", padx=12, pady=(10, 4))
             grafik_alani = ctk.CTkFrame(grafik_cerceve, fg_color="transparent", height=220)
             grafik_alani.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -10980,19 +13111,19 @@ class MainApp(ctk.CTkToplevel):
     def init_stok_yaslandirma(self):
         ust = ctk.CTkFrame(self.tab_stok_yaslandirma, fg_color="transparent")
         ust.pack(fill="x", padx=16, pady=(16, 8))
-        ctk.CTkLabel(ust, text="⏳ Stok Yaşlandırma (Ölü Stok)", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
-        ctk.CTkLabel(ust, text="Eşik (gün):", font=("Arial", 12)).pack(side="left", padx=(24, 6))
+        ctk.CTkLabel(ust, text="⏳ Stok Yaşlandırma (Ölü Stok)", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="Eşik (gün):", font=("Segoe UI", 12)).pack(side="left", padx=(24, 6))
         self.syas_esik = ctk.CTkEntry(ust, width=70)
         self.syas_esik.insert(0, "90")
         self.syas_esik.pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, width=90,
                       command=self.stok_yaslandirma_yukle).pack(side="right")
 
-        cerceve, self.syas_tree = tablo_olustur(
+        self.syas_tree = OzelTablo(
             self.tab_stok_yaslandirma,
             ["Stok Kod", "Stok Adı", "Miktar", "Birim", "Stok Değeri", "Son Hareket", "Gün Farkı"],
             [90, 220, 80, 60, 100, 100, 80], height=16)
-        cerceve.pack(pady=8, padx=16, fill="both", expand=True)
+        self.syas_tree.pack(pady=8, padx=16, fill="both", expand=True)
         self.stok_yaslandirma_yukle()
 
     def stok_yaslandirma_yukle(self):
@@ -11018,18 +13149,18 @@ class MainApp(ctk.CTkToplevel):
     def init_stok_ongoru(self):
         ust = ctk.CTkFrame(self.tab_stok_ongoru, fg_color="transparent")
         ust.pack(fill="x", padx=16, pady=(16, 8))
-        ctk.CTkLabel(ust, text="🔮 Öngörülen Stok Miktarı", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔮 Öngörülen Stok Miktarı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, width=90,
                       command=self.stok_ongoru_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_stok_ongoru,
                      text="Mevcut miktar - açık satış rezervasyonu - açık üretim emri tüketimi + bekleyen satınalma. Rezerve/tüketim/satınalması olmayan kalemler listelenmez.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(0, 6))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=16, pady=(0, 6))
 
-        cerceve, self.song_tree = tablo_olustur(
+        self.song_tree = OzelTablo(
             self.tab_stok_ongoru,
             ["Stok Kod", "Stok Adı", "Mevcut", "Rezerve", "Açık Üretim Tük.", "Bekleyen Satınalma", "Öngörülen"],
             [90, 220, 70, 70, 110, 120, 90], height=16)
-        cerceve.pack(pady=8, padx=16, fill="both", expand=True)
+        self.song_tree.pack(pady=8, padx=16, fill="both", expand=True)
         self.stok_ongoru_yukle()
 
     def stok_ongoru_yukle(self):
@@ -11048,8 +13179,95 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_stok(self):
-        stok_form = ctk.CTkFrame(self.tab_stok, fg_color=RENK_KART, corner_radius=12)
-        stok_form.pack(pady=8, padx=10, fill="x")
+        self.stok_liste_govde = ctk.CTkFrame(self.tab_stok, fg_color="transparent")
+        self.stok_form_govde = ctk.CTkFrame(self.tab_stok, fg_color="transparent")
+        self._stok_liste_olustur()
+        self._stok_form_olustur()
+        self.stok_liste_goster()
+
+    def stok_liste_goster(self):
+        self.stok_form_govde.pack_forget()
+        self.stok_liste_govde.pack(fill="both", expand=True)
+
+    def stok_form_goster(self):
+        self.stok_liste_govde.pack_forget()
+        for e in (self.s_kod, self.s_ad, self.s_birim, self.s_barkod, self.s_mik, self.s_fiyat, self.s_min, self.s_grup, self.s_gtip):
+            e.delete(0, "end")
+        self.stok_form_govde.pack(fill="both", expand=True)
+
+    def _stok_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.stok_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="📦 Stok & Log", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni Stok", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.stok_form_goster).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.stok_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.stok_arama = ctk.CTkEntry(arama_bar, placeholder_text="Stok kodu veya adına göre ara...", width=320)
+        self.stok_arama.pack(side="left", padx=(0, 4), pady=10)
+        self.stok_arama.bind("<KeyRelease>", lambda e: self._stok_tree_render())
+        ctk.CTkButton(arama_bar, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
+                      command=self._stok_urun_sec_ile_ara).pack(side="left", padx=(0, 12), pady=10)
+
+        barkod_arama_satiri = ctk.CTkFrame(self.stok_liste_govde, fg_color="transparent")
+        barkod_arama_satiri.pack(pady=(0, 5), padx=10, fill="x")
+        ctk.CTkLabel(barkod_arama_satiri, text="📷 Barkod Okut/Yaz:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(5, 8))
+        self.s_barkod_arama = ctk.CTkEntry(barkod_arama_satiri, placeholder_text="Barkod okuyucuyla okutun veya kodu yazıp Enter'a basın", width=350)
+        self.s_barkod_arama.pack(side="left", padx=(0, 8))
+        self.s_barkod_arama.bind("<Return>", lambda e: self.stok_barkod_ile_bul())
+        ctk.CTkButton(barkod_arama_satiri, text="🔍 Bul", fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.stok_barkod_ile_bul).pack(side="left")
+
+        buton_satiri = ctk.CTkFrame(self.stok_liste_govde, fg_color="transparent")
+        buton_satiri.pack(pady=(0, 5), padx=10, fill="x")
+        ctk.CTkButton(buton_satiri, text="✏️ Seçileni Düzenle", fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.stok_duzenle_ac).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
+                      command=self.stok_sil_islem).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, hover_color=RENK_IKINCIL, text_color=RENK_METIN,
+                      command=lambda: (self.stoklari_yukle(), self.loglari_yukle())).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="📥 Excel'e Aktar", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=lambda: self.tabloyu_excele_aktar(self.stok_tree, "Stok_Listesi")).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="📤 Excel'den İçeri Aktar", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=lambda: self.excelden_ice_aktar("/stok-excel-import", self.stoklari_yukle)).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="🏭 Depo Dağılımı", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.stok_depo_dagilimi_goster).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="🔀 Alternatifler", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.stok_alternatifler_goster).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="🏷️ Etiket Yazdır", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.stok_etiket_yazdir).pack(side="left", padx=5)
+
+        # DENEME: bu tek tablo artık ttk.Treeview değil, OzelTablo (CTk tabanlı) -
+        # gerçek yuvarlak kart + Durum sütununda renkli pill rozet için (bkz.
+        # OzelTablo docstring'i). Beğenilirse diğer ekranlara da yayılacak.
+        self.stok_tree = OzelTablo(
+            self.stok_liste_govde, ["Stok Kod", "Stok Adı", "Miktar", "Rezerve", "Kullanılabilir", "Birim", "Sat. Fiyatı", "Ort. Maliyet", "Kâr Marjı", "Min. Seviye", "Durum"],
+            [100, 200, 70, 70, 90, 55, 90, 90, 80, 90, 80], height=9, durum_kolonu="Durum")
+        self.stok_tree.pack(pady=5, padx=10, fill="both", expand=True)
+
+        ctk.CTkLabel(self.stok_liste_govde, text="Stok İşlem Logları (Audit Trail)", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12)
+        self.log_tree = OzelTablo(
+            self.stok_liste_govde, ["Tarih", "Stok Kod", "İşlem", "Miktar", "Açıklama"],
+            [150, 100, 90, 80, 320], height=6)
+        self.log_tree.pack(pady=(2, 8), padx=10, fill="both")
+
+        self._stok_onbellek = {}
+        self.stoklari_yukle()
+        self.loglari_yukle()
+
+    def _stok_form_olustur(self):
+        ust = ctk.CTkFrame(self.stok_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.stok_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Stok", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="➕ Stok Ekle", fg_color="#49B772", hover_color="#3E9C61", width=120, height=30,
+                      command=self.stok_ekle_islem).pack(side="right")
+
+        stok_form = ctk.CTkFrame(self.stok_form_govde, fg_color=RENK_KART, corner_radius=12)
+        stok_form.pack(pady=(0, 10), padx=20, fill="x")
         self.s_kod = ctk.CTkEntry(stok_form, placeholder_text="Stok Kodu")
         self.s_kod.grid(row=0, column=0, padx=10, pady=8)
         self.s_ad = ctk.CTkEntry(stok_form, placeholder_text="Stok Adı", width=180)
@@ -11068,50 +13286,6 @@ class MainApp(ctk.CTkToplevel):
         self.s_grup.grid(row=1, column=3, padx=10, pady=8)
         self.s_gtip = ctk.CTkEntry(stok_form, placeholder_text="GTİP Kodu (opsiyonel, örn: 3901.10.00.00)", width=200)
         self.s_gtip.grid(row=1, column=4, padx=10, pady=8)
-        ctk.CTkButton(stok_form, text="➕ Stok Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.stok_ekle_islem).grid(row=1, column=5, padx=10, pady=8)
-
-        barkod_arama_satiri = ctk.CTkFrame(self.tab_stok, fg_color="transparent")
-        barkod_arama_satiri.pack(pady=(0, 5), padx=10, fill="x")
-        ctk.CTkLabel(barkod_arama_satiri, text="📷 Barkod Okut/Yaz:", font=("Arial", 11, "bold")).pack(side="left", padx=(5, 8))
-        self.s_barkod_arama = ctk.CTkEntry(barkod_arama_satiri, placeholder_text="Barkod okuyucuyla okutun veya kodu yazıp Enter'a basın", width=350)
-        self.s_barkod_arama.pack(side="left", padx=(0, 8))
-        self.s_barkod_arama.bind("<Return>", lambda e: self.stok_barkod_ile_bul())
-        ctk.CTkButton(barkod_arama_satiri, text="🔍 Bul", fg_color="#5585EF", hover_color="#4871CB",
-                      command=self.stok_barkod_ile_bul).pack(side="left")
-
-        buton_satiri = ctk.CTkFrame(self.tab_stok, fg_color="transparent")
-        buton_satiri.pack(pady=(0, 5), padx=10, fill="x")
-        ctk.CTkButton(buton_satiri, text="✏️ Seçileni Düzenle", fg_color="#5585EF", hover_color="#4871CB",
-                      command=self.stok_duzenle_ac).pack(side="left", padx=5)
-        ctk.CTkButton(buton_satiri, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
-                      command=self.stok_sil_islem).pack(side="left", padx=5)
-        ctk.CTkButton(buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, hover_color=RENK_IKINCIL, text_color=RENK_METIN,
-                      command=lambda: (self.stoklari_yukle(), self.loglari_yukle())).pack(side="left", padx=5)
-        ctk.CTkButton(buton_satiri, text="📥 Excel'e Aktar", fg_color="#42ACA2", hover_color="#38928A",
-                      command=lambda: self.tabloyu_excele_aktar(self.stok_tree, "Stok_Listesi")).pack(side="left", padx=5)
-        ctk.CTkButton(buton_satiri, text="📤 Excel'den İçeri Aktar", fg_color="#9965F1", hover_color="#8256CD",
-                      command=lambda: self.excelden_ice_aktar("/stok-excel-import", self.stoklari_yukle)).pack(side="left", padx=5)
-        ctk.CTkButton(buton_satiri, text="🏭 Depo Dağılımı", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.stok_depo_dagilimi_goster).pack(side="left", padx=5)
-        ctk.CTkButton(buton_satiri, text="🔀 Alternatifler", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.stok_alternatifler_goster).pack(side="left", padx=5)
-        ctk.CTkButton(buton_satiri, text="🏷️ Etiket Yazdır", fg_color="#76CCE1", hover_color="#64ADBF",
-                      command=self.stok_etiket_yazdir).pack(side="left", padx=5)
-
-        stok_cerceve, self.stok_tree = tablo_olustur(
-            self.tab_stok, ["Stok Kod", "Stok Adı", "Miktar", "Rezerve", "Kullanılabilir", "Birim", "Sat. Fiyatı", "Ort. Maliyet", "Kâr Marjı", "Min. Seviye"],
-            [100, 200, 70, 70, 90, 55, 90, 90, 80, 90], height=9)
-        stok_cerceve.pack(pady=5, padx=10, fill="both", expand=True)
-
-        ctk.CTkLabel(self.tab_stok, text="Stok İşlem Logları (Audit Trail)", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12)
-        log_cerceve, self.log_tree = tablo_olustur(
-            self.tab_stok, ["Tarih", "Stok Kod", "İşlem", "Miktar", "Açıklama"],
-            [150, 100, 90, 80, 320], height=6)
-        log_cerceve.pack(pady=(2, 8), padx=10, fill="both")
-
-        self.stoklari_yukle()
-        self.loglari_yukle()
 
     def stok_ekle_islem(self):
         try:
@@ -11126,12 +13300,11 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/stok-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.s_barkod.delete(0, "end")
-                self.s_grup.delete(0, "end")
-                self.s_gtip.delete(0, "end")
                 self.stoklari_yukle()
                 self.loglari_yukle()
                 self.dashboard_yukle()
+                self.stok_liste_goster()
+                messagebox.showinfo("Başarılı", "Stok eklendi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -11145,6 +13318,9 @@ class MainApp(ctk.CTkToplevel):
             res = requests.get(f"{API}/stok-barkod-ara/{kod}", headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
                 urun = res.json()
+                if hasattr(self, "stok_arama") and self.stok_arama.get().strip():
+                    self.stok_arama.delete(0, "end")
+                    self._stok_tree_render()
                 if urun["StokKod"] in self.stok_tree.get_children():
                     self.stok_tree.selection_set(urun["StokKod"])
                     self.stok_tree.see(urun["StokKod"])
@@ -11220,7 +13396,7 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        ctk.CTkLabel(pencere, text="⚖️ Terazi Bağlantı Ayarları", font=("Arial", 15, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
+        ctk.CTkLabel(pencere, text="⚖️ Terazi Bağlantı Ayarları", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
 
         if not PYSERIAL_MEVCUT:
             ctk.CTkLabel(pencere, text="'pyserial' kütüphanesi kurulu değil.\nKurmak için: pip install pyserial",
@@ -11231,7 +13407,7 @@ class MainApp(ctk.CTkToplevel):
         form = ctk.CTkFrame(pencere, fg_color=gecerli_renk(RENK_KART), corner_radius=12)
         form.pack(fill="x", padx=20, pady=(0, 15))
 
-        ctk.CTkLabel(form, text="COM Portu:", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(12, 2))
+        ctk.CTkLabel(form, text="COM Portu:", font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(12, 2))
         port_satiri = ctk.CTkFrame(form, fg_color="transparent")
         port_satiri.pack(fill="x", padx=12, pady=(0, 8))
         port_secim = ctk.CTkOptionMenu(port_satiri, values=["Portları Tara →"], width=220)
@@ -11249,7 +13425,7 @@ class MainApp(ctk.CTkToplevel):
         if ayarlar.get("port"):
             port_secim.set(ayarlar["port"])
 
-        ctk.CTkLabel(form, text="Baud Rate (çoğu terazide 9600):", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(0, 2))
+        ctk.CTkLabel(form, text="Baud Rate (çoğu terazide 9600):", font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(0, 2))
         baud_secim = ctk.CTkOptionMenu(form, values=["9600", "4800", "2400", "19200", "38400"], width=220)
         baud_secim.set(str(ayarlar.get("baudrate", 9600)))
         baud_secim.pack(anchor="w", padx=12, pady=(0, 12))
@@ -11284,13 +13460,13 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        ctk.CTkLabel(pencere, text="🏷️ Etiket Yazdır", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=(18, 5))
-        ctk.CTkLabel(pencere, text=f"{urun_adi}  ({stok_kod})", font=("Arial", 12), wraplength=380).pack(pady=(0, 15))
+        ctk.CTkLabel(pencere, text="🏷️ Etiket Yazdır", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=(18, 5))
+        ctk.CTkLabel(pencere, text=f"{urun_adi}  ({stok_kod})", font=("Segoe UI", 12), wraplength=380).pack(pady=(0, 15))
 
         form = ctk.CTkFrame(pencere, fg_color=gecerli_renk(RENK_KART), corner_radius=12)
         form.pack(fill="x", padx=20, pady=(0, 10))
 
-        ctk.CTkLabel(form, text=f"Miktar / Ağırlık ({birim}):", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(form, text=f"Miktar / Ağırlık ({birim}):", font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(10, 2))
         et_miktar_satiri = ctk.CTkFrame(form, fg_color="transparent")
         et_miktar_satiri.pack(fill="x", padx=12, pady=(0, 8))
         et_miktar = ctk.CTkEntry(et_miktar_satiri, placeholder_text=f"Örn: 25 (bu ruloya/çuvala özel miktar)")
@@ -11300,14 +13476,14 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(et_miktar_satiri, text="⚙️", width=32, fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
                       command=self.tarti_ayarlari_penceresi).pack(side="left")
 
-        ctk.CTkLabel(form, text="Tarih:", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(0, 2))
+        ctk.CTkLabel(form, text="Tarih:", font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(0, 2))
         et_tarih = ctk.CTkEntry(form)
         et_tarih.insert(0, datetime.now().strftime("%d.%m.%Y"))
         et_tarih.pack(fill="x", padx=12, pady=(0, 8))
 
         boyut_satiri = ctk.CTkFrame(form, fg_color="transparent")
         boyut_satiri.pack(fill="x", padx=12, pady=(0, 10))
-        ctk.CTkLabel(boyut_satiri, text="Etiket Boyutu (mm):", font=("Arial", 11)).pack(side="left")
+        ctk.CTkLabel(boyut_satiri, text="Etiket Boyutu (mm):", font=("Segoe UI", 11)).pack(side="left")
         et_genislik = ctk.CTkEntry(boyut_satiri, width=60)
         et_genislik.insert(0, "80")
         et_genislik.pack(side="left", padx=(8, 4))
@@ -11318,7 +13494,7 @@ class MainApp(ctk.CTkToplevel):
 
         yazici_cerceve = ctk.CTkFrame(pencere, fg_color=gecerli_renk(RENK_KART), corner_radius=12)
         yazici_cerceve.pack(fill="x", padx=20, pady=(0, 15))
-        ctk.CTkLabel(yazici_cerceve, text="Etiket Yazıcısı:", font=("Arial", 11)).pack(anchor="w", padx=12, pady=(10, 2))
+        ctk.CTkLabel(yazici_cerceve, text="Etiket Yazıcısı:", font=("Segoe UI", 11)).pack(anchor="w", padx=12, pady=(10, 2))
 
         if PYWIN32_MEVCUT:
             try:
@@ -11341,7 +13517,7 @@ class MainApp(ctk.CTkToplevel):
             et_yazici = None
             uyari_metni = ("'pywin32' kurulu değil - doğrudan yazdırma kapalı, sadece önizleme açılacak.\nKurmak için: pip install pywin32"
                             if not PYWIN32_MEVCUT else "Sistemde tanımlı yazıcı bulunamadı.")
-            ctk.CTkLabel(yazici_cerceve, text=uyari_metni, font=("Arial", 10), text_color="#F7B341",
+            ctk.CTkLabel(yazici_cerceve, text=uyari_metni, font=("Segoe UI", 10), text_color="#F7B341",
                          wraplength=370, justify="left").pack(anchor="w", padx=12, pady=(0, 10))
 
         def pdf_olustur_ve_indir():
@@ -11407,64 +13583,83 @@ class MainApp(ctk.CTkToplevel):
     def stoklari_yukle(self):
         try:
             res = requests.get(f"{API}/stok-listesi", headers=self.req_headers(), timeout=5)
-            
-            # 1. Önce eski satırları temizle
-            for i in self.stok_tree.get_children():
-                self.stok_tree.delete(i)
-                
             stoklar = res.json().get("stoklar", [])
             self._stok_onbellek = {s["StokKod"]: s for s in stoklar}
-
-            # --- SİHİRLİ DOKUNUŞ: EMPTY STATE (BOŞ DURUM) KONTROLÜ ---
-            if len(stoklar) == 0:
-                # Tablodaki kolon sırasına göre yazıyı ortaya (2. kolona) denk getiriyoruz
-                self.stok_tree.insert("", "end", values=("—", "📭 Henüz kayıt bulunmamaktadır", "—", "—", "—", "—", "—", "—", "—", "—"), tags=("bos_kayit",))
-                
-                # Bu satırın rengini soluk gri yapıyoruz ki tıklanabilir bir veri olmadığı belli olsun
-                self.stok_tree.tag_configure("bos_kayit", foreground="#71717a") 
-                return # Alt taraftaki döngüye girmeden fonksiyonu bitir
-            # --------------------------------------------------------
-
-            # 2. Eğer veri varsa, zebra deseniyle normal bas
-            for index, s in enumerate(stoklar):
-                etiket = 'cift' if index % 2 == 0 else 'tek'
-                kar_marji = s.get("KarMarji", 0)
-                rezerve = s.get("RezerveMiktar", 0)
-                kullanilabilir = s.get("KullanilabilirMiktar", s["MevcutMiktar"])
-                # Kullanılabilir miktar eksiye düştüyse (fazla rezervasyon/arz sıkıntısı) kırmızı vurgula
-                satir_etiketi = 'kullanilabilir_negatif' if kullanilabilir < 0 else etiket
-                self.stok_tree.insert("", "end", iid=s["StokKod"], tags=(satir_etiketi,),
-                                       values=(s["StokKod"], s["StokAdi"], s["MevcutMiktar"], f"{rezerve:g}", f"{kullanilabilir:g}", s["Birim"],
-                                               f"{s['BirimFiyat']:.2f}", f"{s.get('OrtalamaMaliyet', 0):.2f}",
-                                               f"%{kar_marji:g}", s["MinStokSeviyesi"]))
-            self.stok_tree.tag_configure('kullanilabilir_negatif', foreground="#F36D6D")
         except Exception:
-            pass
+            self._stok_onbellek = {}
+        self._stok_tree_render()
+
+    def _stok_urun_sec_ile_ara(self):
+        def secildi(kod, ad):
+            self._stok_tree_render()
+            if kod in self.stok_tree.get_children():
+                self.stok_tree.selection_set(kod)
+                self.stok_tree.see(kod)
+        self.urun_secim_penceresi(self.stok_arama, on_select=secildi)
+
+    def _stok_tree_render(self):
+        if not hasattr(self, "stok_tree"):
+            return
+        for i in self.stok_tree.get_children():
+            self.stok_tree.delete(i)
+        stoklar = list(self._stok_onbellek.values())
+        arama = self.stok_arama.get().strip().lower() if hasattr(self, "stok_arama") else ""
+        if arama:
+            stoklar = [s for s in stoklar if arama in s["StokKod"].lower() or arama in s["StokAdi"].lower()]
+
+        # --- SİHİRLİ DOKUNUŞ: EMPTY STATE (BOŞ DURUM) KONTROLÜ ---
+        if len(stoklar) == 0:
+            # Tablodaki kolon sırasına göre yazıyı ortaya (2. kolona) denk getiriyoruz
+            self.stok_tree.insert("", "end", values=("—", "📭 Henüz kayıt bulunmamaktadır", "—", "—", "—", "—", "—", "—", "—", "—", "—"), tags=("bos_kayit",))
+            # Bu satırın rengini soluk gri yapıyoruz ki tıklanabilir bir veri olmadığı belli olsun
+            self.stok_tree.tag_configure("bos_kayit", foreground="#71717a")
+            return
+        # --------------------------------------------------------
+
+        # Eğer veri varsa, zebra deseniyle normal bas
+        for index, s in enumerate(stoklar):
+            etiket = 'cift' if index % 2 == 0 else 'tek'
+            kar_marji = s.get("KarMarji", 0)
+            rezerve = s.get("RezerveMiktar", 0)
+            kullanilabilir = s.get("KullanilabilirMiktar", s["MevcutMiktar"])
+            # Kullanılabilir miktar eksiye düştüyse (fazla rezervasyon/arz sıkıntısı) kırmızı vurgula
+            satir_etiketi = 'kullanilabilir_negatif' if kullanilabilir < 0 else etiket
+            min_seviye = s["MinStokSeviyesi"]
+            if not min_seviye:
+                durum_metni, durum_tag = "-", "stok_yeterli"
+            elif s["MevcutMiktar"] <= min_seviye:
+                durum_metni, durum_tag = "Kritik", "stok_kritik"
+            elif s["MevcutMiktar"] <= min_seviye * 1.5:
+                durum_metni, durum_tag = "Düşük", "stok_dusuk"
+            else:
+                durum_metni, durum_tag = "Yeterli", "stok_yeterli"
+            self.stok_tree.insert("", "end", iid=s["StokKod"], tags=(satir_etiketi, durum_tag),
+                                   values=(s["StokKod"], s["StokAdi"], s["MevcutMiktar"], f"{rezerve:g}", f"{kullanilabilir:g}", s["Birim"],
+                                           f"{s['BirimFiyat']:.2f}", f"{s.get('OrtalamaMaliyet', 0):.2f}",
+                                           f"%{kar_marji:g}", min_seviye, durum_metni))
+        self.stok_tree.tag_configure('kullanilabilir_negatif', foreground="#F36D6D")
 
     def init_depolar(self):
         ust = ctk.CTkFrame(self.tab_depolar, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🏭 Depo Yönetimi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🏭 Depo Yönetimi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
 
         # --- Depo Ekleme + Liste ---
         depo_cerceve = ctk.CTkFrame(self.tab_depolar, fg_color=RENK_KART, corner_radius=12)
         depo_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ekle_satiri = ctk.CTkFrame(depo_cerceve, fg_color="transparent")
-        ekle_satiri.pack(fill="x", padx=10, pady=10)
-        self.depo_ad_entry = ctk.CTkEntry(ekle_satiri, placeholder_text="Yeni Depo Adı", width=200)
-        self.depo_ad_entry.pack(side="left", padx=(0, 8))
-        self.depo_ack_entry = ctk.CTkEntry(ekle_satiri, placeholder_text="Açıklama (opsiyonel)", width=250)
-        self.depo_ack_entry.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(ekle_satiri, text="+ Depo Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.depo_ekle_islem).pack(side="left")
+        depo_ust = ctk.CTkFrame(depo_cerceve, fg_color="transparent")
+        depo_ust.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(depo_ust, text="Depolar", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkButton(depo_ust, text="+ Depo Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.depo_ekle_penceresi_ac).pack(side="right")
 
-        depo_liste_cerceve, self.depo_tree = tablo_olustur(depo_cerceve, ["ID", "Depo Adı", "Açıklama", "Varsayılan"], [50, 180, 300, 90], height=5)
-        depo_liste_cerceve.pack(fill="x", padx=10, pady=(0, 10))
+        self.depo_tree = OzelTablo(depo_cerceve, ["ID", "Depo Adı", "Açıklama", "Varsayılan"], [50, 180, 300, 90], height=5)
+        self.depo_tree.pack(fill="x", padx=10, pady=(0, 10))
 
         # --- Depo Transferi ---
         transfer_cerceve = ctk.CTkFrame(self.tab_depolar, fg_color=RENK_KART, corner_radius=12)
         transfer_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(transfer_cerceve, text="Depo Transferi", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        ctk.CTkLabel(transfer_cerceve, text="Depo Transferi", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
         t_satiri = ctk.CTkFrame(transfer_cerceve, fg_color="transparent")
         t_satiri.pack(fill="x", padx=10, pady=(0, 10))
         stok_frame = ctk.CTkFrame(t_satiri, fg_color="transparent")
@@ -11483,11 +13678,11 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(t_satiri, text="Transfer Et", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.depo_transfer_islem).pack(side="left")
 
-        ctk.CTkLabel(self.tab_depolar, text="Transfer Geçmişi", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 0))
-        transfer_liste_cerceve, self.depo_transfer_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_depolar, text="Transfer Geçmişi", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 0))
+        self.depo_transfer_tree = OzelTablo(
             self.tab_depolar, ["ID", "Stok Kod", "Kaynak Depo", "Hedef Depo", "Miktar", "Tarih", "Kullanıcı"],
             [50, 100, 150, 150, 80, 140, 100], height=10)
-        transfer_liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.depo_transfer_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self._depolar_cache = []
         self.depolari_yukle()
@@ -11511,22 +13706,41 @@ class MainApp(ctk.CTkToplevel):
         except Exception:
             pass
 
-    def depo_ekle_islem(self):
-        ad = self.depo_ad_entry.get().strip()
-        if not ad:
-            messagebox.showwarning("Eksik Bilgi", "Depo adı zorunludur.")
-            return
-        data = {"DepoAdi": ad, "Aciklama": self.depo_ack_entry.get().strip() or None}
-        try:
-            res = requests.post(f"{API}/depo-ekle", json=data, headers=self.req_headers(), timeout=5)
-            if res.status_code == 200:
-                self.depo_ad_entry.delete(0, "end")
-                self.depo_ack_entry.delete(0, "end")
-                self.depolari_yukle()
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+    def depo_ekle_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Depo")
+        self._pencere_ortala(pencere, 440, 340)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="🏭 Yeni Depo", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        depo_ad = ctk.CTkEntry(pencere, placeholder_text="Depo Adı", width=280)
+        depo_ad.pack(pady=5)
+        depo_ack = ctk.CTkEntry(pencere, placeholder_text="Açıklama (opsiyonel)", width=280)
+        depo_ack.pack(pady=5)
+
+        def kaydet():
+            ad = depo_ad.get().strip()
+            if not ad:
+                messagebox.showwarning("Eksik Bilgi", "Depo adı zorunludur.")
+                return
+            data = {"DepoAdi": ad, "Aciklama": depo_ack.get().strip() or None}
+            try:
+                res = requests.post(f"{API}/depo-ekle", json=data, headers=self.req_headers(), timeout=5)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.depolari_yukle()
+                    messagebox.showinfo("Başarılı", "Depo eklendi.")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="+ Depo Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
+        self.after(100, lambda: depo_ad.focus_set())
 
     def depo_transfer_islem(self):
         stok_kod = self.dt_stok.get().strip()
@@ -11585,7 +13799,7 @@ class MainApp(ctk.CTkToplevel):
         pencere.geometry("380x360")
         pencere.transient(self)
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"🏭 {stok_kod} — Depo Dağılımı", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
+        ctk.CTkLabel(pencere, text=f"🏭 {stok_kod} — Depo Dağılımı", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
         alan = ctk.CTkScrollableFrame(pencere, fg_color=gecerli_renk(RENK_KART))
         alan.pack(fill="both", expand=True, padx=20, pady=(0, 15))
         if not dagilim:
@@ -11593,8 +13807,8 @@ class MainApp(ctk.CTkToplevel):
         for d in dagilim:
             satir = ctk.CTkFrame(alan, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=12)
             satir.pack(fill="x", pady=4, padx=4)
-            ctk.CTkLabel(satir, text=d["DepoAdi"], font=("Arial", 12, "bold")).pack(side="left", padx=12, pady=10)
-            ctk.CTkLabel(satir, text=f"{d['Miktar']:g}", font=("Arial", 13, "bold"), text_color="#45C89D").pack(side="right", padx=12, pady=10)
+            ctk.CTkLabel(satir, text=d["DepoAdi"], font=("Segoe UI", 12, "bold")).pack(side="left", padx=12, pady=10)
+            ctk.CTkLabel(satir, text=f"{d['Miktar']:g}", font=("Segoe UI", 13, "bold"), text_color="#45C89D").pack(side="right", padx=12, pady=10)
         ctk.CTkButton(pencere, text="Kapat", fg_color=gecerli_renk(RENK_KENARLIK), command=pencere.destroy).pack(pady=(0, 15))
 
     def stok_alternatifler_goster(self):
@@ -11609,7 +13823,7 @@ class MainApp(ctk.CTkToplevel):
         pencere.geometry("420x420")
         pencere.transient(self)
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"🔀 {stok_kod} — Alternatif Ürünler", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
+        ctk.CTkLabel(pencere, text=f"🔀 {stok_kod} — Alternatif Ürünler", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
 
         ekle_satiri = ctk.CTkFrame(pencere, fg_color="transparent")
         ekle_satiri.pack(fill="x", padx=20)
@@ -11632,8 +13846,8 @@ class MainApp(ctk.CTkToplevel):
             for a in alternatifler:
                 satir = ctk.CTkFrame(alan, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=12)
                 satir.pack(fill="x", pady=4, padx=4)
-                ctk.CTkLabel(satir, text=f"{a['AlternatifStokKod']} — {a['StokAdi']}", font=("Arial", 12, "bold")).pack(side="left", padx=12, pady=10)
-                ctk.CTkLabel(satir, text=f"{a['MevcutMiktar']:g} {a['Birim']}", font=("Arial", 11), text_color="#45C89D").pack(side="left", padx=(0, 12))
+                ctk.CTkLabel(satir, text=f"{a['AlternatifStokKod']} — {a['StokAdi']}", font=("Segoe UI", 12, "bold")).pack(side="left", padx=12, pady=10)
+                ctk.CTkLabel(satir, text=f"{a['MevcutMiktar']:g} {a['Birim']}", font=("Segoe UI", 11), text_color="#45C89D").pack(side="left", padx=(0, 12))
                 ctk.CTkButton(satir, text="✕", width=28, fg_color="#F36D6D", hover_color="#CF5D5D",
                               command=lambda aid=a["AlternatifID"]: kaldir(aid)).pack(side="right", padx=8)
 
@@ -11684,8 +13898,8 @@ class MainApp(ctk.CTkToplevel):
             return
         vals = self.stok_tree.item(secili[0])["values"]
         onbellek_kaydi = getattr(self, "_stok_onbellek", {}).get(str(secili[0]), {})
-        mevcut = {"StokKod": vals[0], "StokAdi": vals[1], "Birim": vals[3], "BirimFiyat": vals[4],
-                  "MinStokSeviyesi": vals[5], "Barkod": onbellek_kaydi.get("Barkod", ""),
+        mevcut = {"StokKod": vals[0], "StokAdi": vals[1], "Birim": vals[5], "BirimFiyat": vals[6],
+                  "MinStokSeviyesi": vals[9], "Barkod": onbellek_kaydi.get("Barkod", ""),
                   "UrunGrubu": onbellek_kaydi.get("UrunGrubu", ""),
                   "GtipKodu": onbellek_kaydi.get("GtipKodu", "")}
 
@@ -11736,7 +13950,7 @@ class MainApp(ctk.CTkToplevel):
         me_frame.pack(pady=20, padx=20)
 
         # 3. Karta Başlık Ekliyoruz (Boş form yerine kurumsal bir karşılama)
-        baslik = ctk.CTkLabel(me_frame, text="Yeni Müşteri Kayıt Formu", font=("Arial", 18, "bold"), text_color="#76CCE1")
+        baslik = ctk.CTkLabel(me_frame, text="Yeni Müşteri Kayıt Formu", font=("Segoe UI", 18, "bold"), text_color="#76CCE1")
         baslik.grid(row=0, column=0, columnspan=2, pady=(25, 15))
 
         # 4. İnputlar (height=35 ile kutulara biraz daha nefes aldırıyoruz)
@@ -11766,7 +13980,7 @@ class MainApp(ctk.CTkToplevel):
         
         ctk.CTkButton(me_frame, text="Müşteriyi Kaydet", 
                       fg_color="#42ACA2", hover_color="#38928A", text_color="black", 
-                      font=("Arial", 14, "bold"), height=40,
+                      font=("Segoe UI", 14, "bold"), height=40,
                       command=self.musteri_kayit).grid(row=5, column=0, columnspan=2, pady=(20, 30), padx=20, sticky="we")
         
 # --- ENTER TUŞU İLE KAYDETME ---
@@ -11805,41 +14019,19 @@ class MainApp(ctk.CTkToplevel):
         self._proje_aktif_id = None
         ust = ctk.CTkFrame(self.tab_projeler, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📁 Projeler", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📁 Projeler", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.proje_listesi_yukle).pack(side="right")
 
-        ekle_cerceve = ctk.CTkFrame(self.tab_projeler, fg_color=RENK_KART, corner_radius=12)
-        ekle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(10, 5))
-        self.pj_ad = ctk.CTkEntry(satir1, placeholder_text="Proje Adı", width=220)
-        self.pj_ad.pack(side="left", padx=(0, 8))
-        self.pj_butce = ctk.CTkEntry(satir1, placeholder_text="Bütçe (TL)", width=110)
-        self.pj_butce.pack(side="left", padx=(0, 8))
-        self.pj_durum = ctk.CTkOptionMenu(satir1, values=["Planlandı", "Devam Ediyor", "Tamamlandı", "İptal"], width=140)
-        self.pj_durum.pack(side="left", padx=(0, 8))
-        mus_frame = ctk.CTkFrame(satir1, fg_color="transparent")
-        mus_frame.pack(side="left", padx=(0, 8))
-        self.pj_musteri_id = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID (opsiyonel)", width=140)
-        self.pj_musteri_id.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.pj_musteri_id)).pack(side="left")
+        ust_buton_satiri = ctk.CTkFrame(self.tab_projeler, fg_color="transparent")
+        ust_buton_satiri.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkButton(ust_buton_satiri, text="+ Proje Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.proje_ekle_penceresi_ac).pack(side="left")
 
-        satir2 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 10))
-        self.pj_baslangic = ctk.CTkEntry(satir2, placeholder_text="Başlangıç (YYYY-AA-GG)", width=160)
-        self.pj_baslangic.pack(side="left", padx=(0, 8))
-        self.pj_bitis = ctk.CTkEntry(satir2, placeholder_text="Bitiş (YYYY-AA-GG)", width=160)
-        self.pj_bitis.pack(side="left", padx=(0, 8))
-        self.pj_ack = ctk.CTkEntry(satir2, placeholder_text="Açıklama", width=260)
-        self.pj_ack.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir2, text="+ Proje Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.proje_ekle_islem).pack(side="left")
-
-        liste_cerceve, self.proje_tree = tablo_olustur(
+        self.proje_tree = OzelTablo(
             self.tab_projeler, ["ID", "Proje Adı", "Müşteri", "Başlangıç", "Bitiş", "Bütçe", "Durum"],
-            [40, 200, 150, 100, 100, 100, 110], height=12)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+            [40, 200, 150, 100, 100, 100, 110], height=12, durum_kolonu="Durum")
+        self.proje_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
 
         alt_satir = ctk.CTkFrame(self.tab_projeler, fg_color="transparent")
         alt_satir.pack(fill="x", padx=20, pady=(0, 15))
@@ -11852,32 +14044,63 @@ class MainApp(ctk.CTkToplevel):
 
         self.proje_listesi_yukle()
 
-    def proje_ekle_islem(self):
-        ad = self.pj_ad.get().strip()
-        if not ad:
-            messagebox.showwarning("Eksik Bilgi", "Proje adı girin.")
-            return
-        try:
-            butce = float(self.pj_butce.get() or 0)
-        except ValueError:
-            messagebox.showwarning("Eksik/Hatalı Bilgi", "Bütçe sayısal olmalıdır.")
-            return
-        musteri_id_str = self.pj_musteri_id.get().strip()
-        data = {"ProjeAdi": ad, "Butce": butce, "Durum": self.pj_durum.get(),
-                "MusteriID": int(musteri_id_str) if musteri_id_str.isdigit() else None,
-                "BaslangicTarihi": self.pj_baslangic.get().strip() or None,
-                "BitisTarihi": self.pj_bitis.get().strip() or None,
-                "Aciklama": self.pj_ack.get().strip() or None}
-        try:
-            res = requests.post(f"{API}/proje", json=data, headers=self.req_headers(), timeout=6)
-            if res.status_code == 200:
-                for e in (self.pj_ad, self.pj_butce, self.pj_musteri_id, self.pj_baslangic, self.pj_bitis, self.pj_ack):
-                    e.delete(0, "end")
-                self.proje_listesi_yukle()
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+    def proje_ekle_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Proje")
+        self._pencere_ortala(pencere, 460, 520)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="📁 Yeni Proje", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        pj_ad = ctk.CTkEntry(pencere, placeholder_text="Proje Adı", width=320)
+        pj_ad.pack(pady=5)
+        pj_butce = ctk.CTkEntry(pencere, placeholder_text="Bütçe (TL)", width=320)
+        pj_butce.pack(pady=5)
+        pj_durum = ctk.CTkOptionMenu(pencere, values=["Planlandı", "Devam Ediyor", "Tamamlandı", "İptal"], width=320)
+        pj_durum.pack(pady=5)
+        mus_frame = ctk.CTkFrame(pencere, fg_color="transparent")
+        mus_frame.pack(pady=5)
+        pj_musteri_id = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID (opsiyonel)", width=280)
+        pj_musteri_id.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(pj_musteri_id)).pack(side="left")
+        pj_baslangic = ctk.CTkEntry(pencere, placeholder_text="Başlangıç (YYYY-AA-GG)", width=320)
+        pj_baslangic.pack(pady=5)
+        pj_bitis = ctk.CTkEntry(pencere, placeholder_text="Bitiş (YYYY-AA-GG)", width=320)
+        pj_bitis.pack(pady=5)
+        pj_ack = ctk.CTkEntry(pencere, placeholder_text="Açıklama", width=320)
+        pj_ack.pack(pady=5)
+
+        def kaydet():
+            ad = pj_ad.get().strip()
+            if not ad:
+                messagebox.showwarning("Eksik Bilgi", "Proje adı girin.")
+                return
+            try:
+                butce = float(pj_butce.get() or 0)
+            except ValueError:
+                messagebox.showwarning("Eksik/Hatalı Bilgi", "Bütçe sayısal olmalıdır.")
+                return
+            musteri_id_str = pj_musteri_id.get().strip()
+            data = {"ProjeAdi": ad, "Butce": butce, "Durum": pj_durum.get(),
+                    "MusteriID": int(musteri_id_str) if musteri_id_str.isdigit() else None,
+                    "BaslangicTarihi": pj_baslangic.get().strip() or None,
+                    "BitisTarihi": pj_bitis.get().strip() or None,
+                    "Aciklama": pj_ack.get().strip() or None}
+            try:
+                res = requests.post(f"{API}/proje", json=data, headers=self.req_headers(), timeout=6)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.proje_listesi_yukle()
+                    messagebox.showinfo("Başarılı", "Proje eklendi.")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="+ Proje Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
 
     def proje_listesi_yukle(self):
         for i in self.proje_tree.get_children():
@@ -11962,79 +14185,89 @@ class MainApp(ctk.CTkToplevel):
         ust = ctk.CTkFrame(self.tab_proje_gorevleri, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
         self.pg_baslik_label = ctk.CTkLabel(ust, text="✅ Proje Görevleri — (önce Projeler'den bir proje seçin)",
-                                             font=("Arial", 18, "bold"), text_color="#76CCE1")
+                                             font=("Segoe UI", 18, "bold"), text_color="#76CCE1")
         self.pg_baslik_label.pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.proje_gorev_listesi_yukle).pack(side="right")
 
-        self.pg_ozet_label = ctk.CTkLabel(self.tab_proje_gorevleri, text="", font=("Arial", 12), text_color=RENK_METIN_SOLUK)
+        self.pg_ozet_label = ctk.CTkLabel(self.tab_proje_gorevleri, text="", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK)
         self.pg_ozet_label.pack(anchor="w", padx=20, pady=(0, 8))
 
-        ekle_cerceve = ctk.CTkFrame(self.tab_proje_gorevleri, fg_color=RENK_KART, corner_radius=12)
-        ekle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(10, 5))
-        self.pg_ad = ctk.CTkEntry(satir1, placeholder_text="Görev Adı", width=220)
-        self.pg_ad.pack(side="left", padx=(0, 8))
-        self.pg_sorumlu = ctk.CTkEntry(satir1, placeholder_text="Sorumlu (kullanıcı adı)", width=150)
-        self.pg_sorumlu.pack(side="left", padx=(0, 8))
-        self.pg_oncelik = ctk.CTkOptionMenu(satir1, values=["Düşük", "Orta", "Yüksek"], width=100)
-        self.pg_oncelik.set("Orta")
-        self.pg_oncelik.pack(side="left", padx=(0, 8))
-        self.pg_durum = ctk.CTkOptionMenu(satir1, values=["Yapılacak", "Devam Ediyor", "Tamamlandı"], width=130)
-        self.pg_durum.pack(side="left", padx=(0, 8))
+        ust_buton_satiri = ctk.CTkFrame(self.tab_proje_gorevleri, fg_color="transparent")
+        ust_buton_satiri.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkButton(ust_buton_satiri, text="+ Görev Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.proje_gorev_ekle_penceresi_ac).pack(side="left")
 
-        satir2 = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 10))
-        self.pg_baslangic = ctk.CTkEntry(satir2, placeholder_text="Başlangıç (YYYY-AA-GG)", width=150)
-        self.pg_baslangic.pack(side="left", padx=(0, 8))
-        self.pg_bitis = ctk.CTkEntry(satir2, placeholder_text="Bitiş (YYYY-AA-GG)", width=150)
-        self.pg_bitis.pack(side="left", padx=(0, 8))
-        self.pg_tahmini_saat = ctk.CTkEntry(satir2, placeholder_text="Tahmini Saat", width=110)
-        self.pg_tahmini_saat.pack(side="left", padx=(0, 8))
-        self.pg_gercek_saat = ctk.CTkEntry(satir2, placeholder_text="Gerçekleşen Saat", width=120)
-        self.pg_gercek_saat.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir2, text="+ Görev Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.proje_gorev_ekle_islem).pack(side="left")
-
-        liste_cerceve, self.gorev_tree = tablo_olustur(
+        self.gorev_tree = OzelTablo(
             self.tab_proje_gorevleri, ["ID", "Görev", "Sorumlu", "Başlangıç", "Bitiş", "Tahmini Saat", "Gerçek Saat", "Durum", "Öncelik"],
-            [40, 200, 120, 100, 100, 90, 90, 110, 80], height=12)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+            [40, 200, 120, 100, 100, 90, 90, 110, 80], height=12, durum_kolonu="Durum")
+        self.gorev_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
         self.gorev_tree.bind("<Double-Button-1>", self.proje_gorev_durum_ilerlet)
 
         ctk.CTkLabel(self.tab_proje_gorevleri, text="Bir göreve çift tıklayarak durumunu ilerletebilirsiniz (Yapılacak → Devam Ediyor → Tamamlandı).",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 5))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 5))
         ctk.CTkButton(self.tab_proje_gorevleri, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
                       command=self.proje_gorev_sil_islem).pack(anchor="w", padx=20, pady=(0, 15))
 
-    def proje_gorev_ekle_islem(self):
+    def proje_gorev_ekle_penceresi_ac(self):
         if not self._proje_aktif_id:
             messagebox.showinfo("Proje Seçilmedi", "Önce 'Projeler' ekranından bir proje seçip 'Görevlerini Görüntüle'ye basın.")
             return
-        ad = self.pg_ad.get().strip()
-        if not ad:
-            messagebox.showwarning("Eksik Bilgi", "Görev adı girin.")
-            return
-        try:
-            tahmini = float(self.pg_tahmini_saat.get()) if self.pg_tahmini_saat.get().strip() else None
-            gercek = float(self.pg_gercek_saat.get()) if self.pg_gercek_saat.get().strip() else None
-        except ValueError:
-            messagebox.showwarning("Eksik/Hatalı Bilgi", "Saat alanları sayısal olmalıdır.")
-            return
-        data = {"ProjeID": self._proje_aktif_id, "GorevAdi": ad, "SorumluKullanici": self.pg_sorumlu.get().strip() or None,
-                "BaslangicTarihi": self.pg_baslangic.get().strip() or None, "BitisTarihi": self.pg_bitis.get().strip() or None,
-                "TahminiSaat": tahmini, "GercekSaat": gercek, "Durum": self.pg_durum.get(), "Oncelik": self.pg_oncelik.get()}
-        try:
-            res = requests.post(f"{API}/proje-gorev", json=data, headers=self.req_headers(), timeout=6)
-            if res.status_code == 200:
-                for e in (self.pg_ad, self.pg_sorumlu, self.pg_baslangic, self.pg_bitis, self.pg_tahmini_saat, self.pg_gercek_saat):
-                    e.delete(0, "end")
-                self.proje_gorev_listesi_yukle()
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Proje Görevi")
+        self._pencere_ortala(pencere, 460, 520)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="✅ Yeni Proje Görevi", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        pg_ad = ctk.CTkEntry(pencere, placeholder_text="Görev Adı", width=320)
+        pg_ad.pack(pady=5)
+        pg_sorumlu = ctk.CTkEntry(pencere, placeholder_text="Sorumlu (kullanıcı adı)", width=320)
+        pg_sorumlu.pack(pady=5)
+        pg_oncelik = ctk.CTkOptionMenu(pencere, values=["Düşük", "Orta", "Yüksek"], width=320)
+        pg_oncelik.set("Orta")
+        pg_oncelik.pack(pady=5)
+        pg_durum = ctk.CTkOptionMenu(pencere, values=["Yapılacak", "Devam Ediyor", "Tamamlandı"], width=320)
+        pg_durum.pack(pady=5)
+        pg_baslangic = ctk.CTkEntry(pencere, placeholder_text="Başlangıç (YYYY-AA-GG)", width=320)
+        pg_baslangic.pack(pady=5)
+        pg_bitis = ctk.CTkEntry(pencere, placeholder_text="Bitiş (YYYY-AA-GG)", width=320)
+        pg_bitis.pack(pady=5)
+        pg_tahmini_saat = ctk.CTkEntry(pencere, placeholder_text="Tahmini Saat", width=320)
+        pg_tahmini_saat.pack(pady=5)
+        pg_gercek_saat = ctk.CTkEntry(pencere, placeholder_text="Gerçekleşen Saat", width=320)
+        pg_gercek_saat.pack(pady=5)
+
+        def kaydet():
+            ad = pg_ad.get().strip()
+            if not ad:
+                messagebox.showwarning("Eksik Bilgi", "Görev adı girin.")
+                return
+            try:
+                tahmini = float(pg_tahmini_saat.get()) if pg_tahmini_saat.get().strip() else None
+                gercek = float(pg_gercek_saat.get()) if pg_gercek_saat.get().strip() else None
+            except ValueError:
+                messagebox.showwarning("Eksik/Hatalı Bilgi", "Saat alanları sayısal olmalıdır.")
+                return
+            data = {"ProjeID": self._proje_aktif_id, "GorevAdi": ad, "SorumluKullanici": pg_sorumlu.get().strip() or None,
+                    "BaslangicTarihi": pg_baslangic.get().strip() or None, "BitisTarihi": pg_bitis.get().strip() or None,
+                    "TahminiSaat": tahmini, "GercekSaat": gercek, "Durum": pg_durum.get(), "Oncelik": pg_oncelik.get()}
+            try:
+                res = requests.post(f"{API}/proje-gorev", json=data, headers=self.req_headers(), timeout=6)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.proje_gorev_listesi_yukle()
+                    messagebox.showinfo("Başarılı", "Görev eklendi.")
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="+ Görev Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
 
     def proje_gorev_listesi_yukle(self):
         for i in self.gorev_tree.get_children():
@@ -12098,18 +14331,18 @@ class MainApp(ctk.CTkToplevel):
     def init_tedarikci_skor(self):
         ust = ctk.CTkFrame(self.tab_tedarikci_skor, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="⭐ Tedarikçi Skor Kartı", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="⭐ Tedarikçi Skor Kartı", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.tedarikci_skor_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_tedarikci_skor,
                      text="Skor, Alış İrsaliyesi'nde girilen 'Söz Verilen Teslim' tarihi ve kalem bazlı kalite sonucu doldurulan kayıtlar üzerinden hesaplanır. Hiç veri girilmemiş tedarikçiler için skor gösterilmez.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=20, pady=(0, 6))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=20, pady=(0, 6))
 
-        cerceve, self.ts_tree = tablo_olustur(
+        self.ts_tree = OzelTablo(
             self.tab_tedarikci_skor,
             ["Tedarikçi", "Zamanında Teslimat", "Değerlendirilen Teslimat", "Kalite Kabul", "Değerlendirilen Kalem", "Genel Skor"],
             [220, 130, 140, 110, 130, 100], height=16)
-        cerceve.pack(pady=8, padx=20, fill="both", expand=True)
+        self.ts_tree.pack(pady=8, padx=20, fill="both", expand=True)
         self.tedarikci_skor_yukle()
 
     def tedarikci_skor_yukle(self):
@@ -12134,16 +14367,16 @@ class MainApp(ctk.CTkToplevel):
     def init_tedarikci_fiyat_karsilastirma(self):
         ust = ctk.CTkFrame(self.tab_tedarikci_fiyat, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="💲 Tedarikçi Fiyat Karşılaştırma", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="💲 Tedarikçi Fiyat Karşılaştırma", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkLabel(self.tab_tedarikci_fiyat,
                      text="Bir hammadde/ürünün geçmişte hangi tedarikçiden hangi fiyata alındığını gösterir - en ucuz ortalamaya sahip tedarikçi ilk sırada.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         form = ctk.CTkFrame(self.tab_tedarikci_fiyat, fg_color=RENK_KART, corner_radius=12)
         form.pack(fill="x", padx=20, pady=(0, 10))
         satir = ctk.CTkFrame(form, fg_color="transparent")
         satir.pack(fill="x", padx=12, pady=12)
-        ctk.CTkLabel(satir, text="Stok Kodu:", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(satir, text="Stok Kodu:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8))
         self.tf_stok_kod = ctk.CTkEntry(satir, placeholder_text="Örn: PP-001", width=150)
         self.tf_stok_kod.pack(side="left", padx=(0, 8))
         ctk.CTkButton(satir, text="🔑", width=35, fg_color="#5585EF", hover_color="#4871CB",
@@ -12151,19 +14384,19 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(satir, text="Karşılaştır", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.tedarikci_fiyat_gecmisi_yukle).pack(side="left")
 
-        self.tf_baslik_etiket = ctk.CTkLabel(self.tab_tedarikci_fiyat, text="", font=("Arial", 13, "bold"), text_color="#76CCE1")
+        self.tf_baslik_etiket = ctk.CTkLabel(self.tab_tedarikci_fiyat, text="", font=("Segoe UI", 13, "bold"), text_color="#76CCE1")
         self.tf_baslik_etiket.pack(anchor="w", padx=22, pady=(5, 3))
 
-        ctk.CTkLabel(self.tab_tedarikci_fiyat, text="Tedarikçi Özeti", font=("Arial", 12, "bold")).pack(anchor="w", padx=22, pady=(5, 2))
-        ozet_cerceve, self.tf_ozet_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_tedarikci_fiyat, text="Tedarikçi Özeti", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=22, pady=(5, 2))
+        self.tf_ozet_tree = OzelTablo(
             self.tab_tedarikci_fiyat, ["Tedarikçi", "Alış Sayısı", "Ortalama Fiyat", "Son Fiyat", "Son Alış Tarihi"], [220, 90, 120, 100, 120], height=6)
-        ozet_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        self.tf_ozet_tree.pack(fill="x", padx=20, pady=(0, 10))
         self.tf_ozet_tree.tag_configure("en_ucuz", foreground="#45C89D")
 
-        ctk.CTkLabel(self.tab_tedarikci_fiyat, text="Tüm Alış Geçmişi", font=("Arial", 12, "bold")).pack(anchor="w", padx=22, pady=(5, 2))
-        gecmis_cerceve, self.tf_gecmis_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_tedarikci_fiyat, text="Tüm Alış Geçmişi", font=("Segoe UI", 12, "bold")).pack(anchor="w", padx=22, pady=(5, 2))
+        self.tf_gecmis_tree = OzelTablo(
             self.tab_tedarikci_fiyat, ["Tedarikçi", "Birim Fiyat", "Miktar", "Tarih"], [220, 110, 100, 120], height=10)
-        gecmis_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.tf_gecmis_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
     def tedarikci_fiyat_gecmisi_yukle(self):
         stok_kod = self.tf_stok_kod.get().strip()
@@ -12197,24 +14430,37 @@ class MainApp(ctk.CTkToplevel):
             self.tf_gecmis_tree.insert("", "end", values=(g["Tedarikci"], f"{g['BirimFiyat']:,.2f}", f"{g['Miktar']:g}", g["Tarih"]))
 
     def init_tedarikci(self):
-        ted_frame = ctk.CTkFrame(self.tab_ted_ekle, fg_color=RENK_KART, corner_radius=12)
-        ted_frame.pack(pady=15, padx=15, fill="x")
-        self.t_firma = ctk.CTkEntry(ted_frame, placeholder_text="Tedarikçi Firma Adı", width=250)
-        self.t_firma.grid(row=0, column=0, padx=10, pady=10)
-        self.t_yetkili = ctk.CTkEntry(ted_frame, placeholder_text="Yetkili", width=200)
-        self.t_yetkili.grid(row=0, column=1, padx=10, pady=10)
-        self.t_tel = ctk.CTkEntry(ted_frame, placeholder_text="Telefon", width=200)
-        self.t_tel.grid(row=1, column=0, padx=10, pady=10)
-        self.t_vd = ctk.CTkEntry(ted_frame, placeholder_text="Vergi Dairesi", width=200)
-        self.t_vd.grid(row=1, column=1, padx=10, pady=10)
-        self.t_vno = ctk.CTkEntry(ted_frame, placeholder_text="Vergi No", width=200)
-        self.t_vno.grid(row=2, column=0, padx=10, pady=10)
-        self.t_adres = ctk.CTkEntry(ted_frame, placeholder_text="Adres", width=300)
-        self.t_adres.grid(row=2, column=1, padx=10, pady=10)
-        ctk.CTkButton(ted_frame, text="Tedarikçi Kaydet", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.tedarikci_kayit).grid(row=3, column=0, pady=10, padx=10, sticky="w")
+        self.ted_liste_govde = ctk.CTkFrame(self.tab_ted_ekle, fg_color="transparent")
+        self.ted_form_govde = ctk.CTkFrame(self.tab_ted_ekle, fg_color="transparent")
+        self._ted_veri_cache = []
+        self._ted_liste_olustur()
+        self._ted_form_olustur()
+        self.ted_liste_goster()
 
-        buton_satiri = ctk.CTkFrame(self.tab_ted_ekle, fg_color="transparent")
+    def ted_liste_goster(self):
+        self.ted_form_govde.pack_forget()
+        self.ted_liste_govde.pack(fill="both", expand=True)
+
+    def ted_form_goster(self):
+        self.ted_liste_govde.pack_forget()
+        for e in (self.t_firma, self.t_yetkili, self.t_tel, self.t_vd, self.t_vno, self.t_adres):
+            e.delete(0, "end")
+        self.ted_form_govde.pack(fill="both", expand=True)
+
+    def _ted_liste_olustur(self):
+        ust = ctk.CTkFrame(self.ted_liste_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=15, pady=(15, 5))
+        ctk.CTkLabel(ust, text="🏭 Tedarikçiler", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Tedarikçi", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.ted_form_goster).pack(side="right")
+
+        arama_satiri = ctk.CTkFrame(self.ted_liste_govde, fg_color="transparent")
+        arama_satiri.pack(fill="x", padx=15, pady=(0, 5))
+        self.ted_arama = ctk.CTkEntry(arama_satiri, placeholder_text="Ara (firma, yetkili, telefon, vergi no)...", width=320)
+        self.ted_arama.pack(side="left")
+        self.ted_arama.bind("<KeyRelease>", lambda e: self._ted_tree_render())
+
+        buton_satiri = ctk.CTkFrame(self.ted_liste_govde, fg_color="transparent")
         buton_satiri.pack(pady=(0, 5), padx=15, fill="x")
         ctk.CTkButton(buton_satiri, text="✏️ Seçileni Düzenle", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.tedarikci_duzenle_ac).pack(side="left", padx=5)
@@ -12223,11 +14469,44 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(buton_satiri, text="📥 Excel'e Aktar", fg_color="#42ACA2", hover_color="#38928A",
                       command=lambda: self.tabloyu_excele_aktar(self.ted_tree, "Tedarikci_Listesi")).pack(side="left", padx=5)
 
-        ted_cerceve, self.ted_tree = tablo_olustur(
-            self.tab_ted_ekle, ["ID", "Firma", "Yetkili", "Telefon", "Vergi Dairesi", "Vergi No", "Adres"],
-            [50, 220, 140, 110, 110, 90, 260], height=10)
-        ted_cerceve.pack(pady=10, padx=15, fill="both", expand=True)
+        self.ted_tree = OzelTablo(
+            self.ted_liste_govde, ["ID", "Firma", "Yetkili", "Telefon", "Vergi Dairesi", "Vergi No", "Adres"],
+            [50, 220, 140, 110, 110, 90, 260], height=14)
+        self.ted_tree.pack(pady=(0, 10), padx=15, fill="both", expand=True)
         self.tedarikcileri_yukle()
+
+    def _ted_form_olustur(self):
+        ust = ctk.CTkFrame(self.ted_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=15, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.ted_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Tedarikçi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Tedarikçi Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=150, height=30,
+                      command=self.tedarikci_kayit).pack(side="right")
+
+        ted_frame = ctk.CTkFrame(self.ted_form_govde, fg_color=RENK_KART, corner_radius=12)
+        ted_frame.pack(pady=(0, 15), padx=15, fill="x")
+
+        satir1 = ctk.CTkFrame(ted_frame, fg_color="transparent")
+        satir1.pack(fill="x", padx=15, pady=(15, 8))
+        self.t_firma = ctk.CTkEntry(satir1, placeholder_text="Tedarikçi Firma Adı", width=280)
+        self.t_firma.pack(side="left", padx=(0, 10))
+        self.t_yetkili = ctk.CTkEntry(satir1, placeholder_text="Yetkili", width=200)
+        self.t_yetkili.pack(side="left", padx=(0, 10))
+        self.t_tel = ctk.CTkEntry(satir1, placeholder_text="Telefon", width=160)
+        self.t_tel.pack(side="left")
+
+        satir2 = ctk.CTkFrame(ted_frame, fg_color="transparent")
+        satir2.pack(fill="x", padx=15, pady=(0, 8))
+        self.t_vd = ctk.CTkEntry(satir2, placeholder_text="Vergi Dairesi", width=200)
+        self.t_vd.pack(side="left", padx=(0, 10))
+        self.t_vno = ctk.CTkEntry(satir2, placeholder_text="Vergi No", width=160)
+        self.t_vno.pack(side="left")
+
+        satir3 = ctk.CTkFrame(ted_frame, fg_color="transparent")
+        satir3.pack(fill="x", padx=15, pady=(0, 15))
+        self.t_adres = ctk.CTkEntry(satir3, placeholder_text="Adres", width=560)
+        self.t_adres.pack(side="left", fill="x", expand=True)
 
     def tedarikci_kayit(self):
         if not self.t_firma.get().strip():
@@ -12238,13 +14517,9 @@ class MainApp(ctk.CTkToplevel):
                     "VergiDairesi": self.t_vd.get(), "VergiNo": self.t_vno.get(), "Adres": self.t_adres.get()}
             res = requests.post(f"{API}/tedarikci-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.t_firma.delete(0, "end")
-                self.t_yetkili.delete(0, "end")
-                self.t_tel.delete(0, "end")
-                self.t_vd.delete(0, "end")
-                self.t_vno.delete(0, "end")
-                self.t_adres.delete(0, "end")
                 self.tedarikcileri_yukle()
+                self.ted_liste_goster()
+                messagebox.showinfo("Başarılı", "Tedarikçi kaydedildi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -12253,13 +14528,23 @@ class MainApp(ctk.CTkToplevel):
     def tedarikcileri_yukle(self):
         try:
             res = requests.get(f"{API}/tedarikci-listesi", headers=self.req_headers(), timeout=5)
-            for i in self.ted_tree.get_children():
-                self.ted_tree.delete(i)
-            for t in res.json()["tedarikciler"]:
-                self.ted_tree.insert("", "end", iid=str(t["TedarikciID"]),
-                                      values=(t["TedarikciID"], t["FirmaAdi"], t["YetkiliKisi"], t["Telefon"], t["VergiDairesi"], t["VergiNo"], t["Adres"]))
+            self._ted_veri_cache = res.json().get("tedarikciler", []) if res.status_code == 200 else []
         except Exception:
-            pass
+            self._ted_veri_cache = []
+        self._ted_tree_render()
+
+    def _ted_tree_render(self):
+        if not hasattr(self, "ted_tree"):
+            return
+        for i in self.ted_tree.get_children():
+            self.ted_tree.delete(i)
+        arama = self.ted_arama.get().strip().lower() if hasattr(self, "ted_arama") else ""
+        for t in self._ted_veri_cache:
+            if arama and not any(arama in str(t.get(alan, "")).lower()
+                                  for alan in ("FirmaAdi", "YetkiliKisi", "Telefon", "VergiNo")):
+                continue
+            self.ted_tree.insert("", "end", iid=str(t["TedarikciID"]),
+                                  values=(t["TedarikciID"], t["FirmaAdi"], t["YetkiliKisi"], t["Telefon"], t["VergiDairesi"], t["VergiNo"], t["Adres"]))
 
     def tedarikci_duzenle_ac(self):
         secili = self.ted_tree.selection()
@@ -12299,40 +14584,68 @@ class MainApp(ctk.CTkToplevel):
             self.api_hata_goster(res)
 
     def init_musteri_sikayetleri(self):
-        ust = ctk.CTkFrame(self.tab_mus_sikayet, fg_color="transparent")
+        self.mus_sikayet_liste_govde = ctk.CTkFrame(self.tab_mus_sikayet, fg_color="transparent")
+        self.mus_sikayet_form_govde = ctk.CTkFrame(self.tab_mus_sikayet, fg_color="transparent")
+        self._mus_sikayet_liste_olustur()
+        self._mus_sikayet_form_olustur()
+        self.mus_sikayet_liste_goster()
+
+    def mus_sikayet_liste_goster(self):
+        self.mus_sikayet_form_govde.pack_forget()
+        self.mus_sikayet_liste_govde.pack(fill="both", expand=True)
+
+    def mus_sikayet_form_goster(self):
+        self.mus_sikayet_liste_govde.pack_forget()
+        self.sik_musteri_id.delete(0, "end")
+        self.sik_konu.delete(0, "end")
+        self.sik_oncelik.set("Orta")
+        self.sik_aciklama.delete(0, "end")
+        self.mus_sikayet_form_govde.pack(fill="both", expand=True)
+
+    def _mus_sikayet_liste_olustur(self):
+        ust = ctk.CTkFrame(self.mus_sikayet_liste_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📮 Müşteri Şikayetleri", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📮 Müşteri Şikayetleri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.musteri_sikayet_listesini_yukle).pack(side="right")
+        ctk.CTkButton(ust, text="+ Şikayet Aç", fg_color="#F36D6D", hover_color="#CF5D5D",
+                      command=self.mus_sikayet_form_goster).pack(side="right", padx=(0, 8))
 
-        form = ctk.CTkFrame(self.tab_mus_sikayet, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=10)
-        mus_frame = ctk.CTkFrame(satir1, fg_color="transparent")
-        mus_frame.pack(side="left", padx=(0, 8))
-        self.sik_musteri_id = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
-        self.sik_musteri_id.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.sik_musteri_id)).pack(side="left")
-        self.sik_konu = ctk.CTkEntry(satir1, placeholder_text="Konu", width=220)
-        self.sik_konu.pack(side="left", padx=(0, 8))
-        self.sik_oncelik = ctk.CTkOptionMenu(satir1, values=["Düşük", "Orta", "Yüksek"], width=100)
-        self.sik_oncelik.set("Orta")
-        self.sik_oncelik.pack(side="left", padx=(0, 8))
-        self.sik_aciklama = ctk.CTkEntry(satir1, placeholder_text="Açıklama", width=250)
-        self.sik_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir1, text="+ Şikayet Aç", fg_color="#F36D6D", hover_color="#CF5D5D",
-                      command=self.musteri_sikayet_ekle_islem).pack(side="left")
+        self.sikayet_tree = OzelTablo(
+            self.mus_sikayet_liste_govde, ["ID", "Müşteri", "Konu", "Öncelik", "Durum", "Çözüm", "Açan", "Açılış"],
+            [40, 160, 180, 80, 90, 220, 100, 130], height=14, durum_kolonu="Durum")
+        self.sikayet_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
 
-        liste_cerceve, self.sikayet_tree = tablo_olustur(
-            self.tab_mus_sikayet, ["ID", "Müşteri", "Konu", "Öncelik", "Durum", "Çözüm", "Açan", "Açılış"],
-            [40, 160, 180, 80, 90, 220, 100, 130], height=14)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
-
-        ctk.CTkButton(self.tab_mus_sikayet, text="🔒 Seçileni Kapat (Çözümle)", fg_color="#49B772", hover_color="#3E9C61",
+        ctk.CTkButton(self.mus_sikayet_liste_govde, text="🔒 Seçileni Kapat (Çözümle)", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.musteri_sikayet_kapat_islem).pack(anchor="w", padx=20, pady=(0, 15))
 
         self.musteri_sikayet_listesini_yukle()
+
+    def _mus_sikayet_form_olustur(self):
+        ust = ctk.CTkFrame(self.mus_sikayet_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.mus_sikayet_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Müşteri Şikayeti", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Şikayet Aç", fg_color="#F36D6D", hover_color="#CF5D5D", width=130, height=30,
+                      command=self.musteri_sikayet_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.mus_sikayet_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        mus_frame = ctk.CTkFrame(satir, fg_color="transparent")
+        mus_frame.pack(side="left", padx=(0, 8))
+        self.sik_musteri_id = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=100)
+        self.sik_musteri_id.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(self.sik_musteri_id)).pack(side="left")
+        self.sik_konu = ctk.CTkEntry(satir, placeholder_text="Konu", width=220)
+        self.sik_konu.pack(side="left", padx=(0, 8))
+        self.sik_oncelik = ctk.CTkOptionMenu(satir, values=["Düşük", "Orta", "Yüksek"], width=100)
+        self.sik_oncelik.set("Orta")
+        self.sik_oncelik.pack(side="left", padx=(0, 8))
+        self.sik_aciklama = ctk.CTkEntry(satir, placeholder_text="Açıklama", width=250)
+        self.sik_aciklama.pack(side="left")
 
     def musteri_sikayet_ekle_islem(self):
         try:
@@ -12349,10 +14662,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/musteri-sikayet", json=data, headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
-                self.sik_musteri_id.delete(0, "end")
-                self.sik_konu.delete(0, "end")
-                self.sik_aciklama.delete(0, "end")
                 self.musteri_sikayet_listesini_yukle()
+                self.mus_sikayet_liste_goster()
+                messagebox.showinfo("Başarılı", "Şikayet kaydı açıldı.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -12391,20 +14703,62 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_musteri_anlasmalari(self):
-        ust = ctk.CTkFrame(self.tab_mus_anlasma, fg_color="transparent")
+        self.mus_anlasma_liste_govde = ctk.CTkFrame(self.tab_mus_anlasma, fg_color="transparent")
+        self.mus_anlasma_form_govde = ctk.CTkFrame(self.tab_mus_anlasma, fg_color="transparent")
+        self._mus_anlasma_liste_olustur()
+        self._mus_anlasma_form_olustur()
+        self.mus_anlasma_liste_goster()
+
+    def mus_anlasma_liste_goster(self):
+        self.mus_anlasma_form_govde.pack_forget()
+        self.mus_anlasma_liste_govde.pack(fill="both", expand=True)
+
+    def mus_anlasma_form_goster(self):
+        self.mus_anlasma_liste_govde.pack_forget()
+        for e in (self.ma_musteri_id, self.ma_urun_grubu, self.ma_iskonto, self.ma_bitis, self.ma_aciklama):
+            e.delete(0, "end")
+        self.ma_baslangic.delete(0, "end")
+        self.ma_baslangic.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        self.mus_anlasma_form_govde.pack(fill="both", expand=True)
+
+    def _mus_anlasma_liste_olustur(self):
+        ust = ctk.CTkFrame(self.mus_anlasma_liste_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🤝 Müşteri Özel Fiyat/İskonto Anlaşmaları", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🤝 Müşteri Özel Fiyat/İskonto Anlaşmaları", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.musteri_anlasma_listesini_yukle).pack(side="right")
-        ctk.CTkLabel(self.tab_mus_anlasma,
+        ctk.CTkButton(ust, text="+ Yeni Anlaşma", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.mus_anlasma_form_goster).pack(side="right", padx=(0, 8))
+        ctk.CTkLabel(self.mus_anlasma_liste_govde,
                      text="Buradaki iskonto oranı fatura/teklif hesaplamasına OTOMATİK yansımaz - sadece anlaşmayı ve bitiş tarihini takip eder, "
                           "bitişe 14 gün kalınca Giriş ekranındaki bildirimlerde uyarır. Fiyatı fatura keserken elle uygulamanız gerekir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        form = ctk.CTkFrame(self.tab_mus_anlasma, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 10))
-        satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(10, 5))
+        self.ma_tree = OzelTablo(
+            self.mus_anlasma_liste_govde, ["ID", "Müşteri", "Ürün Grubu", "İskonto %", "Başlangıç", "Bitiş", "Açıklama", "Ekleyen"],
+            [40, 160, 140, 80, 90, 90, 200, 100], height=14)
+        self.ma_tree.pack(fill="both", expand=True, padx=20, pady=(0, 5))
+        self.ma_tree.tag_configure("suresi_dolmus", foreground="#F36D6D")
+
+        ctk.CTkButton(self.mus_anlasma_liste_govde, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
+                      command=self.musteri_anlasma_sil_islem).pack(anchor="w", padx=20, pady=(0, 15))
+
+        self.musteri_anlasma_listesini_yukle()
+
+    def _mus_anlasma_form_olustur(self):
+        ust = ctk.CTkFrame(self.mus_anlasma_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.mus_anlasma_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Özel Fiyat/İskonto Anlaşması", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Anlaşma Ekle", fg_color="#49B772", hover_color="#3E9C61", width=150, height=30,
+                      command=self.musteri_anlasma_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.mus_anlasma_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+
+        satir1 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir1.pack(fill="x", padx=15, pady=(15, 8))
         mus_frame = ctk.CTkFrame(satir1, fg_color="transparent")
         mus_frame.pack(side="left", padx=(0, 8))
         self.ma_musteri_id = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
@@ -12413,9 +14767,10 @@ class MainApp(ctk.CTkToplevel):
         self.ma_urun_grubu = ctk.CTkEntry(satir1, placeholder_text="Ürün Grubu (boş=tümü)", width=180)
         self.ma_urun_grubu.pack(side="left", padx=(0, 8))
         self.ma_iskonto = ctk.CTkEntry(satir1, placeholder_text="İskonto %", width=90)
-        self.ma_iskonto.pack(side="left", padx=(0, 8))
-        satir2 = ctk.CTkFrame(form, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 10))
+        self.ma_iskonto.pack(side="left")
+
+        satir2 = ctk.CTkFrame(kart, fg_color="transparent")
+        satir2.pack(fill="x", padx=15, pady=(0, 15))
         ctk.CTkLabel(satir2, text="Başlangıç:").pack(side="left", padx=(0, 5))
         self.ma_baslangic = ctk.CTkEntry(satir2, placeholder_text="YYYY-MM-DD", width=110)
         self.ma_baslangic.insert(0, datetime.now().strftime("%Y-%m-%d"))
@@ -12424,20 +14779,7 @@ class MainApp(ctk.CTkToplevel):
         self.ma_bitis = ctk.CTkEntry(satir2, placeholder_text="YYYY-MM-DD", width=110)
         self.ma_bitis.pack(side="left", padx=(0, 10))
         self.ma_aciklama = ctk.CTkEntry(satir2, placeholder_text="Açıklama", width=220)
-        self.ma_aciklama.pack(side="left", padx=(0, 10))
-        ctk.CTkButton(satir2, text="+ Anlaşma Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.musteri_anlasma_ekle_islem).pack(side="left")
-
-        liste_cerceve, self.ma_tree = tablo_olustur(
-            self.tab_mus_anlasma, ["ID", "Müşteri", "Ürün Grubu", "İskonto %", "Başlangıç", "Bitiş", "Açıklama", "Ekleyen"],
-            [40, 160, 140, 80, 90, 90, 200, 100], height=14)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 5))
-        self.ma_tree.tag_configure("suresi_dolmus", foreground="#F36D6D")
-
-        ctk.CTkButton(self.tab_mus_anlasma, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
-                      command=self.musteri_anlasma_sil_islem).pack(anchor="w", padx=20, pady=(0, 15))
-
-        self.musteri_anlasma_listesini_yukle()
+        self.ma_aciklama.pack(side="left")
 
     def musteri_anlasma_ekle_islem(self):
         try:
@@ -12460,12 +14802,9 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/musteri-anlasma-ekle", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                self.ma_musteri_id.delete(0, "end")
-                self.ma_urun_grubu.delete(0, "end")
-                self.ma_iskonto.delete(0, "end")
-                self.ma_bitis.delete(0, "end")
-                self.ma_aciklama.delete(0, "end")
                 self.musteri_anlasma_listesini_yukle()
+                self.mus_anlasma_liste_goster()
+                messagebox.showinfo("Başarılı", "Anlaşma eklendi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -12503,39 +14842,73 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_crm(self):
-        mus_crm = ctk.CTkFrame(self.tab_mus_liste, fg_color="transparent")
-        mus_crm.pack(pady=10, padx=10, fill="both", expand=True)
-        mus_crm.grid_columnconfigure(0, weight=2)
-        mus_crm.grid_columnconfigure(1, weight=3)
-        mus_crm.grid_rowconfigure(1, weight=1)
+        self._mus_veri_cache = []
+        self.mus_liste_govde = ctk.CTkFrame(self.tab_mus_liste, fg_color="transparent")
+        self.mus_detay_govde = ctk.CTkFrame(self.tab_mus_liste, fg_color="transparent")
+        self._crm_liste_olustur()
+        self._crm_detay_olustur()
+        self.crm_liste_goster()
 
-        sol_buton_satiri = ctk.CTkFrame(mus_crm, fg_color="transparent")
-        sol_buton_satiri.grid(row=0, column=0, sticky="w", pady=(0, 5))
-        ctk.CTkButton(sol_buton_satiri, text="✏️ Düzenle", fg_color="#5585EF", hover_color="#4871CB",
-                      command=self.musteri_duzenle_ac).pack(side="left", padx=5)
-        ctk.CTkButton(sol_buton_satiri, text="🗑️ Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
-                      command=self.musteri_sil_islem).pack(side="left", padx=5)
-        ctk.CTkButton(sol_buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
-                      command=self.musterileri_yukle).pack(side="left", padx=5)
-        ctk.CTkButton(sol_buton_satiri, text="📥 Excel'e Aktar", fg_color="#42ACA2", hover_color="#38928A",
-                      command=lambda: self.tabloyu_excele_aktar(self.musteri_tree, "Musteri_Listesi")).pack(side="left", padx=5)
-        ctk.CTkButton(sol_buton_satiri, text="📤 Excel'den İçeri Aktar", fg_color="#9965F1", hover_color="#8256CD",
-                      command=lambda: self.excelden_ice_aktar("/musteri-excel-import", self.musterileri_yukle)).pack(side="left", padx=5)
-        ctk.CTkButton(sol_buton_satiri, text="📱 WhatsApp", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.musteri_whatsapp_ac).pack(side="left", padx=5)
+    def crm_liste_goster(self):
+        self.mus_detay_govde.pack_forget()
+        self.mus_liste_govde.pack(fill="both", expand=True)
 
-        mus_cerceve, self.musteri_tree = tablo_olustur(
-            mus_crm, ["ID", "Firma", "Yetkili", "Telefon"], [50, 220, 140, 110], height=20)
-        mus_cerceve.grid(row=1, column=0, padx=(0, 8), sticky="nsew")
-        self.musteri_tree.bind("<<TreeviewSelect>>", self.musteri_secilince)
+    def crm_detay_goster(self):
+        self.mus_liste_govde.pack_forget()
+        self.mus_detay_govde.pack(fill="both", expand=True)
 
-        crm_sag = ctk.CTkFrame(mus_crm, fg_color="transparent")
-        crm_sag.grid(row=0, column=1, rowspan=2, padx=(8, 0), sticky="nsew")
-        crm_sag.grid_rowconfigure(2, weight=1)
+    def _crm_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.mus_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="🏢 Müşteri CRM", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni Müşteri", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=lambda: self.sekmeye_git("➕ Müşteri Ekle")).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.mus_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.mus_arama = ctk.CTkEntry(arama_bar, placeholder_text="Firma, yetkili veya telefona göre ara...", width=320)
+        self.mus_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.mus_arama.bind("<KeyRelease>", lambda e: self._crm_tree_render())
+
+        self.musteri_tree = OzelTablo(
+            self.mus_liste_govde, ["ID", "Firma", "Yetkili", "Telefon"], [50, 260, 180, 140], height=16)
+        self.musteri_tree.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+        self.musteri_tree.bind("<Double-1>", self.crm_ac_islem)
+
+        alt_buton = ctk.CTkFrame(self.mus_liste_govde, fg_color="transparent")
+        alt_buton.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(alt_buton, text="✏️ Aç (Cari Ekstre)", fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.crm_ac_islem).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(alt_buton, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.musterileri_yukle).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(alt_buton, text="📥 Excel'e Aktar", fg_color="#42ACA2", hover_color="#38928A",
+                      command=lambda: self.tabloyu_excele_aktar(self.musteri_tree, "Musteri_Listesi")).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(alt_buton, text="📤 Excel'den İçeri Aktar", fg_color="#9965F1", hover_color="#8256CD",
+                      command=lambda: self.excelden_ice_aktar("/musteri-excel-import", self.musterileri_yukle)).pack(side="left")
+
+        self.musterileri_yukle()
+
+    def _crm_detay_olustur(self):
+        ust = ctk.CTkFrame(self.mus_detay_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.crm_liste_goster).pack(side="left")
+        self.crm_detay_baslik = ctk.CTkLabel(ust, text="Müşteri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1")
+        self.crm_detay_baslik.pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="📱 WhatsApp", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.musteri_whatsapp_ac).pack(side="right")
+        ctk.CTkButton(ust, text="🗑️ Sil", fg_color="#F36D6D", hover_color="#CF5D5D", width=90, height=30,
+                      command=self.musteri_sil_islem).pack(side="right", padx=(0, 8))
+        ctk.CTkButton(ust, text="✏️ Düzenle", fg_color="#5585EF", hover_color="#4871CB", width=100, height=30,
+                      command=self.musteri_duzenle_ac).pack(side="right", padx=(0, 8))
+
+        crm_sag = ctk.CTkFrame(self.mus_detay_govde, fg_color="transparent")
+        crm_sag.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
         ust_satir = ctk.CTkFrame(crm_sag, fg_color="transparent")
         ust_satir.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(ust_satir, text="Cari Hesap Ekstresi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust_satir, text="Cari Hesap Ekstresi", font=("Segoe UI", 15, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
         self.c_id = ctk.CTkEntry(ust_satir, placeholder_text="Müşteri ID", width=110, height=34)
         self.c_id.pack(side="left", padx=(20, 6))
         ctk.CTkButton(ust_satir, text="🔍 Ekstreyi Getir", height=34, fg_color="#5585EF", hover_color="#4871CB",
@@ -12555,35 +14928,39 @@ class MainApp(ctk.CTkToplevel):
             kart = ctk.CTkFrame(kart_alani, fg_color=RENK_KART, corner_radius=14, border_width=2, border_color=renk)
             kart.grid(row=0, column=i, padx=6, sticky="nsew")
             kart_alani.grid_columnconfigure(i, weight=1)
-            ctk.CTkLabel(kart, text=baslik, font=("Arial", 13), text_color=RENK_METIN_SOLUK).pack(pady=(14, 2), padx=10)
-            deger = ctk.CTkLabel(kart, text="— TL", font=("Arial", 24, "bold"), text_color=renk)
+            ctk.CTkLabel(kart, text=baslik, font=("Segoe UI", 13), text_color=RENK_METIN_SOLUK).pack(pady=(14, 2), padx=10)
+            deger = ctk.CTkLabel(kart, text="— TL", font=("Segoe UI", 24, "bold"), text_color=renk)
             deger.pack(pady=(0, 14), padx=10)
             self.crm_kpi[anahtar] = deger
 
-        ctk.CTkLabel(crm_sag, text="Fatura Geçmişi", font=("Arial", 14, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w")
-        ekstre_cerceve, self.crm_fatura_tree = tablo_olustur(
+        ctk.CTkLabel(crm_sag, text="Fatura Geçmişi", font=("Segoe UI", 14, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w")
+        self.crm_fatura_tree = OzelTablo(
             crm_sag, ["Fatura No", "Tarih", "Tutar"], [140, 220, 180], height=14)
-        ekstre_cerceve.pack(fill="both", expand=True, pady=(5, 0))
-        self.musterileri_yukle()
+        self.crm_fatura_tree.pack(fill="both", expand=True, pady=(5, 0))
 
     def musteri_whatsapp_ac(self):
+        m_id = self.c_id.get().strip()
+        if not m_id:
+            messagebox.showinfo("Seçim Yok", "Lütfen bir müşteri açın.")
+            return
+        musteri = next((m for m in self._mus_veri_cache if str(m["MusteriID"]) == str(m_id)), None)
+        if not musteri:
+            messagebox.showinfo("Bulunamadı", "Müşteri bilgisi bulunamadı.")
+            return
+        mesaj = f"Merhaba {musteri.get('FirmaAdi', '')}, Nisan Plastik A.Ş. olarak size ulaşmak istedik."
+        self.whatsapp_ac(musteri.get("Telefon", ""), mesaj)
+
+    def crm_ac_islem(self, event=None):
         secili = self.musteri_tree.selection()
         if not secili:
-            messagebox.showinfo("Seçim Yok", "Lütfen listeden bir müşteri seçin.")
+            messagebox.showinfo("Seçim Yok", "Lütfen açmak için bir müşteri seçin.")
             return
-        degerler = self.musteri_tree.item(secili[0])["values"]
-        firma_adi = degerler[1] if len(degerler) > 1 else ""
-        telefon = degerler[3] if len(degerler) > 3 else ""
-        mesaj = f"Merhaba {firma_adi}, Nisan Plastik A.Ş. olarak size ulaşmak istedik."
-        self.whatsapp_ac(telefon, mesaj)
-
-    def musteri_secilince(self, event=None):
-        secili = self.musteri_tree.selection()
-        if secili:
-            vals = self.musteri_tree.item(secili[0])["values"]
-            self.c_id.delete(0, "end")
-            self.c_id.insert(0, vals[0])
-            self.cari_bakiye_goster()
+        vals = self.musteri_tree.item(secili[0])["values"]
+        self.crm_detay_baslik.configure(text=f"🏢 {vals[1]}")
+        self.c_id.delete(0, "end")
+        self.c_id.insert(0, vals[0])
+        self.cari_bakiye_goster()
+        self.crm_detay_goster()
 
     def cari_bakiye_goster(self):
         m_id = self.c_id.get().strip()
@@ -12643,21 +15020,30 @@ class MainApp(ctk.CTkToplevel):
     def musterileri_yukle(self):
         try:
             res = requests.get(f"{API}/musteri-listesi", headers=self.req_headers(), timeout=5)
-            for i in self.musteri_tree.get_children():
-                self.musteri_tree.delete(i)
-            for m in res.json()["musteriler"]:
-                self.musteri_tree.insert("", "end", iid=str(m["MusteriID"]),
-                                          values=(m["MusteriID"], m["FirmaAdi"], m["YetkiliKisi"], m["Telefon"]))
+            self._mus_veri_cache = res.json().get("musteriler", [])
         except Exception:
-            pass
+            self._mus_veri_cache = []
+        self._crm_tree_render()
+
+    def _crm_tree_render(self):
+        if not hasattr(self, "musteri_tree"):
+            return
+        for i in self.musteri_tree.get_children():
+            self.musteri_tree.delete(i)
+        arama = self.mus_arama.get().strip().lower() if hasattr(self, "mus_arama") else ""
+        for m in self._mus_veri_cache:
+            if arama and arama not in str(m.get("FirmaAdi", "")).lower() and arama not in str(m.get("YetkiliKisi", "")).lower() \
+                    and arama not in str(m.get("Telefon", "")).lower():
+                continue
+            self.musteri_tree.insert("", "end", iid=str(m["MusteriID"]),
+                                      values=(m["MusteriID"], m["FirmaAdi"], m["YetkiliKisi"], m["Telefon"]))
 
     def musteri_duzenle_ac(self):
-        secili = self.musteri_tree.selection()
-        if not secili:
-            messagebox.showinfo("Seçim Yok", "Lütfen düzenlemek için bir müşteri seçin.")
+        m_id = self.c_id.get().strip()
+        if not m_id:
+            messagebox.showinfo("Seçim Yok", "Lütfen düzenlemek için bir müşteri açın.")
             return
         try:
-            m_id = secili[0]
             res = requests.get(f"{API}/musteri-listesi", headers=self.req_headers(), timeout=5)
             musteri = next(m for m in res.json()["musteriler"] if str(m["MusteriID"]) == str(m_id))
         except Exception:
@@ -12671,6 +15057,7 @@ class MainApp(ctk.CTkToplevel):
             res = requests.put(f"{API}/musteri-guncelle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
                 self.musterileri_yukle()
+                self.crm_detay_baslik.configure(text=f"🏢 {veri['FirmaAdi']}")
             else:
                 self.api_hata_goster(res)
 
@@ -12682,154 +15069,64 @@ class MainApp(ctk.CTkToplevel):
                               ("EPosta", "E-posta (Fatura/Teklif otomatik gönderim için)", False)], musteri, kaydet)
 
     def musteri_sil_islem(self):
-        secili = self.musteri_tree.selection()
-        if not secili:
-            messagebox.showinfo("Seçim Yok", "Lütfen silmek için bir müşteri seçin.")
+        m_id = self.c_id.get().strip()
+        if not m_id:
+            messagebox.showinfo("Seçim Yok", "Lütfen silmek için bir müşteri açın.")
             return
-        m_id = secili[0]
         if not messagebox.askyesno("Onay", "Bu müşteriyi silmek istediğinize emin misiniz?"):
             return
         res = requests.delete(f"{API}/musteri-sil/{m_id}", headers=self.req_headers(), timeout=5)
         if res.status_code == 200:
             self.musterileri_yukle()
             self.dashboard_yukle()
+            self.crm_liste_goster()
         else:
             self.api_hata_goster(res)
 
     # ================= TEKLİF / PROFORMA =================
-    def cok_kalemli_teklif_penceresi(self):
-        pencere = ctk.CTkToplevel(self)
-        pencere.title("Çok Kalemli Teklif")
-        pencere.geometry("720x560")
-        pencere.configure(fg_color=gecerli_renk(RENK_TABAN))
-        pencere.transient(self)
-        pencere.lift()
-        pencere.focus_force()
-        pencere.grab_set()
-
-        ctk.CTkLabel(pencere, text="📝 Çok Kalemli Teklif", font=("Arial", 17, "bold"), text_color="#76CCE1").pack(pady=(18, 5), padx=20, anchor="w")
-        ctk.CTkLabel(pencere, text="Her kalem kendi para biriminde (TL/USD/EUR) fiyatlandırılabilir - toplam otomatik TL karşılığına çevrilir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=650).pack(padx=20, anchor="w", pady=(0, 8))
-
-        ust_satir = ctk.CTkFrame(pencere, fg_color="transparent")
-        ust_satir.pack(fill="x", padx=20, pady=(0, 10))
-        mus_frame = ctk.CTkFrame(ust_satir, fg_color="transparent")
-        mus_frame.pack(side="left")
-        ck_mus = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=110)
-        ck_mus.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(mus_frame, text="🔍", width=35, command=lambda: self.musteri_secim_penceresi(ck_mus)).pack(side="left")
-
-        kalem_baslik = ctk.CTkFrame(pencere, fg_color="transparent")
-        kalem_baslik.pack(fill="x", padx=20, pady=(0, 5))
-        ctk.CTkLabel(kalem_baslik, text="Ürün Kalemleri", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
-
-        kalem_alani = ctk.CTkScrollableFrame(pencere, fg_color=gecerli_renk(RENK_KART), height=280)
-        kalem_alani.pack(fill="both", expand=True, padx=20, pady=(0, 10))
-
-        kalem_listesi = []
-
-        def kalem_ekle():
-            satir = ctk.CTkFrame(kalem_alani, fg_color="transparent")
-            satir.pack(fill="x", pady=3)
-            kod_entry = ctk.CTkEntry(satir, placeholder_text="Stok Kod", width=85)
-            kod_entry.pack(side="left", padx=(0, 4))
-            ad_entry = ctk.CTkEntry(satir, placeholder_text="Ürün Adı", width=150)
-            ctk.CTkButton(satir, text="🔑", width=30, fg_color="#5585EF", hover_color="#4871CB",
-                          command=lambda: self.urun_secim_penceresi(kod_entry, hedef_ad_entry=ad_entry, hedef_fiyat_entry=fiyat_entry)).pack(side="left", padx=(0, 4))
-            ad_entry.pack(side="left", padx=(0, 4))
-            miktar_entry = ctk.CTkEntry(satir, placeholder_text="Miktar", width=65)
-            miktar_entry.pack(side="left", padx=(0, 4))
-            fiyat_entry = ctk.CTkEntry(satir, placeholder_text="Birim Fiyat", width=85)
-            fiyat_entry.pack(side="left", padx=(0, 4))
-            pb_secim = ctk.CTkOptionMenu(satir, values=["TL", "USD", "EUR"], width=75)
-            pb_secim.pack(side="left", padx=(0, 4))
-
-            def satiri_sil():
-                kalem_listesi[:] = [k for k in kalem_listesi if k["satir"] != satir]
-                satir.destroy()
-
-            ctk.CTkButton(satir, text="✕", width=28, fg_color="#F36D6D", hover_color="#CF5D5D", command=satiri_sil).pack(side="left")
-            kalem_listesi.append({"satir": satir, "kod": kod_entry, "ad": ad_entry, "miktar": miktar_entry, "fiyat": fiyat_entry, "pb": pb_secim})
-
-        ctk.CTkButton(pencere, text="+ Kalem Ekle", width=120, fg_color="#45C89D", hover_color="#3BAA85", command=kalem_ekle).pack(anchor="w", padx=20, pady=(0, 10))
-
-        def kaydet():
-            try:
-                musteri_id = int(ck_mus.get())
-            except ValueError:
-                messagebox.showwarning("Eksik Bilgi", "Geçerli bir Müşteri ID girin (🔍 ile seçebilirsiniz).")
-                return
-            kalemler = []
-            for k in kalem_listesi:
-                kod = k["kod"].get().strip()
-                ad = k["ad"].get().strip()
-                if not kod:
-                    continue
-                try:
-                    miktar = float(k["miktar"].get())
-                    fiyat = float(k["fiyat"].get())
-                except ValueError:
-                    messagebox.showwarning("Hatalı Değer", f"'{ad or kod}' için miktar/fiyat sayısal olmalıdır.")
-                    return
-                kalemler.append({"StokKod": kod, "StokAdi": ad or kod, "Miktar": miktar, "BirimFiyat": fiyat, "ParaBirimi": k["pb"].get()})
-            if not kalemler:
-                messagebox.showwarning("Eksik Bilgi", "En az bir ürün kalemi eklemelisiniz.")
-                return
-            data = {"MusteriID": musteri_id, "Kalemler": kalemler}
-            try:
-                res = requests.post(f"{API}/teklif-olustur", json=data, headers=self.req_headers(), timeout=15)
-                if res.status_code == 200:
-                    pencere.destroy()
-                    self.teklifleri_yukle()
-                    messagebox.showinfo("Başarılı", res.json().get("mesaj", "Teklif oluşturuldu."))
-                else:
-                    self.api_hata_goster(res)
-            except requests.exceptions.RequestException:
-                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
-
-        ctk.CTkButton(pencere, text="📝 Teklifi Oluştur", fg_color="#42ACA2", hover_color="#38928A", height=38,
-                      command=kaydet).pack(fill="x", padx=20, pady=(0, 20))
-
-        kalem_ekle()
-
     def init_teklif(self):
-        tek_frame = ctk.CTkFrame(self.tab_teklif, fg_color=RENK_KART, corner_radius=12)
-        tek_frame.pack(pady=10, padx=10, fill="x")
+        """Teklif ekranı: Sipariş'te uygulanan liste+tam sayfa form kalıbının aynısı.
+        Önceden tek kalemlik hızlı form liste ile aynı ekranda duruyordu ve çok
+        kalemli teklif ayrı, küçük bir pencerede açılıyordu - ikisi de zaten aynı
+        /teklif-olustur ucunu (Kalemler: list[...]) kullandığı için tek, tam sayfa
+        forma birleştirildi."""
+        self._tek_kalem_listesi = []
+        self.tek_liste_govde = ctk.CTkFrame(self.tab_teklif, fg_color="transparent")
+        self.tek_form_govde = ctk.CTkFrame(self.tab_teklif, fg_color="transparent")
+        self._teklif_liste_olustur()
+        self._teklif_form_olustur()
+        self.teklif_liste_goster()
 
-        ctk.CTkLabel(tek_frame, text="Tek kalemlik hızlı teklif için aşağıyı, 5-6 farklı ürün/para birimi içeren bir teklif için "
-                                      "'📝 Çok Kalemli Teklif' butonunu kullanın.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=800).grid(row=0, column=0, columnspan=3, padx=10, pady=(10, 5), sticky="w")
+    def teklif_liste_goster(self):
+        self.tek_form_govde.pack_forget()
+        self.tek_liste_govde.pack(fill="both", expand=True)
 
-        # Müşteri ID ve büyüteç butonunu tutan minik çerçeve (Grid yapısını bozmamak için)
-        tk_mus_frame = ctk.CTkFrame(tek_frame, fg_color="transparent")
-        tk_mus_frame.grid(row=1, column=0, padx=10, pady=10)
-        self.tk_mus = ctk.CTkEntry(tk_mus_frame, placeholder_text="Müşteri ID", width=110)
-        self.tk_mus.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(tk_mus_frame, text="🔍", width=35,
-                      command=lambda: self.musteri_secim_penceresi(self.tk_mus)).pack(side="left")
+    def teklif_form_goster(self):
+        self.tek_liste_govde.pack_forget()
+        self._teklif_form_sifirla()
+        self.tek_form_govde.pack(fill="both", expand=True)
 
-        tk_stok_frame = ctk.CTkFrame(tek_frame, fg_color="transparent")
-        tk_stok_frame.grid(row=1, column=1, padx=10, pady=10)
-        self.tk_kod = ctk.CTkEntry(tk_stok_frame, placeholder_text="Stok Kod", width=110)
-        self.tk_kod.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(tk_stok_frame, text="🔑", width=35, fg_color="#5585EF", hover_color="#4871CB",
-                      command=lambda: self.urun_secim_penceresi(self.tk_kod, hedef_ad_entry=self.tk_ad, hedef_fiyat_entry=self.tk_fiyat)).pack(side="left")
-        self.tk_ad = ctk.CTkEntry(tek_frame, placeholder_text="Stok Adı")
-        self.tk_ad.grid(row=1, column=2, padx=10, pady=10)
-        self.tk_mik = ctk.CTkEntry(tek_frame, placeholder_text="Miktar")
-        self.tk_mik.grid(row=2, column=0, padx=10, pady=10)
-        self.tk_fiyat = ctk.CTkEntry(tek_frame, placeholder_text="Birim Fiyat")
-        self.tk_fiyat.grid(row=2, column=1, padx=10, pady=10)
-        self.tk_pb = ctk.CTkOptionMenu(tek_frame, values=["TL", "USD", "EUR"], width=90)
-        self.tk_pb.grid(row=2, column=2, padx=10, pady=10)
-        ctk.CTkButton(tek_frame, text="📝 Teklif Oluştur", fg_color="#42ACA2", hover_color="#38928A",
-                      command=self.teklif_olustur_islem).grid(row=3, column=0, padx=10, pady=10)
-        ctk.CTkButton(tek_frame, text="📝 Çok Kalemli Teklif", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.cok_kalemli_teklif_penceresi).grid(row=3, column=1, padx=10, pady=10)
+    def _teklif_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.tek_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="📝 Teklifler", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni Teklif", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.teklif_form_goster).pack(side="right")
 
-        durum_satiri = ctk.CTkFrame(self.tab_teklif, fg_color="transparent")
+        arama_bar = ctk.CTkFrame(self.tek_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.tek_arama = ctk.CTkEntry(arama_bar, placeholder_text="ID veya firma adına göre ara...", width=280)
+        self.tek_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.tek_arama.bind("<KeyRelease>", lambda e: self._teklif_tree_render())
+        ctk.CTkLabel(arama_bar, text="Durum:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 6))
+        self.tek_durum_filtre = ctk.CTkOptionMenu(arama_bar, values=["Tümü", "Bekliyor", "Onaylandı", "Reddedildi"],
+                                                   width=140, command=lambda _: self._teklif_tree_render())
+        self.tek_durum_filtre.pack(side="left", padx=(0, 12), pady=10)
+
+        durum_satiri = ctk.CTkFrame(self.tek_liste_govde, fg_color="transparent")
         durum_satiri.pack(pady=(0, 5), padx=10, fill="x")
-        ctk.CTkLabel(durum_satiri, text="Seçili teklif için:", font=("Arial", 11)).pack(side="left", padx=(5, 10))
+        ctk.CTkLabel(durum_satiri, text="Seçili teklif için:", font=("Segoe UI", 11)).pack(side="left", padx=(5, 10))
         ctk.CTkButton(durum_satiri, text="✅ Onayla (Siparişe Çevir)", fg_color="#49B772", hover_color="#3E9C61",
                       command=lambda: self.teklif_durum_guncelle_islem("Onaylandı")).pack(side="left", padx=4)
         ctk.CTkButton(durum_satiri, text="✖️ Reddet", fg_color="#F36D6D", hover_color="#CF5D5D",
@@ -12838,32 +15135,154 @@ class MainApp(ctk.CTkToplevel):
                       command=self.teklif_pdf_ac).pack(side="left", padx=4)
         ctk.CTkButton(durum_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
                       command=self.teklifleri_yukle).pack(side="left", padx=4)
-        ctk.CTkLabel(self.tab_teklif,
+        ctk.CTkLabel(self.tek_liste_govde,
                      text="Not: 'Onayla' dediğinizde teklif kalemleri otomatik olarak 'Sipariş' sekmesine\n"
                           "Bekliyor durumunda aktarılır - Sipariş sekmesinden normal akışla faturaya çevirebilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=14, pady=(0, 5))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=14, pady=(0, 5))
 
-        tek_cerceve, self.teklif_tree = tablo_olustur(
-            self.tab_teklif, ["ID", "Firma", "Tutar", "Tarih", "Durum"],
-            [50, 240, 120, 160, 130], height=16)
-        tek_cerceve.pack(pady=10, padx=10, fill="both", expand=True)
+        self.teklif_tree = OzelTablo(
+            self.tek_liste_govde, ["ID", "Firma", "Tutar", "Tarih", "Durum"],
+            [50, 240, 120, 160, 130], height=16, durum_kolonu="Durum")
+        self.teklif_tree.pack(pady=(0, 10), padx=10, fill="both", expand=True)
+        self.teklif_tree.bind("<Double-1>", self.teklif_detay_penceresi_ac)
+        self.teklif_tree.tag_configure("Bekliyor", foreground=RENK_BEKLIYOR)
+        self.teklif_tree.tag_configure("Onaylandı", foreground=RENK_TAMAM)
+        self.teklif_tree.tag_configure("İptal", foreground=RENK_IPTAL)
+        self._tek_veri_cache = []
         self.teklifleri_yukle()
 
-    def teklif_olustur_islem(self):
+    def teklif_detay_penceresi_ac(self, event=None, teklif_id=None):
+        if teklif_id is None:
+            secili = self.teklif_tree.selection()
+            if not secili:
+                return
+            teklif_id = secili[0]
         try:
-            data = {"MusteriID": int(self.tk_mus.get()),
-                    "Kalemler": [{"StokKod": self.tk_kod.get(), "StokAdi": self.tk_ad.get(),
-                                  "Miktar": float(self.tk_mik.get()), "BirimFiyat": float(self.tk_fiyat.get()),
-                                  "ParaBirimi": self.tk_pb.get()}]}
-        except ValueError:
-            messagebox.showwarning("Eksik/Hatalı Bilgi", "Müşteri ID, Miktar ve Fiyat sayısal olmalıdır.")
+            res = requests.get(f"{API}/teklif-detay/{teklif_id}", headers=self.req_headers(), timeout=6)
+            if res.status_code != 200:
+                self.api_hata_goster(res)
+                return
+            veri = res.json()
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
             return
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title(f"Teklif #{veri['TeklifID']} Detayı")
+        self._pencere_ortala(pencere, 760, 520)
+        pencere.configure(fg_color=gecerli_renk(RENK_TABAN))
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text=f"📝 Teklif #{veri['TeklifID']} — {veri['FirmaAdi']}", font=("Segoe UI", 16, "bold"),
+                     text_color="#76CCE1").pack(pady=(18, 4), padx=20, anchor="w")
+        ctk.CTkLabel(pencere,
+                     text=f"Tarih: {veri['Tarih']}    Durum: {veri['Durum']}    Genel Toplam: {veri['ToplamTutar']:,.2f} TL    Teklifi Veren: {veri.get('OlusturanKullanici', '-')}",
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(padx=20, anchor="w", pady=(0, 12))
+
+        kalem_tree = OzelTablo(
+            pencere, ["Stok Kod", "Ürün Adı", "Miktar", "Birim Fiyat", "P.B.", "Satır Toplamı", "İskonto Tutarı"],
+            [90, 200, 70, 100, 55, 120, 110], height=12)
+        kalem_tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        for k in veri["Kalemler"]:
+            iskonto = k.get("IskontoTutari", 0)
+            kalem_tree.insert("", "end", values=(k["StokKod"], k["StokAdi"], f"{k['Miktar']:g}",
+                                                  f"{k['BirimFiyat']:,.2f}", k["ParaBirimi"], f"{k['SatirToplami']:,.2f} {k['ParaBirimi']}",
+                                                  f"{iskonto:,.2f} TL" if iskonto else "-"))
+
+        alt_satir = ctk.CTkFrame(pencere, fg_color="transparent")
+        alt_satir.pack(fill="x", padx=20, pady=(0, 18))
+        ctk.CTkButton(alt_satir, text="📄 PDF Aç", fg_color="#9965F1", hover_color="#8256CD",
+                      command=self.teklif_pdf_ac).pack(side="left")
+        ctk.CTkButton(alt_satir, text="Kapat", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=pencere.destroy).pack(side="right")
+
+    def _teklif_form_olustur(self):
+        ust = ctk.CTkFrame(self.tek_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.teklif_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Teklif", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="📝 Oluştur", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.teklif_form_kaydet_islem).pack(side="right")
+
+        mus_satir = ctk.CTkFrame(self.tek_form_govde, fg_color="transparent")
+        mus_satir.pack(fill="x", padx=20, pady=(0, 10))
+        self.tk_mus = ctk.CTkEntry(mus_satir, placeholder_text="Müşteri ID", width=110)
+        self.tk_mus.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(mus_satir, text="🔍", width=35, command=lambda: self.musteri_secim_penceresi(self.tk_mus)).pack(side="left")
+
+        kalem_baslik = ctk.CTkFrame(self.tek_form_govde, fg_color="transparent")
+        kalem_baslik.pack(fill="x", padx=20, pady=(0, 5))
+        ctk.CTkLabel(kalem_baslik, text="Ürün Kalemleri", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkLabel(kalem_baslik, text="Her kalem kendi para biriminde (TL/USD/EUR) fiyatlandırılabilir.",
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(side="left", padx=(10, 0))
+        ctk.CTkButton(kalem_baslik, text="+ Kalem Ekle", width=110, fg_color="#45C89D", hover_color="#3BAA85",
+                      command=self.teklif_form_kalem_ekle).pack(side="right")
+
+        self._tek_form_kalem_alani = ctk.CTkScrollableFrame(self.tek_form_govde, fg_color=RENK_KART, corner_radius=12, height=340)
+        self._tek_form_kalem_alani.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+
+    def _teklif_form_sifirla(self):
+        for k in list(self._tek_kalem_listesi):
+            k["satir"].destroy()
+        self._tek_kalem_listesi = []
+        self.tk_mus.delete(0, "end")
+        self.teklif_form_kalem_ekle()
+
+    def teklif_form_kalem_ekle(self):
+        satir = ctk.CTkFrame(self._tek_form_kalem_alani, fg_color="transparent")
+        satir.pack(fill="x", pady=3)
+        kod_entry = ctk.CTkEntry(satir, placeholder_text="Stok Kod", width=90)
+        kod_entry.pack(side="left", padx=(0, 4))
+        ad_entry = ctk.CTkEntry(satir, placeholder_text="Ürün Adı", width=200)
+        ctk.CTkButton(satir, text="🔑", width=30, fg_color="#5585EF", hover_color="#4871CB",
+                      command=lambda: self.urun_secim_penceresi(kod_entry, hedef_ad_entry=ad_entry, hedef_fiyat_entry=fiyat_entry)).pack(side="left", padx=(0, 4))
+        ad_entry.pack(side="left", padx=(0, 4))
+        miktar_entry = ctk.CTkEntry(satir, placeholder_text="Miktar", width=70)
+        miktar_entry.pack(side="left", padx=(0, 4))
+        fiyat_entry = ctk.CTkEntry(satir, placeholder_text="Birim Fiyat", width=90)
+        fiyat_entry.pack(side="left", padx=(0, 4))
+        pb_secim = ctk.CTkOptionMenu(satir, values=["TL", "USD", "EUR"], width=80)
+        pb_secim.pack(side="left", padx=(0, 4))
+
+        def satiri_sil():
+            self._tek_kalem_listesi[:] = [k for k in self._tek_kalem_listesi if k["satir"] != satir]
+            satir.destroy()
+
+        ctk.CTkButton(satir, text="✕", width=28, fg_color="#F36D6D", hover_color="#CF5D5D", command=satiri_sil).pack(side="left")
+        self._tek_kalem_listesi.append({"satir": satir, "kod": kod_entry, "ad": ad_entry, "miktar": miktar_entry, "fiyat": fiyat_entry, "pb": pb_secim})
+
+    def teklif_form_kaydet_islem(self):
         try:
-            res = requests.post(f"{API}/teklif-olustur", json=data, headers=self.req_headers(), timeout=8)
+            musteri_id = int(self.tk_mus.get())
+        except ValueError:
+            messagebox.showwarning("Eksik Bilgi", "Geçerli bir Müşteri ID girin (🔍 ile seçebilirsiniz).")
+            return
+        kalemler = []
+        for k in self._tek_kalem_listesi:
+            kod = k["kod"].get().strip()
+            ad = k["ad"].get().strip()
+            if not kod:
+                continue
+            try:
+                miktar = float(k["miktar"].get())
+                fiyat = float(k["fiyat"].get())
+            except ValueError:
+                messagebox.showwarning("Hatalı Değer", f"'{ad or kod}' için miktar/fiyat sayısal olmalıdır.")
+                return
+            kalemler.append({"StokKod": kod, "StokAdi": ad or kod, "Miktar": miktar, "BirimFiyat": fiyat, "ParaBirimi": k["pb"].get()})
+        if not kalemler:
+            messagebox.showwarning("Eksik Bilgi", "En az bir ürün kalemi eklemelisiniz.")
+            return
+        data = {"MusteriID": musteri_id, "Kalemler": kalemler}
+        try:
+            res = requests.post(f"{API}/teklif-olustur", json=data, headers=self.req_headers(), timeout=15)
             if res.status_code == 200:
-                for e in (self.tk_mus, self.tk_kod, self.tk_ad, self.tk_mik, self.tk_fiyat):
-                    e.delete(0, "end")
                 self.teklifleri_yukle()
+                self.teklif_liste_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj", "Teklif oluşturuldu."))
             else:
                 self.api_hata_goster(res)
@@ -12875,18 +15294,30 @@ class MainApp(ctk.CTkToplevel):
             res = requests.get(f"{API}/teklif-listesi", headers=self.req_headers(), timeout=5)
             if res.status_code != 200:
                 return
-            for i in self.teklif_tree.get_children():
-                self.teklif_tree.delete(i)
-            self._teklif_pdf_yollari = {}
-            for t in res.json()["teklifler"]:
-                iid = str(t["TeklifID"])
-                durum = t["Durum"]
-                tag = "Onaylandı" if durum == "Onaylandı" else ("İptal" if durum == "Reddedildi" else "Bekliyor")
-                self.teklif_tree.insert("", "end", iid=iid, tags=(tag,),
-                                         values=(t["TeklifID"], t["FirmaAdi"], f"{t['ToplamTutar']:,.2f} TL", t["Tarih"], durum))
-                self._teklif_pdf_yollari[iid] = t.get("PdfYolu")
+            self._tek_veri_cache = res.json().get("teklifler", [])
         except Exception:
-            pass
+            self._tek_veri_cache = []
+        self._teklif_tree_render()
+
+    def _teklif_tree_render(self):
+        if not hasattr(self, "teklif_tree"):
+            return
+        for i in self.teklif_tree.get_children():
+            self.teklif_tree.delete(i)
+        self._teklif_pdf_yollari = {}
+        arama = self.tek_arama.get().strip().lower() if hasattr(self, "tek_arama") else ""
+        durum_secim = self.tek_durum_filtre.get() if hasattr(self, "tek_durum_filtre") else "Tümü"
+        for t in self._tek_veri_cache:
+            durum = t["Durum"]
+            if durum_secim != "Tümü" and durum != durum_secim:
+                continue
+            if arama and arama not in str(t["TeklifID"]).lower() and arama not in str(t["FirmaAdi"]).lower():
+                continue
+            iid = str(t["TeklifID"])
+            tag = "Onaylandı" if durum == "Onaylandı" else ("İptal" if durum == "Reddedildi" else "Bekliyor")
+            self.teklif_tree.insert("", "end", iid=iid, tags=(tag,),
+                                     values=(t["TeklifID"], t["FirmaAdi"], f"{t['ToplamTutar']:,.2f} TL", t["Tarih"], durum))
+            self._teklif_pdf_yollari[iid] = t.get("PdfYolu")
 
     def teklif_durum_guncelle_islem(self, yeni_durum):
         secili = self.teklif_tree.selection()
@@ -12898,7 +15329,7 @@ class MainApp(ctk.CTkToplevel):
             res = requests.put(f"{API}/teklif-durum-guncelle", json=data, headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
                 self.teklifleri_yukle()
-                if yeni_durum == "Onaylandı" and hasattr(self, "siparisleri_yukle"):
+                if yeni_durum == "Onaylandı" and hasattr(self, "sip_tree"):
                     self.siparisleri_yukle()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj", "Güncellendi."))
             else:
@@ -12921,42 +15352,51 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showinfo("Bilgi", f"PDF yolu: {yol}")
 
     def init_siparis(self):
-        sip_frame = ctk.CTkFrame(self.tab_siparis, fg_color=RENK_KART, corner_radius=12)
-        sip_frame.pack(pady=10, padx=10, fill="x")
+        """Sipariş ekranı: önce LİSTE (arama/filtre + sıralanabilir tablo), '+ Yeni
+        Sipariş' ile TAM SAYFA bir form açılır (küçük bir seçim penceresi DEĞİL) -
+        ERPNext/Logo gibi kurumsal ERP'lerdeki standart akış. Önceden bu ekranda tek
+        kalemlik hızlı-ekleme alanları liste ile HER ZAMAN aynı anda görünüyordu ve
+        çok kalemli sipariş ayrı, küçük bir pencerede açılıyordu - sipariş sayısı
+        büyüdükçe (binlerce sipariş) bu karışık hale geliyordu. Tek/çok kalem ayrımı
+        da kaldırıldı - ikisi de aynı /siparis-grup-ekle ucunu kullanıyordu zaten."""
+        self.sip_liste_govde = ctk.CTkFrame(self.tab_siparis, fg_color="transparent")
+        self.sip_form_govde = ctk.CTkFrame(self.tab_siparis, fg_color="transparent")
+        self._siparis_liste_olustur()
+        self._siparis_form_olustur()
+        self.siparis_liste_goster()
 
-        sp_mus_frame = ctk.CTkFrame(sip_frame, fg_color="transparent")
-        sp_mus_frame.grid(row=0, column=0, padx=10, pady=10)
-        self.sp_mus = ctk.CTkEntry(sp_mus_frame, placeholder_text="Müşteri ID", width=110)
-        self.sp_mus.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(sp_mus_frame, text="🔍", width=35,
-                      command=lambda: self.musteri_secim_penceresi(self.sp_mus)).pack(side="left")
+    def siparis_liste_goster(self):
+        self.sip_form_govde.pack_forget()
+        self.sip_liste_govde.pack(fill="both", expand=True)
 
-        sp_urun_frame = ctk.CTkFrame(sip_frame, fg_color="transparent")
-        sp_urun_frame.grid(row=0, column=1, columnspan=2, padx=10, pady=10, sticky="w")
-        self.sp_kod = ctk.CTkEntry(sp_urun_frame, placeholder_text="Stok Kod", width=110)
-        self.sp_kod.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(sp_urun_frame, text="🔑", width=35, fg_color="#5585EF", hover_color="#4871CB",
-                      command=lambda: self.urun_secim_penceresi(self.sp_kod, hedef_ad_entry=self.sp_ad, hedef_fiyat_entry=self.sp_fiyat)).pack(side="left", padx=(0, 8))
-        self.sp_ad = ctk.CTkEntry(sp_urun_frame, placeholder_text="Stok Adı", width=180)
-        self.sp_ad.pack(side="left")
-        self.sp_mik = ctk.CTkEntry(sip_frame, placeholder_text="Miktar")
-        self.sp_mik.grid(row=1, column=0, padx=10, pady=10)
-        self.sp_fiyat = ctk.CTkEntry(sip_frame, placeholder_text="Birim Fiyat")
-        self.sp_fiyat.grid(row=1, column=1, padx=10, pady=10)
-        self.sp_kur = ctk.CTkOptionMenu(sip_frame, values=["TL", "USD", "EUR"], width=70)
-        self.sp_kur.grid(row=1, column=2, padx=10, pady=10, sticky="w")
-        self.sp_teslim_tarihi = ctk.CTkEntry(sip_frame, placeholder_text="Teslim Tarihi (YYYY-AA-GG, opsiyonel)", width=200)
-        self.sp_teslim_tarihi.grid(row=1, column=3, padx=10, pady=10)
-        ctk.CTkButton(sip_frame, text="Sipariş Al", fg_color="#42ACA2", hover_color="#38928A",
-                      command=self.siparis_ver).grid(row=1, column=4, padx=10, pady=10)
-        ctk.CTkButton(sip_frame, text="📦 Çok Kalemli Sipariş", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.cok_kalemli_siparis_penceresi).grid(row=1, column=5, padx=10, pady=10)
-        ctk.CTkButton(sip_frame, text="📋 Şablonlar", fg_color="#64CCFA", hover_color="#55ADD5",
-                      command=self.siparis_sablonlari_penceresi).grid(row=1, column=6, padx=10, pady=10)
+    def siparis_form_goster(self):
+        self.sip_liste_govde.pack_forget()
+        self._siparis_form_sifirla()
+        self.sip_form_govde.pack(fill="both", expand=True)
 
-        durum_satiri = ctk.CTkFrame(self.tab_siparis, fg_color="transparent")
+    def _siparis_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.sip_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="🛒 Siparişler", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni Sipariş", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.siparis_form_goster).pack(side="right")
+        ctk.CTkButton(ust_bar, text="📋 Şablonlar", fg_color="#64CCFA", hover_color="#55ADD5", height=34,
+                      command=self.siparis_sablonlari_penceresi).pack(side="right", padx=(0, 8))
+
+        arama_bar = ctk.CTkFrame(self.sip_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.sip_arama = ctk.CTkEntry(arama_bar, placeholder_text="ID, firma veya ürün adına göre ara...", width=280)
+        self.sip_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.sip_arama.bind("<KeyRelease>", lambda e: self._siparis_tree_render())
+        ctk.CTkLabel(arama_bar, text="Durum:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 6))
+        self.sip_durum_filtre = ctk.CTkOptionMenu(arama_bar, values=["Tümü", "Bekliyor", "Onaylandı", "Kargoda", "Kısmi Teslim", "Tamamlandı", "İptal"],
+                                                   width=140, command=lambda _: self._siparis_tree_render())
+        self.sip_durum_filtre.pack(side="left", padx=(0, 12), pady=10)
+
+        durum_satiri = ctk.CTkFrame(self.sip_liste_govde, fg_color="transparent")
         durum_satiri.pack(pady=(0, 5), padx=10, fill="x")
-        ctk.CTkLabel(durum_satiri, text="Seçili sipariş için:", font=("Arial", 11)).pack(side="left", padx=(5, 10))
+        ctk.CTkLabel(durum_satiri, text="Seçili sipariş için:", font=("Segoe UI", 11)).pack(side="left", padx=(5, 10))
         ctk.CTkButton(durum_satiri, text="✅ Onayla", fg_color=RENK_ONAY, hover_color="#55ADD5",
                       command=lambda: self.siparis_durum_guncelle_islem("Onaylandı")).pack(side="left", padx=4)
         ctk.CTkButton(durum_satiri, text="🚚 Kargoya Çıkar", fg_color=RENK_KARGO, hover_color="#9965F1",
@@ -12969,148 +15409,175 @@ class MainApp(ctk.CTkToplevel):
                       command=self.siparis_sil_islem).pack(side="left", padx=4)
         ctk.CTkButton(durum_satiri, text="🧾 Seçilenleri Toplu Faturaya Çevir", fg_color="#64CCFA", hover_color="#55ADD5",
                       command=self.siparis_toplu_faturaya_cevir_islem).pack(side="left", padx=4)
+        ctk.CTkButton(durum_satiri, text="💰 Tahsilat Özeti", fg_color="#9965F1", hover_color="#8256CD",
+                      command=self.siparis_tahsilat_ozeti_goster).pack(side="left", padx=4)
 
-        sip_cerceve, self.sip_tree = tablo_olustur(
-            self.tab_siparis, ["ID", "Grup", "Firma", "Ürün", "Miktar", "Teslim/Kalan", "Tutar", "Kalan Bakiye", "Tarih", "Durum"],
-            [50, 60, 150, 140, 80, 100, 100, 100, 110, 100], height=16)
-        sip_cerceve.pack(pady=10, padx=10, fill="both", expand=True)
+        self.sip_tree = OzelTablo(
+            self.sip_liste_govde, ["ID", "Grup", "Firma", "Ürün", "Miktar", "Teslim/Kalan", "Tutar", "Kalan Bakiye", "Tarih", "Durum"],
+            [50, 60, 150, 140, 80, 100, 100, 100, 110, 100], height=16, durum_kolonu="Durum")
+        self.sip_tree.pack(pady=(0, 10), padx=10, fill="both", expand=True)
         # --- ÇİFT TIKLAMA İLE SİPARİŞ ONAYLAMA ---
         self.sip_tree.bind("<Double-1>", lambda e: self.siparis_durum_guncelle_islem("Onaylandı"))
+        self._sip_veri_cache = []
         self.siparisleri_yukle()
 
-    def cok_kalemli_siparis_penceresi(self):
-        pencere = ctk.CTkToplevel(self)
-        pencere.title("Çok Kalemli Sipariş")
-        pencere.geometry("620x560")
-        pencere.configure(fg_color=gecerli_renk(RENK_TABAN))
-        pencere.transient(self)
-        pencere.lift()
-        pencere.focus_force()
-        pencere.grab_set()
+    def _siparis_form_olustur(self):
+        # NOT: Kaydet/Şablon Yap butonları BİLİNÇLİ olarak sağ üstte, küçük ve
+        # kompakt duruyor (ERPNext/Logo tarzı) - önceden tam satır genişliğinde,
+        # kalın butonlardı; bu hem "amatör" görünüyordu hem de mor renk (RENK
+        # paletinde ikincil eylemler için ayrılmıştı) burada yersizdi.
+        ust = ctk.CTkFrame(self.sip_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.siparis_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Sipariş", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.siparis_form_kaydet).pack(side="right")
+        ctk.CTkButton(ust, text="🗂️ Şablon Yap", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=120, height=30, command=self.siparis_form_sablon_kaydet).pack(side="right", padx=(0, 8))
 
-        ctk.CTkLabel(pencere, text="📦 Çok Kalemli Sipariş", font=("Arial", 17, "bold"), text_color="#76CCE1").pack(pady=(18, 5), padx=20, anchor="w")
-        ctk.CTkLabel(pencere, text="Her kalem kendi para biriminde (TL/USD/EUR) fiyatlandırılabilir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(padx=20, anchor="w", pady=(0, 8))
+        ctk.CTkLabel(self.sip_form_govde,
+                     text="Her kalem kendi para biriminde (TL/USD/EUR) fiyatlandırılabilir - tek ürünlük bir sipariş için de sadece bir satır yeterli.",
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        ust_satir = ctk.CTkFrame(pencere, fg_color="transparent")
+        ust_satir = ctk.CTkFrame(self.sip_form_govde, fg_color=RENK_KART, corner_radius=12)
         ust_satir.pack(fill="x", padx=20, pady=(0, 10))
         mus_frame = ctk.CTkFrame(ust_satir, fg_color="transparent")
-        mus_frame.pack(side="left")
-        ck_mus = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=110)
-        ck_mus.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(mus_frame, text="🔍", width=35, command=lambda: self.musteri_secim_penceresi(ck_mus)).pack(side="left")
+        mus_frame.pack(side="left", padx=15, pady=15)
+        ctk.CTkLabel(mus_frame, text="Müşteri:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8))
+        self._sip_form_mus = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=110)
+        self._sip_form_mus.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(mus_frame, text="🔍", width=35, command=lambda: self.musteri_secim_penceresi(self._sip_form_mus)).pack(side="left")
+        teslim_frame = ctk.CTkFrame(ust_satir, fg_color="transparent")
+        teslim_frame.pack(side="left", padx=(0, 15), pady=15)
+        ctk.CTkLabel(teslim_frame, text="Teslim Tarihi (opsiyonel):", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+        self._sip_form_teslim = ctk.CTkEntry(teslim_frame, placeholder_text="YYYY-AA-GG", width=120)
+        self._sip_form_teslim.pack(side="left")
 
-        kalem_baslik = ctk.CTkFrame(pencere, fg_color="transparent")
+        kalem_baslik = ctk.CTkFrame(self.sip_form_govde, fg_color="transparent")
         kalem_baslik.pack(fill="x", padx=20, pady=(0, 5))
-        ctk.CTkLabel(kalem_baslik, text="Ürün Kalemleri", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkLabel(kalem_baslik, text="Ürün Kalemleri", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
 
-        kalem_alani = ctk.CTkScrollableFrame(pencere, fg_color=gecerli_renk(RENK_KART), height=280)
-        kalem_alani.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self._sip_form_kalem_alani = ctk.CTkScrollableFrame(self.sip_form_govde, fg_color=RENK_KART, height=280)
+        self._sip_form_kalem_alani.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self._sip_form_kalem_listesi = []
 
-        kalem_listesi = []
+        ctk.CTkButton(self.sip_form_govde, text="+ Kalem Ekle", width=120, fg_color="#45C89D", hover_color="#3BAA85",
+                      command=self.siparis_form_kalem_ekle).pack(anchor="w", padx=20, pady=(0, 20))
 
-        def kalem_ekle():
-            satir = ctk.CTkFrame(kalem_alani, fg_color="transparent")
-            satir.pack(fill="x", pady=3)
-            kod_entry = ctk.CTkEntry(satir, placeholder_text="Stok Kod", width=85)
-            kod_entry.pack(side="left", padx=(0, 4))
-            ad_entry = ctk.CTkEntry(satir, placeholder_text="Ürün Adı", width=150)
-            ctk.CTkButton(satir, text="🔑", width=30, fg_color="#5585EF", hover_color="#4871CB",
-                          command=lambda: self.urun_secim_penceresi(kod_entry, hedef_ad_entry=ad_entry, hedef_fiyat_entry=fiyat_entry)).pack(side="left", padx=(0, 4))
-            ad_entry.pack(side="left", padx=(0, 4))
-            miktar_entry = ctk.CTkEntry(satir, placeholder_text="Miktar", width=65)
-            miktar_entry.pack(side="left", padx=(0, 4))
-            fiyat_entry = ctk.CTkEntry(satir, placeholder_text="Birim Fiyat", width=85)
-            fiyat_entry.pack(side="left", padx=(0, 4))
-            pb_secim = ctk.CTkOptionMenu(satir, values=["TL", "USD", "EUR"], width=75)
-            pb_secim.pack(side="left", padx=(0, 4))
+    def _siparis_form_sifirla(self):
+        for k in list(self._sip_form_kalem_listesi):
+            k["satir"].destroy()
+        self._sip_form_kalem_listesi.clear()
+        self._sip_form_mus.delete(0, "end")
+        self._sip_form_teslim.delete(0, "end")
+        self.siparis_form_kalem_ekle()
 
-            def satiri_sil():
-                kalem_listesi[:] = [k for k in kalem_listesi if k["satir"] != satir]
-                satir.destroy()
+    def siparis_form_kalem_ekle(self):
+        satir = ctk.CTkFrame(self._sip_form_kalem_alani, fg_color="transparent")
+        satir.pack(fill="x", pady=3)
+        kod_entry = ctk.CTkEntry(satir, placeholder_text="Stok Kod", width=100)
+        kod_entry.pack(side="left", padx=(0, 4))
+        ad_entry = ctk.CTkEntry(satir, placeholder_text="Ürün Adı", width=200)
+        ctk.CTkButton(satir, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
+                      command=lambda: self.urun_secim_penceresi(kod_entry, hedef_ad_entry=ad_entry, hedef_fiyat_entry=fiyat_entry)).pack(side="left", padx=(0, 4))
+        ad_entry.pack(side="left", padx=(0, 4))
+        miktar_entry = ctk.CTkEntry(satir, placeholder_text="Miktar", width=75)
+        miktar_entry.pack(side="left", padx=(0, 4))
+        fiyat_entry = ctk.CTkEntry(satir, placeholder_text="Birim Fiyat", width=90)
+        fiyat_entry.pack(side="left", padx=(0, 4))
+        iskonto_entry = ctk.CTkEntry(satir, placeholder_text="İskonto %", width=70)
+        iskonto_entry.pack(side="left", padx=(0, 4))
+        pb_secim = ctk.CTkOptionMenu(satir, values=["TL", "USD", "EUR"], width=80)
+        pb_secim.pack(side="left", padx=(0, 4))
 
-            ctk.CTkButton(satir, text="✕", width=28, fg_color="#F36D6D", hover_color="#CF5D5D", command=satiri_sil).pack(side="left")
-            kalem_listesi.append({"satir": satir, "kod": kod_entry, "ad": ad_entry, "miktar": miktar_entry, "fiyat": fiyat_entry, "pb": pb_secim})
+        def satiri_sil():
+            self._sip_form_kalem_listesi[:] = [k for k in self._sip_form_kalem_listesi if k["satir"] != satir]
+            satir.destroy()
 
-        ctk.CTkButton(pencere, text="+ Kalem Ekle", width=120, fg_color="#45C89D", hover_color="#3BAA85", command=kalem_ekle).pack(anchor="w", padx=20, pady=(0, 10))
+        ctk.CTkButton(satir, text="✕", width=30, fg_color="#F36D6D", hover_color="#CF5D5D", command=satiri_sil).pack(side="left")
+        self._sip_form_kalem_listesi.append({"satir": satir, "kod": kod_entry, "ad": ad_entry, "miktar": miktar_entry,
+                                              "fiyat": fiyat_entry, "iskonto": iskonto_entry, "pb": pb_secim})
 
-        def kaydet():
+    def _siparis_form_kalemleri_topla(self):
+        """İskonto % alanı sadece bu form içinde kullanılıyor - backend'e giden BirimFiyat
+        zaten iskonto uygulanmış NET fiyattır (şema değişikliği gerektirmez, Fatura Kes'teki
+        gibi ayrı bir İskontoOrani alanı taşımaz)."""
+        kalemler = []
+        for k in self._sip_form_kalem_listesi:
+            kod = k["kod"].get().strip()
+            ad = k["ad"].get().strip()
+            if not kod:
+                continue
             try:
-                musteri_id = int(ck_mus.get())
+                miktar = float(k["miktar"].get())
+                fiyat = float(k["fiyat"].get())
             except ValueError:
-                messagebox.showwarning("Eksik Bilgi", "Geçerli bir Müşteri ID girin (🔍 ile seçebilirsiniz).")
-                return
-            kalemler = []
-            for k in kalem_listesi:
-                kod = k["kod"].get().strip()
-                ad = k["ad"].get().strip()
-                if not kod:
-                    continue
+                messagebox.showwarning("Hatalı Değer", f"'{ad or kod}' için miktar/fiyat sayısal olmalıdır.")
+                return None
+            iskonto_metin = k["iskonto"].get().strip()
+            if iskonto_metin:
                 try:
-                    miktar = float(k["miktar"].get())
-                    fiyat = float(k["fiyat"].get())
+                    iskonto = float(iskonto_metin)
+                    if not (0 <= iskonto <= 100):
+                        raise ValueError
                 except ValueError:
-                    messagebox.showwarning("Hatalı Değer", f"'{ad or kod}' için miktar/fiyat sayısal olmalıdır.")
-                    return
-                kalemler.append({"StokKod": kod, "StokAdi": ad or kod, "Miktar": miktar, "BirimFiyat": fiyat, "ParaBirimi": k["pb"].get()})
-            if not kalemler:
-                messagebox.showwarning("Eksik Bilgi", "En az bir ürün kalemi eklemelisiniz.")
-                return
-            data = {"MusteriID": musteri_id, "Kalemler": kalemler}
-            try:
-                res = requests.post(f"{API}/siparis-grup-ekle", json=data, headers=self.req_headers(), timeout=10)
-                if res.status_code == 200:
-                    pencere.destroy()
-                    self.siparisleri_yukle()
-                    self.stoklari_yukle()
-                    messagebox.showinfo("Başarılı", res.json().get("mesaj", "Sipariş grubu oluşturuldu."))
-                else:
-                    self.api_hata_goster(res)
-            except requests.exceptions.RequestException:
-                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+                    messagebox.showwarning("Hatalı Değer", f"'{ad or kod}' için iskonto 0-100 arasında bir sayı olmalıdır.")
+                    return None
+                fiyat = round(fiyat * (1 - iskonto / 100), 2)
+            kalemler.append({"StokKod": kod, "StokAdi": ad or kod, "Miktar": miktar, "BirimFiyat": fiyat, "ParaBirimi": k["pb"].get()})
+        return kalemler
 
-        ctk.CTkButton(pencere, text="💾 Siparişi Kaydet", fg_color="#49B772", hover_color="#3E9C61", height=38,
-                      command=kaydet).pack(fill="x", padx=20, pady=(0, 5))
+    def siparis_form_kaydet(self):
+        try:
+            musteri_id = int(self._sip_form_mus.get())
+        except ValueError:
+            messagebox.showwarning("Eksik Bilgi", "Geçerli bir Müşteri ID girin (🔍 ile seçebilirsiniz).")
+            return
+        kalemler = self._siparis_form_kalemleri_topla()
+        if kalemler is None:
+            return
+        if not kalemler:
+            messagebox.showwarning("Eksik Bilgi", "En az bir ürün kalemi eklemelisiniz.")
+            return
+        data = {"MusteriID": musteri_id, "Kalemler": kalemler, "SozVerilenTeslimTarihi": self._sip_form_teslim.get().strip() or None}
+        try:
+            res = requests.post(f"{API}/siparis-grup-ekle", json=data, headers=self.req_headers(), timeout=10)
+            if res.status_code == 200:
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Sipariş oluşturuldu."))
+                self.siparisleri_yukle()
+                self.dashboard_yukle()
+                self.stoklari_yukle()
+                self.siparis_liste_goster()
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
-        def sablon_olarak_kaydet():
-            sablon_adi = simpledialog.askstring("Şablon Adı", "Bu şablona vermek istediğiniz adı yazın (örn: 'Aylık Standart Sipariş'):", parent=pencere)
-            if not sablon_adi:
-                return
-            kalemler = []
-            for k in kalem_listesi:
-                kod = k["kod"].get().strip()
-                ad = k["ad"].get().strip()
-                if not kod:
-                    continue
-                try:
-                    miktar = float(k["miktar"].get())
-                    fiyat = float(k["fiyat"].get())
-                except ValueError:
-                    messagebox.showwarning("Hatalı Değer", f"'{ad or kod}' için miktar/fiyat sayısal olmalıdır.")
-                    return
-                kalemler.append({"StokKod": kod, "StokAdi": ad or kod, "Miktar": miktar, "BirimFiyat": fiyat, "ParaBirimi": k["pb"].get()})
-            if not kalemler:
-                messagebox.showwarning("Eksik Bilgi", "Şablon olarak kaydetmek için en az bir ürün kalemi eklemelisiniz.")
-                return
-            musteri_id_val = None
-            try:
-                musteri_id_val = int(ck_mus.get())
-            except ValueError:
-                pass  # müşteri seçilmemişse "Genel" şablon olarak kaydedilir
-            data = {"SablonAdi": sablon_adi, "MusteriID": musteri_id_val, "Kalemler": kalemler}
-            try:
-                res = requests.post(f"{API}/siparis-sablonu-kaydet", json=data, headers=self.req_headers(), timeout=8)
-                if res.status_code == 200:
-                    messagebox.showinfo("Başarılı", res.json().get("mesaj"))
-                else:
-                    self.api_hata_goster(res)
-            except requests.exceptions.RequestException:
-                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
-
-        ctk.CTkButton(pencere, text="💾 Bu Sipariş İçeriğini Şablon Olarak Kaydet", fg_color="#9965F1", hover_color="#8256CD",
-                      command=sablon_olarak_kaydet).pack(fill="x", padx=20, pady=(0, 20))
-
-        kalem_ekle()
+    def siparis_form_sablon_kaydet(self):
+        sablon_adi = simpledialog.askstring("Şablon Adı", "Bu şablona vermek istediğiniz adı yazın (örn: 'Aylık Standart Sipariş'):", parent=self)
+        if not sablon_adi:
+            return
+        kalemler = self._siparis_form_kalemleri_topla()
+        if kalemler is None:
+            return
+        if not kalemler:
+            messagebox.showwarning("Eksik Bilgi", "Şablon olarak kaydetmek için en az bir ürün kalemi eklemelisiniz.")
+            return
+        musteri_id_val = None
+        try:
+            musteri_id_val = int(self._sip_form_mus.get())
+        except ValueError:
+            pass  # müşteri seçilmemişse "Genel" şablon olarak kaydedilir
+        data = {"SablonAdi": sablon_adi, "MusteriID": musteri_id_val, "Kalemler": kalemler}
+        try:
+            res = requests.post(f"{API}/siparis-sablonu-kaydet", json=data, headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+            else:
+                self.api_hata_goster(res)
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def siparis_sablonlari_penceresi(self):
         pencere = ctk.CTkToplevel(self)
@@ -13122,9 +15589,9 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        ctk.CTkLabel(pencere, text="📋 Kayıtlı Sipariş Şablonları", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
-        cerceve, tree = tablo_olustur(pencere, ["ID", "Şablon Adı", "Varsayılan Müşteri", "Oluşturma Tarihi"], [50, 220, 200, 150], height=12)
-        cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        ctk.CTkLabel(pencere, text="📋 Kayıtlı Sipariş Şablonları", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=(18, 10))
+        tree = OzelTablo(pencere, ["ID", "Şablon Adı", "Varsayılan Müşteri", "Oluşturma Tarihi"], [50, 220, 200, 150], height=12)
+        tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
         def sablonlari_yukle():
             try:
@@ -13140,7 +15607,7 @@ class MainApp(ctk.CTkToplevel):
         alt_satir.pack(fill="x", padx=20, pady=(0, 20))
         mus_frame = ctk.CTkFrame(alt_satir, fg_color="transparent")
         mus_frame.pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(mus_frame, text="Sipariş için Müşteri:", font=("Arial", 11)).pack(side="left", padx=(0, 5))
+        ctk.CTkLabel(mus_frame, text="Sipariş için Müşteri:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 5))
         hedef_musteri_entry = ctk.CTkEntry(mus_frame, placeholder_text="Müşteri ID", width=90)
         hedef_musteri_entry.pack(side="left", padx=(0, 4))
         ctk.CTkButton(mus_frame, text="🔍", width=32, command=lambda: self.musteri_secim_penceresi(hedef_musteri_entry)).pack(side="left")
@@ -13190,58 +15657,41 @@ class MainApp(ctk.CTkToplevel):
 
         sablonlari_yukle()
 
-    def siparis_ver(self):
-        try:
-            data = {"MusteriID": int(self.sp_mus.get()), "StokKod": self.sp_kod.get(), "StokAdi": self.sp_ad.get(),
-                    "Miktar": float(self.sp_mik.get()),"ParaBirimi": self.sp_kur.get(), "BirimFiyat": float(self.sp_fiyat.get()),
-                    "SozVerilenTeslimTarihi": self.sp_teslim_tarihi.get().strip() or None}
-        except ValueError:
-            messagebox.showwarning("Eksik/Hatalı Bilgi", "Müşteri ID, Miktar ve Fiyat sayısal olmalıdır.")
-            return
-        try:
-            res = requests.post(f"{API}/siparis-ekle", json=data, headers=self.req_headers(), timeout=5)
-            if res.status_code == 200:
-                sonuc = res.json()
-                self.sp_mus.delete(0, "end")
-                self.sp_kod.delete(0, "end")
-                self.sp_ad.delete(0, "end")
-                self.sp_mik.delete(0, "end")
-                self.sp_fiyat.delete(0, "end")
-                self.sp_teslim_tarihi.delete(0, "end")
-                self.siparisleri_yukle()
-                self.dashboard_yukle()
-                self.stoklari_yukle()
-                if sonuc.get("StokUyarisi"):
-                    messagebox.showwarning("Sipariş Alındı - Stok Uyarısı", sonuc["mesaj"])
-                elif "OnayBekliyor" not in sonuc:
-                    messagebox.showinfo("Başarılı", sonuc.get("mesaj", "Sipariş alındı."))
-                else:
-                    messagebox.showinfo("Onaya Gönderildi", sonuc.get("mesaj"))
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
-
     def siparisleri_yukle(self):
         try:
             res = requests.get(f"{API}/siparis-listesi", headers=self.req_headers(), timeout=5)
-            for i in self.sip_tree.get_children():
-                self.sip_tree.delete(i)
-            for s in res.json()["siparisler"]:
-                durum = s["Durum"]
-                teslim = s.get("TeslimEdilenMiktar", 0)
-                kalan = s.get("KalanMiktar", s["Miktar"])
-                grup = s.get("SiparisGrupID") or "-"
-                kalan_bakiye = s.get("KalanBakiye", s["ToplamTutar"])
-                bakiye_gosterim = f"{kalan_bakiye:,.2f} TL" if kalan_bakiye > 0.01 else "✅ Ödendi"
-                bakiye_etiketi = "bakiye_odendi" if kalan_bakiye <= 0.01 else ("bakiye_kismi" if kalan_bakiye < s["ToplamTutar"] else "")
-                self.sip_tree.insert("", "end", iid=str(s["SiparisID"]), tags=(durum, bakiye_etiketi),
-                                      values=(s["SiparisID"], grup, s["FirmaAdi"], s["StokAdi"], f"{s['Miktar']} KG",
-                                              f"{teslim:g} / {kalan:g}", f"{s['ToplamTutar']:.2f} TL", bakiye_gosterim, s["Tarih"], durum))
-            self.sip_tree.tag_configure("bakiye_odendi", foreground="#45C89D")
-            self.sip_tree.tag_configure("bakiye_kismi", foreground="#F7B341")
+            self._sip_veri_cache = res.json().get("siparisler", [])
         except Exception:
-            pass
+            self._sip_veri_cache = []
+        self._siparis_tree_render()
+
+    def _siparis_tree_render(self):
+        """Arama/durum filtresini _sip_veri_cache üzerinde İSTEMCİ TARAFINDA uygular -
+        binlerce siparişte bile her tuşa basışta sunucuya gitmemek için (liste zaten
+        siparisleri_yukle ile önbelleğe alınmış durumda)."""
+        if not hasattr(self, "sip_tree"):
+            return
+        for i in self.sip_tree.get_children():
+            self.sip_tree.delete(i)
+        arama = self.sip_arama.get().strip().lower() if hasattr(self, "sip_arama") else ""
+        durum_secim = self.sip_durum_filtre.get() if hasattr(self, "sip_durum_filtre") else "Tümü"
+        for s in self._sip_veri_cache:
+            durum = s["Durum"]
+            if durum_secim != "Tümü" and durum != durum_secim:
+                continue
+            if arama and arama not in str(s["SiparisID"]).lower() and arama not in s["FirmaAdi"].lower() and arama not in s["StokAdi"].lower():
+                continue
+            teslim = s.get("TeslimEdilenMiktar", 0)
+            kalan = s.get("KalanMiktar", s["Miktar"])
+            grup = s.get("SiparisGrupID") or "-"
+            kalan_bakiye = s.get("KalanBakiye", s["ToplamTutar"])
+            bakiye_gosterim = f"{kalan_bakiye:,.2f} TL" if kalan_bakiye > 0.01 else "✅ Ödendi"
+            bakiye_etiketi = "bakiye_odendi" if kalan_bakiye <= 0.01 else ("bakiye_kismi" if kalan_bakiye < s["ToplamTutar"] else "")
+            self.sip_tree.insert("", "end", iid=str(s["SiparisID"]), tags=(durum, bakiye_etiketi),
+                                  values=(s["SiparisID"], grup, s["FirmaAdi"], s["StokAdi"], f"{s['Miktar']} KG",
+                                          f"{teslim:g} / {kalan:g}", f"{s['ToplamTutar']:.2f} TL", bakiye_gosterim, s["Tarih"], durum))
+        self.sip_tree.tag_configure("bakiye_odendi", foreground="#45C89D")
+        self.sip_tree.tag_configure("bakiye_kismi", foreground="#F7B341")
 
     def siparis_durum_guncelle_islem(self, yeni_durum):
         secili = self.sip_tree.selection()
@@ -13270,6 +15720,43 @@ class MainApp(ctk.CTkToplevel):
         else:
             self.api_hata_goster(res)
 
+    def siparis_tahsilat_ozeti_goster(self):
+        secili = self.sip_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen bir sipariş satırı seçin.")
+            return
+        try:
+            res = requests.get(f"{API}/siparis-tahsilat-ozeti/{secili[0]}", headers=self.req_headers(), timeout=6)
+            if res.status_code != 200:
+                self.api_hata_goster(res)
+                return
+            veri = res.json()
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+            return
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title(f"Tahsilat Özeti - Sipariş #{secili[0]}")
+        self._pencere_ortala(pencere, 380, 300)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+        pencere.configure(fg_color=gecerli_renk(RENK_TABAN))
+
+        ctk.CTkLabel(pencere, text=f"💰 Sipariş #{secili[0]} Tahsilat Özeti",
+                     font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(20, 15))
+
+        def kart(baslik, deger, renk):
+            f = ctk.CTkFrame(pencere, fg_color=gecerli_renk(RENK_KART), corner_radius=10, border_width=1, border_color=renk)
+            f.pack(fill="x", padx=25, pady=6)
+            ctk.CTkLabel(f, text=baslik, font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=15, pady=(8, 0))
+            ctk.CTkLabel(f, text=f"{deger:,.2f} TL", font=("Segoe UI", 16, "bold"), text_color=renk).pack(anchor="w", padx=15, pady=(0, 8))
+
+        kart("Sipariş Tutarı", veri.get("SiparisTutari", 0), "#5585EF")
+        kart("Tahsil Edilen", veri.get("TahsilEdilen", 0), "#49B772")
+        kart("Kalan Bakiye", veri.get("KalanBakiye", 0), "#F7B341" if veri.get("KalanBakiye", 0) > 0.01 else "#45C89D")
+
     def siparis_toplu_faturaya_cevir_islem(self):
         secili = self.sip_tree.selection()
         if not secili:
@@ -13297,8 +15784,69 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_tahsilat(self):
-        tah_frame = ctk.CTkFrame(self.tab_tahsilat, fg_color=RENK_KART, corner_radius=12)
-        tah_frame.pack(pady=20, padx=20, fill="x")
+        self.tah_liste_govde = ctk.CTkFrame(self.tab_tahsilat, fg_color="transparent")
+        self.tah_form_govde = ctk.CTkFrame(self.tab_tahsilat, fg_color="transparent")
+        self._tahsilat_liste_olustur()
+        self._tahsilat_form_olustur()
+        self.tahsilat_liste_goster()
+
+    def tahsilat_liste_goster(self):
+        self.tah_form_govde.pack_forget()
+        self.tah_liste_govde.pack(fill="both", expand=True)
+
+    def tahsilat_form_goster(self):
+        self.tah_liste_govde.pack_forget()
+        for e in (self.tah_mus, self.tah_tutar, self.tah_ack, self.tah_cek_evrak_no, self.tah_cek_vade, self.tah_cek_banka):
+            e.delete(0, "end")
+        self.tah_tur.set("Nakit")
+        self.tah_kur.set("TL")
+        self.tahsilat_siparis_baglantisini_temizle()
+        self._tahsilat_banka_hesaplarini_yukle()
+        self.tah_form_govde.pack(fill="both", expand=True)
+
+    def _tahsilat_banka_hesaplarini_yukle(self):
+        try:
+            res = requests.get(f"{API}/banka-hesaplari", headers=self.req_headers(), timeout=5)
+            self._tah_banka_hesap_cache = res.json().get("hesaplar", []) if res.status_code == 200 else []
+        except Exception:
+            self._tah_banka_hesap_cache = []
+        secenekler = ["(Seçilmedi - genel kayıt)"] + [f"{h['HesapID']} - {h['BankaAdi']} {h.get('SubeAdi') or ''}".strip()
+                                                        for h in self._tah_banka_hesap_cache]
+        self.tah_banka_hesap.configure(values=secenekler)
+        self.tah_banka_hesap.set(secenekler[0])
+
+    def _tahsilat_liste_olustur(self):
+        ust = ctk.CTkFrame(self.tah_liste_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 5))
+        ctk.CTkLabel(ust, text="💰 Tahsilat & Kasa", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Tahsilat", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.tahsilat_form_goster).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.tah_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=20, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.tah_arama = ctk.CTkEntry(arama_bar, placeholder_text="Firma, açıklama veya ödeme türüne göre ara...", width=320)
+        self.tah_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.tah_arama.bind("<KeyRelease>", lambda e: self._tahsilat_tree_render())
+
+        self.tah_tree = OzelTablo(
+            self.tah_liste_govde, ["ID", "Firma", "Tutar", "Ödeme Türü", "Sipariş", "Açıklama", "Tarih"],
+            [50, 180, 100, 130, 80, 190, 150], height=13)
+        self.tah_tree.pack(pady=(0, 10), padx=20, fill="both", expand=True)
+        self._tah_veri_cache = []
+        self.tahsilatlari_yukle()
+
+    def _tahsilat_form_olustur(self):
+        ust = ctk.CTkFrame(self.tah_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.tahsilat_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Tahsilat", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Kasaya Tahsilat Gir", fg_color="#49B772", hover_color="#3E9C61", width=180, height=30,
+                      command=self.tahsilat_islem).pack(side="right")
+
+        tah_frame = ctk.CTkFrame(self.tah_form_govde, fg_color=RENK_KART, corner_radius=12)
+        tah_frame.pack(padx=20, pady=(0, 10), fill="x")
 
         tah_mus_frame = ctk.CTkFrame(tah_frame, fg_color="transparent")
         tah_mus_frame.grid(row=0, column=0, padx=10, pady=10)
@@ -13320,22 +15868,35 @@ class MainApp(ctk.CTkToplevel):
         tah_siparis_frame.grid(row=1, column=2, columnspan=2, padx=10, pady=10, sticky="w")
         self._tah_secili_siparis_id = None
         self.tah_siparis_etiket = ctk.CTkLabel(tah_siparis_frame, text="Sipariş: (bağlanmadı - genel tahsilat)",
-                                                font=("Arial", 11), text_color=RENK_METIN_SOLUK)
+                                                font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK)
         self.tah_siparis_etiket.pack(side="left", padx=(0, 8))
         ctk.CTkButton(tah_siparis_frame, text="📎 Siparişe Bağla (opsiyonel)", width=190, fg_color="#64CCFA", hover_color="#55ADD5",
                       command=self.tahsilat_siparis_secim_penceresi).pack(side="left", padx=(0, 4))
         ctk.CTkButton(tah_siparis_frame, text="✕", width=28, fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
                       command=self.tahsilat_siparis_baglantisini_temizle).pack(side="left")
 
-        ctk.CTkButton(tah_frame, text="Kasaya Tahsilat Gir", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.tahsilat_islem).grid(row=2, column=0, columnspan=4, padx=10, pady=(0, 10), sticky="we")
+        # Banka Hesabı seçimi - Havale/EFT veya Kredi Kartı ile birlikte doldurulursa
+        # tahsilat SADECE genel "102 Bankalar" hesabına soyut kayıt olarak değil, seçilen
+        # gerçek banka hesabının bakiyesine de işlenir (Finans & Banka ile bağlantılı).
+        banka_satiri = ctk.CTkFrame(tah_frame, fg_color="transparent")
+        banka_satiri.grid(row=2, column=0, columnspan=4, padx=10, pady=(0, 10), sticky="w")
+        ctk.CTkLabel(banka_satiri, text="Banka Hesabı (Havale/EFT, Kredi Kartı için opsiyonel):", font=("Segoe UI", 11)).pack(side="left", padx=(0, 8))
+        self.tah_banka_hesap = ctk.CTkOptionMenu(banka_satiri, values=["(Seçilmedi - genel kayıt)"], width=260)
+        self.tah_banka_hesap.pack(side="left")
+        self._tah_banka_hesap_cache = []
 
-        ctk.CTkLabel(self.tab_tahsilat, text="Tahsilat Geçmişi", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 0))
-        tah_cerceve, self.tah_tree = tablo_olustur(
-            self.tab_tahsilat, ["ID", "Firma", "Tutar", "Ödeme Türü", "Sipariş", "Açıklama", "Tarih"],
-            [50, 180, 100, 130, 80, 190, 150], height=13)
-        tah_cerceve.pack(pady=10, padx=20, fill="both", expand=True)
-        self.tahsilatlari_yukle()
+        cek_kutu = ctk.CTkFrame(self.tah_form_govde, fg_color=RENK_KART, corner_radius=12)
+        cek_kutu.pack(padx=20, pady=(0, 10), fill="x")
+        ctk.CTkLabel(cek_kutu, text="Çek Bilgileri (Ödeme Türü 'Çek' seçilirse doldurun - Çek/Senet Portföyüne otomatik eklenir):",
+                     font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
+        cek_satiri = ctk.CTkFrame(cek_kutu, fg_color="transparent")
+        cek_satiri.pack(fill="x", padx=10, pady=(0, 10))
+        self.tah_cek_evrak_no = ctk.CTkEntry(cek_satiri, placeholder_text="Evrak No (boş=otomatik)", width=180)
+        self.tah_cek_evrak_no.pack(side="left", padx=(0, 8))
+        self.tah_cek_vade = ctk.CTkEntry(cek_satiri, placeholder_text="Vade Tarihi (YYYY-AA-GG)", width=170)
+        self.tah_cek_vade.pack(side="left", padx=(0, 8))
+        self.tah_cek_banka = ctk.CTkEntry(cek_satiri, placeholder_text="Banka Bilgisi", width=180)
+        self.tah_cek_banka.pack(side="left")
 
     def tahsilat_siparis_secim_penceresi(self):
         try:
@@ -13352,11 +15913,11 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        ctk.CTkLabel(pencere, text="📎 Bu Müşterinin Siparişleri", font=("Arial", 15, "bold"), text_color="#76CCE1").pack(pady=(18, 5))
+        ctk.CTkLabel(pencere, text="📎 Bu Müşterinin Siparişleri", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(18, 5))
         ctk.CTkLabel(pencere, text="Bir satıra çift tıklayarak ya da seçip aşağıdaki butona basarak seçebilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(pady=(0, 10))
-        cerceve, tree = tablo_olustur(pencere, ["Sipariş ID", "Ürün", "Tutar (Kalan Bakiye)", "Durum", "Tarih"], [80, 190, 150, 100, 130], height=9)
-        cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(pady=(0, 10))
+        tree = OzelTablo(pencere, ["Sipariş ID", "Ürün", "Tutar (Kalan Bakiye)", "Durum", "Tarih"], [80, 190, 150, 100, 130], height=9, durum_kolonu="Durum")
+        tree.pack(fill="both", expand=True, padx=20, pady=(0, 15))
         tree.tag_configure("tam_odendi", foreground="#45C89D")
         tree.tag_configure("kismi_odendi", foreground="#F7B341")
 
@@ -13404,18 +15965,38 @@ class MainApp(ctk.CTkToplevel):
         except ValueError:
             messagebox.showwarning("Eksik/Hatalı Bilgi", "Müşteri ID ve Tutar sayısal olmalıdır.")
             return
+
+        # Banka Hesabı seçildiyse (Havale/EFT, Kredi Kartı) - backend sadece bu iki
+        # ödeme türü için dikkate alır, diğerlerinde sessizce yok sayılır.
+        secili_banka = self.tah_banka_hesap.get()
+        if secili_banka and secili_banka != "(Seçilmedi - genel kayıt)":
+            try:
+                data["BankaHesapID"] = int(secili_banka.split(" - ")[0])
+            except (ValueError, IndexError):
+                data["BankaHesapID"] = None
+        else:
+            data["BankaHesapID"] = None
+
+        # Çek bilgileri - backend sadece OdemeTuru='Çek' iken dikkate alır.
+        data["CekEvrakNo"] = self.tah_cek_evrak_no.get().strip() or None
+        data["CekVadeTarihi"] = self.tah_cek_vade.get().strip() or None
+        data["CekBankaBilgisi"] = self.tah_cek_banka.get().strip() or None
+
         try:
             res = requests.post(f"{API}/tahsilat-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.tah_mus.delete(0, "end")
-                self.tah_tutar.delete(0, "end")
-                self.tah_tur.set("Nakit")
-                self.tah_ack.delete(0, "end")
-                self.tahsilat_siparis_baglantisini_temizle()
                 self.tahsilatlari_yukle()
                 self.dashboard_yukle()
-                if hasattr(self, "kasalari_yukle"):
+                # NOT: hasattr(self, "kasalari_yukle") HER ZAMAN True döner çünkü bu bir
+                # sınıf metodu - Kasa ekranı henüz hiç açılmamışsa (tembel yükleme) widget'ları
+                # kurulmamış olur ve kasalari_yukle() içeride patlardı. Doğru kontrol, ekranın
+                # gerçekten kurulup kurulmadığını gösteren bir WIDGET'ın varlığına bakmak.
+                if hasattr(self, "kasa_kartlari_alani"):
                     self.kasalari_yukle()
+                if hasattr(self, "banka_tree"):
+                    self.finans_verilerini_yukle()
+                self.tahsilat_liste_goster()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Tahsilat kaydedildi."))
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -13424,25 +16005,137 @@ class MainApp(ctk.CTkToplevel):
     def tahsilatlari_yukle(self):
         try:
             res = requests.get(f"{API}/tahsilat-listesi", headers=self.req_headers(), timeout=5)
-            for i in self.tah_tree.get_children():
-                self.tah_tree.delete(i)
-            for t in res.json()["tahsilatlar"]:
-                siparis_gosterim = f"#{t['SiparisID']}" if t.get("SiparisID") else "-"
-                self.tah_tree.insert("", "end", values=(t["TahsilatID"], t["FirmaAdi"], f"{t['Tutar']:.2f} TL", t["OdemeTuru"],
-                                                          siparis_gosterim, t["Aciklama"], t["Tarih"]))
+            self._tah_veri_cache = res.json().get("tahsilatlar", [])
         except Exception:
-            pass
+            self._tah_veri_cache = []
+        self._tahsilat_tree_render()
+
+    def _tahsilat_tree_render(self):
+        if not hasattr(self, "tah_tree"):
+            return
+        for i in self.tah_tree.get_children():
+            self.tah_tree.delete(i)
+        arama = self.tah_arama.get().strip().lower() if hasattr(self, "tah_arama") else ""
+        for t in self._tah_veri_cache:
+            if arama and arama not in str(t.get("FirmaAdi", "")).lower() and arama not in str(t.get("Aciklama", "")).lower() \
+                    and arama not in str(t.get("OdemeTuru", "")).lower():
+                continue
+            siparis_gosterim = f"#{t['SiparisID']}" if t.get("SiparisID") else "-"
+            self.tah_tree.insert("", "end", values=(t["TahsilatID"], t["FirmaAdi"], f"{t['Tutar']:.2f} TL", t["OdemeTuru"],
+                                                      siparis_gosterim, t["Aciklama"], t["Tarih"]))
+
+    def _hareket_iptal_penceresi_ac(self, baslik, endpoint_url, yenile_fn, uyari_metni):
+        """Kasa/Banka/Masraf/Personel hareketi iptal endpoint'lerinin (main.py'de
+        /fatura-iptal ile aynı storno deseni - bkz. secili_fatura_iptal_et) HEPSİ
+        aynı 'neden + dönem kilit şifresi' formunu kullanıyor - tek yerde yazılıp
+        4 ekranda tekrar kullanılıyor."""
+        pencere = ctk.CTkToplevel(self)
+        pencere.title(baslik)
+        pencere.geometry("420x300")
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text=uyari_metni, font=("Segoe UI", 10), text_color="#F7B341",
+                     wraplength=380, justify="left").pack(padx=15, pady=(15, 10))
+        ctk.CTkLabel(pencere, text="İptal Nedeni:", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=15)
+        neden_entry = ctk.CTkEntry(pencere, width=380, placeholder_text="Örn: Yanlış tutar girildi")
+        neden_entry.pack(padx=15, pady=(3, 12))
+
+        sifre_lbl = ctk.CTkLabel(pencere, text="Dönem Kilit Şifresi (sadece kilitli bir döneme aitse gerekir):", font=("Segoe UI", 10))
+        sifre_lbl.pack(anchor="w", padx=15)
+        sifre_entry = ctk.CTkEntry(pencere, width=200, show="•")
+        sifre_entry.pack(anchor="w", padx=15, pady=(3, 15))
+
+        def onayla():
+            neden = neden_entry.get().strip()
+            if not neden:
+                messagebox.showwarning("Eksik Bilgi", "İptal nedeni zorunludur.")
+                return
+            if not messagebox.askyesno("Onay", "Bu hareket iptal edilecek. Emin misiniz?"):
+                return
+            data = {"Neden": neden, "DonemKilitSifresi": sifre_entry.get() or None}
+            try:
+                res = requests.put(endpoint_url, json=data, headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    yenile_fn()
+                    messagebox.showinfo("Başarılı", res.json()["mesaj"])
+                elif res.status_code == 403:
+                    messagebox.showerror("Dönem Kilitli", res.json().get("detail", "Şifre hatalı veya eksik."))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="🚫 İptal Et", fg_color="#F36D6D", hover_color="#CF5D5D", command=onayla).pack()
 
     def init_kasa(self):
-        ust = ctk.CTkFrame(self.tab_kasa, fg_color="transparent")
-        ust.pack(fill="x", padx=10, pady=10)
-        self.kasa_kartlari_alani = ctk.CTkFrame(ust, fg_color="transparent")
-        self.kasa_kartlari_alani.pack(fill="x")
+        self.kasa_liste_govde = ctk.CTkFrame(self.tab_kasa, fg_color="transparent")
+        self.kasa_form_govde = ctk.CTkFrame(self.tab_kasa, fg_color="transparent")
+        self._kasa_liste_olustur()
+        self._kasa_form_olustur()
+        self.kasa_liste_goster()
 
-        form = ctk.CTkFrame(self.tab_kasa, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=10, pady=(0, 10))
-        self.kasa_secim = ctk.CTkOptionMenu(form, values=["Kasa TL"], width=140, command=lambda _: self.kasa_hareketlerini_yukle())
-        self.kasa_secim.grid(row=0, column=0, padx=10, pady=10)
+    def kasa_liste_goster(self):
+        self.kasa_form_govde.pack_forget()
+        self.kasa_liste_govde.pack(fill="both", expand=True)
+
+    def kasa_form_goster(self):
+        self.kasa_liste_govde.pack_forget()
+        for e in (self.kasa_tutar, self.kasa_belge_no, self.kasa_aciklama):
+            e.delete(0, "end")
+        if self._kasa_listesi:
+            self.kasa_form_secim.configure(values=[k["Ad"] for k in self._kasa_listesi])
+            self.kasa_form_secim.set(self.kasa_secim.get())
+        self.kasa_form_govde.pack(fill="both", expand=True)
+
+    def _kasa_liste_olustur(self):
+        ust = ctk.CTkFrame(self.kasa_liste_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust, text="🗄️ Kasa", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Hareket Ekle", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.kasa_form_goster).pack(side="right")
+        ctk.CTkButton(ust, text="🚫 Seçileni İptal Et", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, height=34,
+                      command=self.secili_kasa_hareketi_iptal_et).pack(side="right", padx=(0, 8))
+
+        self.kasa_kartlari_alani = ctk.CTkFrame(self.kasa_liste_govde, fg_color="transparent")
+        self.kasa_kartlari_alani.pack(fill="x", padx=10, pady=(0, 10))
+
+        arama_bar = ctk.CTkFrame(self.kasa_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="Görüntülenen Kasa:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(12, 6), pady=10)
+        self.kasa_secim = ctk.CTkOptionMenu(arama_bar, values=["Kasa TL"], width=140, command=lambda _: self.kasa_hareketlerini_yukle())
+        self.kasa_secim.pack(side="left", padx=(0, 12), pady=10)
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(0, 4))
+        self.kasa_arama = ctk.CTkEntry(arama_bar, placeholder_text="Belge no, açıklama veya işlem türüne göre ara...", width=300)
+        self.kasa_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.kasa_arama.bind("<KeyRelease>", lambda e: self._kasa_hareket_tree_render())
+
+        self.kasa_hareket_tree = OzelTablo(
+            self.kasa_liste_govde, ["Tarih", "İşlem No", "Belge No", "İşlem Türü", "Açıklama", "Tutar", "Yön", "Kullanıcı"],
+            [130, 70, 90, 130, 220, 100, 70, 100], height=16)
+        self.kasa_hareket_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.kasa_hareket_tree.tag_configure("iptal_edilmis", foreground=("#a1a1aa", "#71717a"))
+
+        self._kasa_listesi = []
+        self._kasa_hareket_cache = []
+        self.kasalari_yukle()
+
+    def _kasa_form_olustur(self):
+        ust = ctk.CTkFrame(self.kasa_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.kasa_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Kasa Hareketi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.kasa_hareket_ekle_islem).pack(side="right")
+
+        form = ctk.CTkFrame(self.kasa_form_govde, fg_color=RENK_KART, corner_radius=12)
+        form.pack(fill="x", padx=20, pady=(0, 10))
+        self.kasa_form_secim = ctk.CTkOptionMenu(form, values=["Kasa TL"], width=140)
+        self.kasa_form_secim.grid(row=0, column=0, padx=10, pady=10)
         self.kasa_islem_turu = ctk.CTkOptionMenu(form, values=["Tahsilat", "Ödeme", "Bankadan Çekilen", "Bankaya Yatırılan"], width=160)
         self.kasa_islem_turu.grid(row=0, column=1, padx=10, pady=10)
         self.kasa_tutar = ctk.CTkEntry(form, placeholder_text="Tutar")
@@ -13451,16 +16144,22 @@ class MainApp(ctk.CTkToplevel):
         self.kasa_belge_no.grid(row=0, column=3, padx=10, pady=10)
         self.kasa_aciklama = ctk.CTkEntry(form, placeholder_text="Açıklama", width=220)
         self.kasa_aciklama.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 10))
-        ctk.CTkButton(form, text="💾 Hareketi Kaydet", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.kasa_hareket_ekle_islem).grid(row=1, column=2, columnspan=2, padx=10, pady=(0, 10))
+        # "Ödeme" seçilirse (örn. tedarikçiye nakit ödeme) hangi tedarikçiye ait olduğu
+        # burada belirtilebilir - verilirse tedarikçi ekstresine de işlenir.
+        ctk.CTkLabel(form, text="Tedarikçi (Ödeme ise, opsiyonel):", font=("Segoe UI", 11)).grid(row=1, column=2, padx=(10, 5), pady=(0, 10), sticky="e")
+        self.kasa_tedarikci_id = ctk.CTkOptionMenu(form, values=["(Yok - genel kayıt)"], width=200)
+        self.kasa_tedarikci_id.grid(row=1, column=3, padx=10, pady=(0, 10))
+        self._kasa_tedarikcilerini_yukle()
 
-        kasa_cerceve, self.kasa_hareket_tree = tablo_olustur(
-            self.tab_kasa, ["Tarih", "İşlem No", "Belge No", "İşlem Türü", "Açıklama", "Tutar", "Yön", "Kullanıcı"],
-            [130, 70, 90, 130, 220, 100, 70, 100], height=16)
-        kasa_cerceve.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        self._kasa_listesi = []
-        self.kasalari_yukle()
+    def _kasa_tedarikcilerini_yukle(self):
+        try:
+            res = requests.get(f"{API}/tedarikci-listesi", headers=self.req_headers(), timeout=5)
+            tedarikciler = res.json().get("tedarikciler", []) if res.status_code == 200 else []
+        except Exception:
+            tedarikciler = []
+        secenekler = ["(Yok - genel kayıt)"] + [f"{t['TedarikciID']} - {t['FirmaAdi']}" for t in tedarikciler]
+        self.kasa_tedarikci_id.configure(values=secenekler)
+        self.kasa_tedarikci_id.set(secenekler[0])
 
     def kasalari_yukle(self):
         try:
@@ -13476,8 +16175,8 @@ class MainApp(ctk.CTkToplevel):
             renk = renkler.get(kasa["ParaBirimi"], "#71717a")
             kart = ctk.CTkFrame(self.kasa_kartlari_alani, fg_color=RENK_KART, corner_radius=14, border_width=2, border_color=renk)
             kart.pack(side="left", padx=(0, 10), fill="x", expand=True)
-            ctk.CTkLabel(kart, text=kasa["Ad"], font=("Arial", 13, "bold"), text_color=renk).pack(pady=(12, 4), padx=16)
-            ctk.CTkLabel(kart, text=f"{kasa['Bakiye']:,.2f} {kasa['ParaBirimi']}", font=("Arial", 17, "bold")).pack(pady=(0, 12), padx=16)
+            ctk.CTkLabel(kart, text=kasa["Ad"], font=("Segoe UI", 13, "bold"), text_color=renk).pack(pady=(12, 4), padx=16)
+            ctk.CTkLabel(kart, text=f"{kasa['Bakiye']:,.2f} {kasa['ParaBirimi']}", font=("Segoe UI", 17, "bold")).pack(pady=(0, 12), padx=16)
 
         if self._kasa_listesi:
             self.kasa_secim.configure(values=[k["Ad"] for k in self._kasa_listesi])
@@ -13493,20 +16192,34 @@ class MainApp(ctk.CTkToplevel):
 
     def kasa_hareketlerini_yukle(self):
         kasa_id = self._secili_kasa_id()
-        for i in self.kasa_hareket_tree.get_children():
-            self.kasa_hareket_tree.delete(i)
         if kasa_id is None:
+            self._kasa_hareket_cache = []
+            self._kasa_hareket_tree_render()
             return
         try:
             res = requests.get(f"{API}/kasa-hareketleri/{kasa_id}", headers=self.req_headers(), timeout=5)
-            for h in res.json().get("hareketler", []):
-                self.kasa_hareket_tree.insert("", "end", values=(h["Tarih"], h["HareketID"], h["BelgeNo"], h["IslemTuru"],
-                                                                  h["Aciklama"], f"{h['Tutar']:,.2f}", h["Yon"], h["Kullanici"]))
+            self._kasa_hareket_cache = res.json().get("hareketler", [])
         except Exception:
-            pass
+            self._kasa_hareket_cache = []
+        self._kasa_hareket_tree_render()
+
+    def _kasa_hareket_tree_render(self):
+        if not hasattr(self, "kasa_hareket_tree"):
+            return
+        for i in self.kasa_hareket_tree.get_children():
+            self.kasa_hareket_tree.delete(i)
+        arama = self.kasa_arama.get().strip().lower() if hasattr(self, "kasa_arama") else ""
+        for h in self._kasa_hareket_cache:
+            if arama and arama not in str(h.get("BelgeNo", "")).lower() and arama not in str(h.get("Aciklama", "")).lower() \
+                    and arama not in str(h.get("IslemTuru", "")).lower():
+                continue
+            etiket = ("iptal_edilmis",) if h.get("Durum") == "İptal" else ()
+            self.kasa_hareket_tree.insert("", "end", tags=etiket, values=(h["Tarih"], h["HareketID"], h["BelgeNo"], h["IslemTuru"],
+                                                              h["Aciklama"], f"{h['Tutar']:,.2f}", h["Yon"], h["Kullanici"]))
 
     def kasa_hareket_ekle_islem(self):
-        kasa_id = self._secili_kasa_id()
+        secili_ad = self.kasa_form_secim.get()
+        kasa_id = next((k["KasaID"] for k in self._kasa_listesi if k["Ad"] == secili_ad), None)
         if kasa_id is None:
             messagebox.showwarning("Kasa Seçilmedi", "Lütfen bir kasa seçin.")
             return
@@ -13515,72 +16228,81 @@ class MainApp(ctk.CTkToplevel):
         except ValueError:
             messagebox.showwarning("Hatalı Tutar", "Tutar sayısal olmalıdır.")
             return
+        aciklama = self.kasa_aciklama.get().strip()
         data = {"KasaID": kasa_id, "IslemTuru": self.kasa_islem_turu.get(), "Tutar": tutar,
-                "Aciklama": self.kasa_aciklama.get().strip(), "BelgeNo": self.kasa_belge_no.get().strip() or None}
+                "Aciklama": aciklama, "BelgeNo": self.kasa_belge_no.get().strip() or None}
+        ted_secili = self.kasa_tedarikci_id.get()
+        if " - " in ted_secili:
+            ted_id, ted_ad = ted_secili.split(" - ", 1)
+            data["TedarikciID"] = int(ted_id)
+            # Kasa hareketinin kendi açıklaması sadece kullanıcının yazdığını gösteriyordu
+            # (örn. "test"), tedarikçiye ait olduğunu belirtmiyordu - Kasa Hareketleri
+            # listesine bakan biri bunun bir tedarikçi ödemesi olduğunu anlayamıyordu.
+            # (Tedarikçi ekstresi zaten doğru gösteriyordu, ama Kasa listesi göstermiyordu.)
+            data["Aciklama"] = f"Tedarikçiye Ödeme ({ted_ad}): {aciklama}" if aciklama else f"Tedarikçiye Ödeme ({ted_ad})"
         try:
             res = requests.post(f"{API}/kasa-hareket-ekle", json=data, headers=self.req_headers(), timeout=6)
             if res.status_code == 200:
-                self.kasa_tutar.delete(0, "end")
-                self.kasa_belge_no.delete(0, "end")
-                self.kasa_aciklama.delete(0, "end")
+                self.kasa_secim.set(secili_ad)
+                self._kasa_tedarikcilerini_yukle()
                 self.kasalari_yukle()
+                self.kasa_liste_goster()
+                messagebox.showinfo("Başarılı", "Kasa hareketi kaydedildi.")
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
+    def secili_kasa_hareketi_iptal_et(self):
+        secili = self.kasa_hareket_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen iptal etmek istediğiniz hareketi listeden seçin.")
+            return
+        vals = self.kasa_hareket_tree.item(secili[0])["values"]
+        hareket_id = vals[1]  # İşlem No sütunu
+        self._hareket_iptal_penceresi_ac(
+            f"Kasa Hareketi İptal: #{hareket_id}", f"{API}/kasa-hareket-iptal/{hareket_id}", self.kasa_hareketlerini_yukle,
+            "⚠️ Bu hareket silinmez, 'İptal' olarak işaretlenir; kasa bakiyesi geri alınır ve ters (storno) bir muhasebe kaydı atılır.")
+
     def init_irsaliye(self):
-        irs_frame = ctk.CTkFrame(self.tab_irsaliye, fg_color=RENK_KART, corner_radius=12)
-        irs_frame.pack(pady=20, padx=20, fill="x")
-
-        i_mus_frame = ctk.CTkFrame(irs_frame, fg_color="transparent")
-        i_mus_frame.grid(row=0, column=0, padx=10, pady=10)
-        self.i_mus = ctk.CTkEntry(i_mus_frame, placeholder_text="Müşteri ID", width=110)
-        self.i_mus.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(i_mus_frame, text="🔍", width=35,
-                      command=lambda: self.musteri_secim_penceresi(self.i_mus)).pack(side="left")
-
-        self.i_plaka = ctk.CTkEntry(irs_frame, placeholder_text="Kamyon Plaka", width=150)
-        self.i_plaka.grid(row=0, column=1, padx=10, pady=10)
-        self.i_sofor = ctk.CTkEntry(irs_frame, placeholder_text="Şoför Adı", width=180)
-        self.i_sofor.grid(row=0, column=2, padx=10, pady=10)
-        self.i_tur = ctk.CTkOptionMenu(irs_frame, values=["Toptan Satış İrsaliyesi", "Toptan Satış İade İrsaliyesi",
-                                                            "Konsinye Çıkış İrsaliyesi", "Konsinye Çıkış İade İrsaliyesi",
-                                                            "Perakende Satış İrsaliyesi"], width=230)
-        self.i_tur.grid(row=1, column=2, padx=10, pady=10)
-        self.i_ack = ctk.CTkEntry(irs_frame, placeholder_text="Sevk Açıklaması", width=250)
-        self.i_ack.grid(row=1, column=0, columnspan=2, padx=10, pady=10)
-
-        siparis_satiri = ctk.CTkFrame(irs_frame, fg_color="transparent")
-        siparis_satiri.grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="w")
-        self.i_siparis_etiket = ctk.CTkLabel(siparis_satiri, text="Bağlı Sipariş: Yok", font=("Arial", 11), text_color=RENK_METIN_SOLUK)
-        self.i_siparis_etiket.pack(side="left", padx=(0, 10))
-        ctk.CTkButton(siparis_satiri, text="🔑 Siparişten Seç", width=140, fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.irsaliye_siparis_sec_penceresi).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(siparis_satiri, text="✕ Kaldır", width=80, fg_color="#3f3f46", hover_color="#27272a",
-                      command=self.irsaliye_siparis_kaldir).pack(side="left")
-
-        self.irsaliye_siparis_id = None
-        ctk.CTkButton(irs_frame, text="Sevk İrsaliyesi Kes", fg_color="#76CCE1", hover_color="#64ADBF",
-                      command=self.irsaliye_islem).grid(row=2, column=2, padx=10, pady=(0, 10))
-
-        ctk.CTkLabel(self.tab_irsaliye, text="Sevk Kalemleri (opsiyonel — e-İrsaliye oluşturmak için en az 1 kalem gerekir)",
-                     font=("Arial", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 2))
         self._irs_kalem_listesi = []
-        self.irs_kalemler_frame = ctk.CTkFrame(self.tab_irsaliye, fg_color=RENK_KART, corner_radius=12)
-        self.irs_kalemler_frame.pack(fill="x", padx=20, pady=(0, 5))
-        ctk.CTkButton(self.tab_irsaliye, text="+ Kalem Satırı Ekle", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
-                      command=self.irs_kalem_ekle).pack(anchor="w", padx=20, pady=(0, 10))
-        self.irs_kalem_ekle()
+        self.irsaliye_siparis_id = None
+        self.irs_liste_govde = ctk.CTkFrame(self.tab_irsaliye, fg_color="transparent")
+        self.irs_form_govde = ctk.CTkFrame(self.tab_irsaliye, fg_color="transparent")
+        self._irsaliye_liste_olustur()
+        self._irsaliye_form_olustur()
+        self.irsaliye_liste_goster()
 
-        ctk.CTkLabel(self.tab_irsaliye, text="İrsaliye Geçmişi", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 0))
-        irs_cerceve, self.irs_tree = tablo_olustur(
-            self.tab_irsaliye, ["ID", "Firma", "Tür", "Plaka", "Şoför", "Açıklama", "Tarih", "e-İrsaliye"],
-            [50, 150, 160, 80, 100, 160, 130, 90], height=11)
-        irs_cerceve.pack(pady=(5, 5), padx=20, fill="both", expand=True)
+    def irsaliye_liste_goster(self):
+        self.irs_form_govde.pack_forget()
+        self.irs_liste_govde.pack(fill="both", expand=True)
 
-        irs_buton_satiri = ctk.CTkFrame(self.tab_irsaliye, fg_color="transparent")
-        irs_buton_satiri.pack(fill="x", padx=20, pady=(0, 15))
+    def irsaliye_form_goster(self):
+        self.irs_liste_govde.pack_forget()
+        self._irsaliye_form_sifirla()
+        self.irs_form_govde.pack(fill="both", expand=True)
+
+    def _irsaliye_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.irs_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="🚚 İrsaliye", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni İrsaliye Kes", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.irsaliye_form_goster).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.irs_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.irs_arama = ctk.CTkEntry(arama_bar, placeholder_text="Firma, plaka, şoför veya açıklamaya göre ara...", width=320)
+        self.irs_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.irs_arama.bind("<KeyRelease>", lambda e: self._irsaliye_tree_render())
+
+        self.irs_tree = OzelTablo(
+            self.irs_liste_govde, ["ID", "Firma", "Tür", "Plaka", "Şoför", "Açıklama", "Tarih", "e-İrsaliye"],
+            [50, 150, 160, 80, 100, 160, 130, 90], height=15)
+        self.irs_tree.pack(pady=(0, 5), padx=10, fill="both", expand=True)
+
+        irs_buton_satiri = ctk.CTkFrame(self.irs_liste_govde, fg_color="transparent")
+        irs_buton_satiri.pack(fill="x", padx=10, pady=(0, 10))
         ctk.CTkButton(irs_buton_satiri, text="🧾 e-İrsaliye XML Oluştur", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.secili_irsaliye_eirsaliye_olustur).pack(side="left", padx=(0, 6))
         ctk.CTkButton(irs_buton_satiri, text="👁️ XML'i Görüntüle", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
@@ -13590,7 +16312,70 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(irs_buton_satiri, text="📄 PDF Oluştur", fg_color="#42ACA2", hover_color="#38928A",
                       command=self.secili_irsaliye_pdf_olustur).pack(side="left")
 
+        self._irs_veri_cache = []
         self.irsaliyeleri_yukle()
+
+    def _irsaliye_form_olustur(self):
+        ust = ctk.CTkFrame(self.irs_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.irsaliye_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni İrsaliye Kes", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="🚚 Kes", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.irsaliye_islem).pack(side="right")
+
+        irs_frame = ctk.CTkFrame(self.irs_form_govde, fg_color=RENK_KART, corner_radius=12)
+        irs_frame.pack(padx=20, pady=(0, 10), fill="x")
+        irs_frame.grid_columnconfigure((0, 1, 2), weight=1, uniform="irs_col")
+
+        i_mus_frame = ctk.CTkFrame(irs_frame, fg_color="transparent")
+        i_mus_frame.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        self.i_mus = ctk.CTkEntry(i_mus_frame, placeholder_text="Müşteri ID", width=110)
+        self.i_mus.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(i_mus_frame, text="🔍", width=35,
+                      command=lambda: self.musteri_secim_penceresi(self.i_mus)).pack(side="left")
+
+        self.i_plaka = ctk.CTkEntry(irs_frame, placeholder_text="Kamyon Plaka", width=150)
+        self.i_plaka.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        self.i_sofor = ctk.CTkEntry(irs_frame, placeholder_text="Şoför Adı", width=180)
+        self.i_sofor.grid(row=0, column=2, padx=10, pady=10, sticky="ew")
+        self.i_tur = ctk.CTkOptionMenu(irs_frame, values=["Toptan Satış İrsaliyesi", "Toptan Satış İade İrsaliyesi",
+                                                            "Konsinye Çıkış İrsaliyesi", "Konsinye Çıkış İade İrsaliyesi",
+                                                            "Perakende Satış İrsaliyesi"], width=230)
+        self.i_tur.grid(row=1, column=2, padx=10, pady=10, sticky="ew")
+        self.i_ack = ctk.CTkEntry(irs_frame, placeholder_text="Sevk Açıklaması", width=250)
+        self.i_ack.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+
+        siparis_satiri = ctk.CTkFrame(irs_frame, fg_color="transparent")
+        siparis_satiri.grid(row=2, column=0, columnspan=3, padx=10, pady=(0, 10), sticky="w")
+        self.i_siparis_etiket = ctk.CTkLabel(siparis_satiri, text="Bağlı Sipariş: Yok", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK)
+        self.i_siparis_etiket.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(siparis_satiri, text="🔑 Siparişten Seç", width=140, fg_color="#9965F1", hover_color="#8256CD",
+                      command=self.irsaliye_siparis_sec_penceresi).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(siparis_satiri, text="✕ Kaldır", width=80, fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.irsaliye_siparis_kaldir).pack(side="left")
+
+        kalem_kutu = ctk.CTkFrame(self.irs_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kalem_kutu.pack(fill="both", expand=True, padx=20, pady=(0, 15))
+        kalem_baslik = ctk.CTkFrame(kalem_kutu, fg_color="transparent")
+        kalem_baslik.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(kalem_baslik, text="Sevk Kalemleri (opsiyonel — e-İrsaliye oluşturmak için en az 1 kalem gerekir)",
+                     font=("Segoe UI", 11, "bold"), text_color=RENK_METIN_SOLUK).pack(side="left")
+        ctk.CTkButton(kalem_baslik, text="+ Kalem Satırı Ekle", width=140, fg_color="#45C89D", hover_color="#3BAA85",
+                      command=self.irs_kalem_ekle).pack(side="right")
+        self.irs_kalemler_frame = ctk.CTkScrollableFrame(kalem_kutu, fg_color=gecerli_renk(RENK_IKINCIL), corner_radius=12)
+        self.irs_kalemler_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _irsaliye_form_sifirla(self):
+        self.i_mus.delete(0, "end")
+        self.i_plaka.delete(0, "end")
+        self.i_sofor.delete(0, "end")
+        self.i_ack.delete(0, "end")
+        self.irsaliye_siparis_kaldir()
+        for k in list(self._irs_kalem_listesi):
+            k["satir"].destroy()
+        self._irs_kalem_listesi = []
+        self.irs_kalem_ekle()
 
     def irs_kalem_ekle(self):
         satir = ctk.CTkFrame(self.irs_kalemler_frame, fg_color="transparent")
@@ -13694,7 +16479,7 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        ctk.CTkLabel(pencere, text="📦 Açık Siparişler", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(anchor="w", padx=20, pady=(18, 10))
+        ctk.CTkLabel(pencere, text="📦 Açık Siparişler", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(anchor="w", padx=20, pady=(18, 10))
         liste_alani = ctk.CTkScrollableFrame(pencere, fg_color=gecerli_renk(RENK_KART))
         liste_alani.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
@@ -13724,10 +16509,10 @@ class MainApp(ctk.CTkToplevel):
             ic = ctk.CTkFrame(kart, fg_color="transparent")
             ic.pack(fill="x", padx=12, pady=8)
             ic.bind("<Button-1>", sec)
-            ust = ctk.CTkLabel(ic, text=f"#{s['SiparisID']} — {s['FirmaAdi']}", font=("Arial", 13, "bold"), anchor="w")
+            ust = ctk.CTkLabel(ic, text=f"#{s['SiparisID']} — {s['FirmaAdi']}", font=("Segoe UI", 13, "bold"), anchor="w")
             ust.pack(fill="x")
             ust.bind("<Button-1>", sec)
-            alt = ctk.CTkLabel(ic, text=f"{s['StokAdi']} · Toplam: {s['Miktar']:g} · Kalan: {kalan:g} · {s['Durum']}", font=("Arial", 10),
+            alt = ctk.CTkLabel(ic, text=f"{s['StokAdi']} · Toplam: {s['Miktar']:g} · Kalan: {kalan:g} · {s['Durum']}", font=("Segoe UI", 10),
                                 text_color=gecerli_renk(RENK_METIN_SOLUK), anchor="w")
             alt.pack(fill="x")
             alt.bind("<Button-1>", sec)
@@ -13757,16 +16542,8 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/irsaliye-kes", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.i_mus.delete(0, "end")
-                self.i_plaka.delete(0, "end")
-                self.i_sofor.delete(0, "end")
-                self.i_ack.delete(0, "end")
-                self.irsaliye_siparis_kaldir()
-                for k in list(self._irs_kalem_listesi):
-                    k["satir"].destroy()
-                self._irs_kalem_listesi = []
-                self.irs_kalem_ekle()
                 self.irsaliyeleri_yukle()
+                self.irsaliye_liste_goster()
                 messagebox.showinfo("Başarılı", "Sevk irsaliyesi başarıyla kesildi.")
             else:
                 self.api_hata_goster(res)
@@ -13776,13 +16553,23 @@ class MainApp(ctk.CTkToplevel):
     def irsaliyeleri_yukle(self):
         try:
             res = requests.get(f"{API}/irsaliye-listesi", headers=self.req_headers(), timeout=5)
-            for i in self.irs_tree.get_children():
-                self.irs_tree.delete(i)
-            for r in res.json()["irsaliyeler"]:
-                self.irs_tree.insert("", "end", values=(r["IrsaliyeID"], r["FirmaAdi"], r.get("IrsaliyeTuru", "-"), r["Plaka"],
-                                                          r["Sofor"], r["Aciklama"], r["Tarih"], r.get("EIrsaliyeDurum", "TASLAK")))
+            self._irs_veri_cache = res.json().get("irsaliyeler", [])
         except Exception:
-            pass
+            self._irs_veri_cache = []
+        self._irsaliye_tree_render()
+
+    def _irsaliye_tree_render(self):
+        if not hasattr(self, "irs_tree"):
+            return
+        for i in self.irs_tree.get_children():
+            self.irs_tree.delete(i)
+        arama = self.irs_arama.get().strip().lower() if hasattr(self, "irs_arama") else ""
+        for r in self._irs_veri_cache:
+            if arama and arama not in str(r.get("FirmaAdi", "")).lower() and arama not in str(r.get("Plaka", "")).lower() \
+                    and arama not in str(r.get("Sofor", "")).lower() and arama not in str(r.get("Aciklama", "")).lower():
+                continue
+            self.irs_tree.insert("", "end", values=(r["IrsaliyeID"], r["FirmaAdi"], r.get("IrsaliyeTuru", "-"), r["Plaka"],
+                                                      r["Sofor"], r["Aciklama"], r["Tarih"], r.get("EIrsaliyeDurum", "TASLAK")))
 
     def init_fatura(self):
         fat_frame = ctk.CTkFrame(self.tab_fatura, fg_color=RENK_KART, corner_radius=12)
@@ -13827,7 +16614,7 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkLabel(self.tab_fatura,
                      text="Not: Fatura kesildiğinde stok otomatik düşülür, KDV dahil PDF oluşturulur, verilirse ilgili\n"
                           "sipariş 'Tamamlandı' yapılır ve irsaliye faturaya bağlanır (sipariş → irsaliye → fatura zinciri).",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, justify="left").pack(pady=5, anchor="w", padx=40)
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, justify="left").pack(pady=5, anchor="w", padx=40)
 
     def fatura_islem(self):
         try:
@@ -13955,11 +16742,11 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkLabel(self.tab_fatura_liste,
                      text="Not: Bu XML resmi bir e-Fatura değildir. GİB e-Arşiv Portalı'na manuel veri girişini\n"
                           "hızlandırmak veya ileride bir entegratöre (Foriba/Nesbilgi/QNB eFinans vb.) veri beslemek içindir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=10, pady=(0, 5))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, justify="left").pack(anchor="w", padx=10, pady=(0, 5))
 
         efatura_satiri = ctk.CTkFrame(self.tab_fatura_liste, fg_color="transparent")
         efatura_satiri.pack(pady=(0, 10), padx=10, fill="x")
-        ctk.CTkLabel(efatura_satiri, text="e-Fatura/e-Arşiv:", font=("Arial", 11, "bold")).pack(side="left", padx=(5, 10))
+        ctk.CTkLabel(efatura_satiri, text="e-Fatura/e-Arşiv:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(5, 10))
         ctk.CTkButton(efatura_satiri, text="🧾 e-Fatura XML Oluştur", fg_color="#76CCE1", hover_color="#64ADBF",
                       command=self.secili_fatura_efatura_olustur).pack(side="left", padx=4)
         ctk.CTkButton(efatura_satiri, text="📤 Entegratöre Gönder", fg_color="#5585EF", hover_color="#4871CB",
@@ -13967,10 +16754,10 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(efatura_satiri, text="🚫 Faturayı İptal Et", fg_color="#F36D6D", hover_color="#CF5D5D",
                       command=self.secili_fatura_iptal_et).pack(side="left", padx=4)
 
-        fat_cerceve, self.fatura_tree = tablo_olustur(
+        self.fatura_tree = OzelTablo(
             self.tab_fatura_liste, ["Fatura No", "Firma", "Tarih", "Toplam Tutar", "e-Fatura Durumu", "Durum"],
-            [100, 240, 150, 120, 120, 90], height=17)
-        fat_cerceve.pack(pady=5, padx=10, fill="both", expand=True)
+            [100, 240, 150, 120, 120, 90], height=17, durum_kolonu="Durum")
+        self.fatura_tree.pack(pady=5, padx=10, fill="both", expand=True)
         self.fatura_pdf_yollari = {}
         self.faturalari_yukle()
         # --- ÇİFT TIKLAMA İLE PDF AÇMA ---
@@ -14075,12 +16862,12 @@ class MainApp(ctk.CTkToplevel):
 
         ctk.CTkLabel(pencere, text="⚠️ Fatura silinmez, 'İptal' olarak işaretlenir; düşülen stok geri eklenir ve "
                                     "ters (storno) bir muhasebe kaydı atılır. Bu bir İADE değildir.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=380, justify="left").pack(padx=15, pady=(15, 10))
-        ctk.CTkLabel(pencere, text="İptal Nedeni:", font=("Arial", 11, "bold")).pack(anchor="w", padx=15)
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=380, justify="left").pack(padx=15, pady=(15, 10))
+        ctk.CTkLabel(pencere, text="İptal Nedeni:", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=15)
         neden_entry = ctk.CTkEntry(pencere, width=380, placeholder_text="Örn: Yanlış tutar/müşteri girildi")
         neden_entry.pack(padx=15, pady=(3, 12))
 
-        sifre_lbl = ctk.CTkLabel(pencere, text="Dönem Kilit Şifresi (sadece kilitli bir döneme aitse gerekir):", font=("Arial", 10))
+        sifre_lbl = ctk.CTkLabel(pencere, text="Dönem Kilit Şifresi (sadece kilitli bir döneme aitse gerekir):", font=("Segoe UI", 10))
         sifre_lbl.pack(anchor="w", padx=15)
         sifre_entry = ctk.CTkEntry(pencere, width=200, show="•")
         sifre_entry.pack(anchor="w", padx=15, pady=(3, 15))
@@ -14098,7 +16885,7 @@ class MainApp(ctk.CTkToplevel):
                 if res.status_code == 200:
                     pencere.destroy()
                     self.faturalari_yukle()
-                    if hasattr(self, "stoklari_yukle"):
+                    if hasattr(self, "stok_tree"):
                         self.stoklari_yukle()
                     messagebox.showinfo("Başarılı", res.json()["mesaj"])
                 elif res.status_code == 403:
@@ -14155,32 +16942,32 @@ class MainApp(ctk.CTkToplevel):
         if not secili:
             messagebox.showinfo("Seçim Yok", "Lütfen listeden bir fatura seçin.")
             return
-        
-        yol = self.fatura_pdf_yollari.get(secili[0])
-        if not yol:
-            messagebox.showerror("Hata", "Bu faturaya ait dosya yolu bulunamadı.")
-            return
-            
+        fatura_id = int(secili[0])
+
         try:
-            import re, os
-            dosya_adi = os.path.basename(yol)
-            sayilar = re.findall(r'\d+', dosya_adi)
-            if not sayilar:
-                messagebox.showerror("Hata", f"Dosya adından ID çıkarılamadı: {dosya_adi}")
+            res = requests.get(f"{API}/fatura-pdf-indir/{fatura_id}", headers=self.req_headers(), timeout=8)
+            if res.status_code == 200:
+                os.makedirs("Faturalar", exist_ok=True)
+                yerel_yol = os.path.join("Faturalar", f"Fatura_{fatura_id}.pdf")
+                with open(yerel_yol, "wb") as f:
+                    f.write(res.content)
+                os.startfile(os.path.abspath(yerel_yol))
                 return
-            
-            fatura_id = int(sayilar[0])
-            
+        except requests.exceptions.RequestException:
+            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+            return
+
+        # Sunucuda kayıtlı PDF bulunamadıysa (ör. eski, PdfYolu'suz fatura) yerelde yeniden üret.
+        try:
             res = requests.get(f"{API}/fatura-detay/{fatura_id}", headers=self.req_headers())
             if res.status_code == 200:
                 veri = res.json()
                 yeni_yol = f"Fatura_{fatura_id}_Yeni.pdf"
-                
+
                 fatura_bilgi = veri.get('fatura', {})
                 kalemler = veri.get('kalemler', [])
                 musteri_bilgi = veri.get('musteri', {"Unvan": "Bilinmiyor"})
-                
-                # İŞTE ÇÖZÜM BURADA: dip_toplam'ı sayı olarak değil, PDF'in beklediği gibi Sözlük (Dict) yapıyoruz.
+
                 ara_toplam = sum(k.get("SatirToplam", 0) for k in kalemler)
                 toplam_kdv = sum(k.get("KDVTutari", 0) for k in kalemler)
                 genel_toplam = fatura_bilgi.get("ToplamTutar", 0.0)
@@ -14190,12 +16977,12 @@ class MainApp(ctk.CTkToplevel):
                     "KDVToplam": toplam_kdv,
                     "GenelToplam": genel_toplam
                 }
-                
+
                 self.profesyonel_fatura_pdf_olustur(
                     fatura_id=fatura_id,
                     musteri_bilgi=musteri_bilgi,
                     kalemler=kalemler,
-                    dip_toplam=dip_toplam_dict,  # Artık sözlük gidiyor, hata vermeyecek!
+                    dip_toplam=dip_toplam_dict,
                     dosya_yolu=yeni_yol
                 )
                 os.startfile(os.path.abspath(yeni_yol))
@@ -14235,16 +17022,16 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, hover_color=RENK_IKINCIL, text_color=RENK_METIN,
                       command=lambda: (self.loglari_sistem_yukle(), self.degisiklik_loglarini_yukle())).pack(side="left", padx=5)
 
-        ctk.CTkLabel(self.tab_loglar, text="İşlem Logları (genel akış)", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12)
-        log_cerceve, self.sistem_log_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_loglar, text="İşlem Logları (genel akış)", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12)
+        self.sistem_log_tree = OzelTablo(
             self.tab_loglar, ["Log ID", "Kullanıcı", "İşlem", "Tarih"], [70, 130, 460, 170], height=10)
-        log_cerceve.pack(pady=(2, 10), padx=10, fill="both", expand=True)
+        self.sistem_log_tree.pack(pady=(2, 10), padx=10, fill="both", expand=True)
 
-        ctk.CTkLabel(self.tab_loglar, text="Değişiklik Geçmişi (eski değer → yeni değer)", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12)
-        degisiklik_cerceve, self.degisiklik_log_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_loglar, text="Değişiklik Geçmişi (eski değer → yeni değer)", font=("Segoe UI", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=12)
+        self.degisiklik_log_tree = OzelTablo(
             self.tab_loglar, ["Tablo", "Kayıt ID", "Alan", "Eski Değer", "Yeni Değer", "Kullanıcı", "Tarih"],
             [110, 80, 120, 150, 150, 110, 140], height=10)
-        degisiklik_cerceve.pack(pady=(2, 10), padx=10, fill="both", expand=True)
+        self.degisiklik_log_tree.pack(pady=(2, 10), padx=10, fill="both", expand=True)
 
         self.loglari_sistem_yukle()
         self.degisiklik_loglarini_yukle()
@@ -14273,18 +17060,18 @@ class MainApp(ctk.CTkToplevel):
     def init_kullanici_aktivite(self):
         ust = ctk.CTkFrame(self.tab_kullanici_aktivite, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="👤 Kullanıcı Aktivite Özeti", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="👤 Kullanıcı Aktivite Özeti", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkLabel(self.tab_kullanici_aktivite,
                      text="İşlem Logları serbest metin olduğu için kesin bir sınıflandırma yapılamaz - 'Kritik İşlem' sütunu "
                           "açıklamasında iptal/silme/kilit/kapatma/red geçen satırları kabaca sayar, tam bir denetim değildir. "
                           "Bir satıra çift tıklayarak o kullanıcının ham işlem loglarını (Sistem Logları ekranında) görebilirsiniz.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         form = ctk.CTkFrame(self.tab_kullanici_aktivite, fg_color=RENK_KART, corner_radius=12)
         form.pack(fill="x", padx=20, pady=(0, 10))
         satir = ctk.CTkFrame(form, fg_color="transparent")
         satir.pack(fill="x", padx=12, pady=12)
-        ctk.CTkLabel(satir, text="Dönem:", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(satir, text="Dönem:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8))
         self.ka_donem = ctk.CTkOptionMenu(satir, values=["Son 7 Gün", "Son 30 Gün", "Son 90 Gün", "Tüm Zamanlar"],
                                            width=150, command=lambda _: self.kullanici_aktivite_yukle())
         self.ka_donem.set("Son 30 Gün")
@@ -14292,9 +17079,9 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(satir, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.kullanici_aktivite_yukle).pack(side="left")
 
-        liste_cerceve, self.ka_tree = tablo_olustur(
+        self.ka_tree = OzelTablo(
             self.tab_kullanici_aktivite, ["Kullanıcı", "Toplam İşlem", "Kritik İşlem", "Son İşlem Tarihi"], [160, 120, 120, 160], height=16)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.ka_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.ka_tree.tag_configure("yuksek_kritik", foreground="#F36D6D")
 
         self.kullanici_aktivite_yukle()
@@ -14320,17 +17107,17 @@ class MainApp(ctk.CTkToplevel):
     def init_ekran_yetkilendirme(self):
         ust = ctk.CTkFrame(self.tab_ekran_yetki, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔐 Ekran Yetkilendirme", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔐 Ekran Yetkilendirme", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkLabel(self.tab_ekran_yetki,
                      text="⚠️ Bu SADECE bir rolün sol menüsünde hangi ekranların GÖRÜNDÜĞÜNÜ belirler - gerçek erişim "
                           "izni hâlâ koddaki güvenlik kontrolleriyle sağlanır. Bir ekranı burada gizlemek o role API "
                           "erişimini KAPATMAZ, sadece menüden gizler. Değişiklik, o rolle oturum açmış kullanıcılarda "
                           "ancak tekrar giriş yapınca görünür.",
-                     font=("Arial", 11), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 12))
+                     font=("Segoe UI", 11), text_color="#F7B341", wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 12))
 
         secim_cerceve = ctk.CTkFrame(self.tab_ekran_yetki, fg_color=RENK_KART, corner_radius=12)
         secim_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(secim_cerceve, text="Rol:", font=("Arial", 11, "bold")).pack(side="left", padx=(15, 5), pady=15)
+        ctk.CTkLabel(secim_cerceve, text="Rol:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(15, 5), pady=15)
         EY_ROLLER = ["Yönetici", "Master", "Patron", "Satış", "Muhasebe", "Depo", "Üretim", "Satınalma", "Finans", "İnsan Kaynakları"]
         self.ey_rol = ctk.CTkOptionMenu(secim_cerceve, values=EY_ROLLER, width=180, command=lambda _: self.ekran_yetki_yukle())
         self.ey_rol.pack(side="left", padx=(0, 15))
@@ -14361,7 +17148,7 @@ class MainApp(ctk.CTkToplevel):
         for ekran_adi in tum_ekranlar:
             var = ctk.BooleanVar(value=(ekran_adi in gizli_ekranlar))
             self._ey_checkbox_vars[ekran_adi] = var
-            ctk.CTkCheckBox(self.ey_liste_alani, text=ekran_adi, variable=var, font=("Arial", 12)).pack(anchor="w", padx=10, pady=3)
+            ctk.CTkCheckBox(self.ey_liste_alani, text=ekran_adi, variable=var, font=("Segoe UI", 12)).pack(anchor="w", padx=10, pady=3)
 
     def ekran_yetki_kaydet(self):
         secili_rol = self.ey_rol.get()
@@ -14406,14 +17193,14 @@ class MainApp(ctk.CTkToplevel):
     def init_rapor_merkezi(self):
         ust = ctk.CTkFrame(self.tab_rapor_merkezi, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🗂️ Rapor Merkezi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🗂️ Rapor Merkezi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkLabel(self.tab_rapor_merkezi,
                      text="Aşağıdan istediğin raporları seç, TEK bir Excel dosyasında (her rapor ayrı sayfa/sekme olarak) indir.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=850).pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=850).pack(anchor="w", padx=22, pady=(0, 10))
 
         donem_cerceve = ctk.CTkFrame(self.tab_rapor_merkezi, fg_color=RENK_KART, corner_radius=12)
         donem_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(donem_cerceve, text="Dönem (KDV/Muhtasar Beyanname Taslağı için gerekli):", font=("Arial", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        ctk.CTkLabel(donem_cerceve, text="Dönem (KDV/Muhtasar Beyanname Taslağı için gerekli):", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
         donem_satir = ctk.CTkFrame(donem_cerceve, fg_color="transparent")
         donem_satir.pack(fill="x", padx=12, pady=(0, 12))
         ctk.CTkLabel(donem_satir, text="Yıl:").pack(side="left", padx=(0, 5))
@@ -14427,7 +17214,7 @@ class MainApp(ctk.CTkToplevel):
 
         secim_cerceve = ctk.CTkFrame(self.tab_rapor_merkezi, fg_color=RENK_KART, corner_radius=12)
         secim_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(secim_cerceve, text="İndirilecek Raporlar:", font=("Arial", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        ctk.CTkLabel(secim_cerceve, text="İndirilecek Raporlar:", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=12, pady=(10, 4))
         self._rm_checkbox_vars = {}
         for rapor_adi in self._RM_RAPOR_SECENEKLERI:
             var = ctk.BooleanVar(value=True)
@@ -14435,10 +17222,10 @@ class MainApp(ctk.CTkToplevel):
             self._rm_checkbox_vars[rapor_adi] = var
         ctk.CTkFrame(secim_cerceve, fg_color="transparent", height=8).pack()
 
-        self.rm_durum_etiket = ctk.CTkLabel(self.tab_rapor_merkezi, text="", font=("Arial", 11), text_color="#49B772")
+        self.rm_durum_etiket = ctk.CTkLabel(self.tab_rapor_merkezi, text="", font=("Segoe UI", 11), text_color="#49B772")
         self.rm_durum_etiket.pack(anchor="w", padx=22, pady=(0, 5))
 
-        ctk.CTkButton(self.tab_rapor_merkezi, text="📥 Seçilenleri Tek Excel Dosyasında İndir", font=("Arial", 13, "bold"),
+        ctk.CTkButton(self.tab_rapor_merkezi, text="📥 Seçilenleri Tek Excel Dosyasında İndir", font=("Segoe UI", 13, "bold"),
                       fg_color="#42ACA2", hover_color="#38928A", height=42, width=280,
                       command=self.rapor_merkezi_indir).pack(anchor="w", padx=20, pady=(0, 20))
 
@@ -14608,17 +17395,17 @@ class MainApp(ctk.CTkToplevel):
     def init_toplu_ice_aktar(self):
         ust = ctk.CTkFrame(self.tab_toplu_ice_aktar, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📤 Toplu İçe Aktarma", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📤 Toplu İçe Aktarma", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkLabel(self.tab_toplu_ice_aktar,
                      text="1) Türü seçip şablonu indirin, 2) Excel'de doldurun (ilk satır başlık, ikinci satırdaki örneği silin), "
                           "3) dosyayı seçip içe aktarın. Her satır ayrı bir kayıt olarak eklenir - mevcut kayıtları GÜNCELLEMEZ, sadece yeni kayıt ekler.",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         form = ctk.CTkFrame(self.tab_toplu_ice_aktar, fg_color=RENK_KART, corner_radius=12)
         form.pack(fill="x", padx=20, pady=(0, 10))
         satir = ctk.CTkFrame(form, fg_color="transparent")
         satir.pack(fill="x", padx=12, pady=15)
-        ctk.CTkLabel(satir, text="Varlık Türü:", font=("Arial", 11, "bold")).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(satir, text="Varlık Türü:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 8))
         self.tia_tur = ctk.CTkOptionMenu(satir, values=list(self._TIA_VARLIKLAR.keys()), width=140)
         self.tia_tur.pack(side="left", padx=(0, 15))
         ctk.CTkButton(satir, text="📄 Şablon İndir", fg_color="#42ACA2", hover_color="#38928A",
@@ -14771,21 +17558,10 @@ class MainApp(ctk.CTkToplevel):
         messagebox.showinfo("İçe Aktarma Tamamlandı", f"{basarili} reçete eklendi, {len(basarisiz)} hata oluştu.\n\nDetaylar aşağıdaki kutuda.")
 
     def init_kullanici_yonetimi(self):
-        ROLLER = ["Yönetici", "Master", "Patron", "Satış", "Muhasebe", "Depo", "Üretim", "Satınalma", "Finans", "İnsan Kaynakları"]
-
-        form = ctk.CTkFrame(self.tab_kullanici, fg_color=RENK_KART, corner_radius=12)
-        form.pack(pady=10, padx=10, fill="x")
-        self.ky_kullanici_adi = ctk.CTkEntry(form, placeholder_text="Kullanıcı Adı", width=180)
-        self.ky_kullanici_adi.grid(row=0, column=0, padx=10, pady=10)
-        self.ky_sifre = ctk.CTkEntry(form, placeholder_text="Şifre", width=180, show="●")
-        self.ky_sifre.grid(row=0, column=1, padx=10, pady=10)
-        self.ky_rol = ctk.CTkOptionMenu(form, values=ROLLER, width=180)
-        self.ky_rol.grid(row=0, column=2, padx=10, pady=10)
-        ctk.CTkButton(form, text="➕ Kullanıcı Ekle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.kullanici_ekle_islem).grid(row=0, column=3, padx=10, pady=10)
+        self._ky_roller = ["Yönetici", "Master", "Patron", "Satış", "Muhasebe", "Depo", "Üretim", "Satınalma", "Finans", "İnsan Kaynakları"]
 
         buton_satiri = ctk.CTkFrame(self.tab_kullanici, fg_color="transparent")
-        buton_satiri.pack(pady=(0, 5), padx=10, fill="x")
+        buton_satiri.pack(pady=(10, 5), padx=10, fill="x")
         ctk.CTkButton(buton_satiri, text="🔑 Seçilinin Şifresini Değiştir", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.kullanici_sifre_degistir_islem).pack(side="left", padx=5)
         ctk.CTkButton(buton_satiri, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
@@ -14794,14 +17570,16 @@ class MainApp(ctk.CTkToplevel):
                       command=self.kullanicilari_yukle).pack(side="left", padx=5)
         ctk.CTkButton(buton_satiri, text="🔒 Sadece Kendi Kayıtları: Aç/Kapat", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.kullanici_yetki_toggle_islem).pack(side="left", padx=5)
+        ctk.CTkButton(buton_satiri, text="➕ Yeni Kullanıcı", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.kullanici_ekle_penceresi_ac).pack(side="right", padx=5)
         ctk.CTkLabel(self.tab_kullanici,
                      text="Not: 'Sadece Kendi Kayıtları' açıldığında o kullanıcı yalnızca kendi eklediği Satış Fırsatı/Aktivite "
                           "kayıtlarını görür (Yönetici/Master bu kısıtlamadan her zaman muaftır). Şu an sadece bu iki ekranı kapsar.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=12, pady=(0, 5))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=12, pady=(0, 5))
 
-        kul_cerceve, self.kullanici_tree = tablo_olustur(
+        self.kullanici_tree = OzelTablo(
             self.tab_kullanici, ["ID", "Kullanıcı Adı", "Rol", "Sadece Kendi Kayıtları"], [70, 220, 160, 150], height=16)
-        kul_cerceve.pack(pady=10, padx=10, fill="both", expand=True)
+        self.kullanici_tree.pack(pady=10, padx=10, fill="both", expand=True)
         self.kullanicilari_yukle()
 
     def kullanici_yetki_toggle_islem(self):
@@ -14821,27 +17599,47 @@ class MainApp(ctk.CTkToplevel):
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
-    def kullanici_ekle_islem(self):
-        kullanici_adi = self.ky_kullanici_adi.get().strip()
-        sifre = self.ky_sifre.get().strip()
-        if not kullanici_adi or not sifre:
-            messagebox.showwarning("Eksik Bilgi", "Kullanıcı adı ve şifre zorunludur.")
-            return
-        if len(sifre) < 3:
-            messagebox.showwarning("Zayıf Şifre", "Şifre en az 3 karakter olmalıdır.")
-            return
-        data = {"KullaniciAdi": kullanici_adi, "Sifre": sifre, "Rol": self.ky_rol.get()}
-        try:
-            res = requests.post(f"{API}/kullanici-ekle", json=data, headers=self.req_headers(), timeout=6)
-            if res.status_code == 200:
-                self.ky_kullanici_adi.delete(0, "end")
-                self.ky_sifre.delete(0, "end")
-                self.kullanicilari_yukle()
-                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kullanıcı eklendi."))
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+    def kullanici_ekle_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Kullanıcı")
+        self._pencere_ortala(pencere, 440, 380)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="➕ Yeni Kullanıcı", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        kullanici_adi = ctk.CTkEntry(pencere, placeholder_text="Kullanıcı Adı", width=280)
+        kullanici_adi.pack(pady=5)
+        sifre = ctk.CTkEntry(pencere, placeholder_text="Şifre", width=280, show="●")
+        sifre.pack(pady=5)
+        rol = ctk.CTkOptionMenu(pencere, values=self._ky_roller, width=280)
+        rol.pack(pady=5)
+
+        def kaydet():
+            kullanici_adi_deger = kullanici_adi.get().strip()
+            sifre_deger = sifre.get().strip()
+            if not kullanici_adi_deger or not sifre_deger:
+                messagebox.showwarning("Eksik Bilgi", "Kullanıcı adı ve şifre zorunludur.")
+                return
+            if len(sifre_deger) < 3:
+                messagebox.showwarning("Zayıf Şifre", "Şifre en az 3 karakter olmalıdır.")
+                return
+            data = {"KullaniciAdi": kullanici_adi_deger, "Sifre": sifre_deger, "Rol": rol.get()}
+            try:
+                res = requests.post(f"{API}/kullanici-ekle", json=data, headers=self.req_headers(), timeout=6)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.kullanicilari_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kullanıcı eklendi."))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="💾 Kullanıcı Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
+        self.after(100, lambda: kullanici_adi.focus_set())
 
     def kullanicilari_yukle(self):
         try:
@@ -14886,7 +17684,7 @@ class MainApp(ctk.CTkToplevel):
         win.geometry("340x180")
         win.grab_set()
         win.transient(self)
-        ctk.CTkLabel(win, text=f"{secili_ad} için yeni şifre", font=("Arial", 13, "bold")).pack(pady=(20, 10))
+        ctk.CTkLabel(win, text=f"{secili_ad} için yeni şifre", font=("Segoe UI", 13, "bold")).pack(pady=(20, 10))
         yeni_sifre_entry = ctk.CTkEntry(win, width=250, show="●")
         yeni_sifre_entry.pack(pady=5)
 
@@ -14910,94 +17708,100 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(win, text="💾 Kaydet", fg_color="#49B772", hover_color="#3E9C61", command=kaydet).pack(pady=15)
 
     def init_satinalma(self):
-        ust_frame = ctk.CTkFrame(self.tab_satinalma, fg_color="transparent")
-        ust_frame.pack(fill="x", padx=10, pady=10)
+        """NOT: Bu ekran önceden 'Personele Satınalma Talebi' (onay gerektiren iç talep
+        akışı) ile 'Mal Kabul' (tedarikçi faturası girme) diye İKİ AYRI, birbiriyle
+        alakasız özelliği yan yana sıkıştırıyordu - sayfanın yarısı boş dururken diğer
+        yarısı kalabalıktı. 'Mal Kabul' kısmı zaten AYRI bir ekranda (📥 Alış İrsaliyesi)
+        çok daha eksiksiz haliyle (kalite kontrolü, tedarikçi geçmişi vb.) mevcut olduğu
+        için kaldırıldı - bu ekran artık SADECE personel satınalma talebi işine
+        odaklanıyor, liste+arama / '+ Yeni Talep' ile tam form deseniyle."""
+        self.sat_liste_govde = ctk.CTkFrame(self.tab_satinalma, fg_color="transparent")
+        self.sat_form_govde = ctk.CTkFrame(self.tab_satinalma, fg_color="transparent")
+        self._satinalma_liste_olustur()
+        self._satinalma_form_olustur()
+        self.satinalma_liste_goster()
 
-        sol = ctk.CTkFrame(ust_frame, fg_color=RENK_KART, corner_radius=12)
-        sol.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        ctk.CTkLabel(sol, text="Personele Satınalma Talebi Aç", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
-        
-        f1 = ctk.CTkFrame(sol, fg_color="transparent")
-        f1.pack(fill="x", padx=10, pady=5)
-        sa_stok_frame = ctk.CTkFrame(f1, fg_color="transparent")
-        sa_stok_frame.pack(side="left", padx=2)
-        self.sa_stok = ctk.CTkEntry(sa_stok_frame, placeholder_text="Stok Kodu", width=100)
-        self.sa_stok.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(sa_stok_frame, text="🔑", width=30, fg_color="#5585EF", hover_color="#4871CB",
-                      command=lambda: self.urun_secim_penceresi(self.sa_stok)).pack(side="left")
-        self.sa_mik = ctk.CTkEntry(f1, placeholder_text="Miktar", width=80)
-        self.sa_mik.pack(side="left", padx=2)
-        self.sa_ack = ctk.CTkEntry(f1, placeholder_text="Açıklama", width=150)
-        self.sa_ack.pack(side="left", padx=2)
-        ctk.CTkButton(f1, text="Talep Oluştur", fg_color="#5585EF", hover_color="#4871CB", command=self.satinalma_talep_ekle_islem).pack(side="left", padx=2)
+    def satinalma_liste_goster(self):
+        self.sat_form_govde.pack_forget()
+        self.sat_liste_govde.pack(fill="both", expand=True)
 
-        t_cerceve, self.sa_tree = tablo_olustur(sol, ["ID", "Stok", "Miktar", "Talep Eden", "Durum", "Tarih"], [40, 100, 60, 100, 80, 120], height=8)
-        t_cerceve.pack(fill="both", expand=True, padx=10, pady=5)
+    def satinalma_form_goster(self):
+        self.sat_liste_govde.pack_forget()
+        self.sa_stok.delete(0, "end")
+        self.sa_mik.delete(0, "end")
+        self.sa_ack.delete(0, "end")
+        self.sat_form_govde.pack(fill="both", expand=True)
+
+    def _satinalma_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.sat_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="🛒 Personel Satınalma Talepleri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni Talep", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.satinalma_form_goster).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.sat_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.sa_arama = ctk.CTkEntry(arama_bar, placeholder_text="Stok kodu veya talep edene göre ara...", width=280)
+        self.sa_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.sa_arama.bind("<KeyRelease>", lambda e: self._satinalma_tree_render())
+        ctk.CTkLabel(arama_bar, text="Durum:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 6))
+        self.sa_durum_filtre = ctk.CTkOptionMenu(arama_bar, values=["Tümü", "Bekliyor", "Onaylandı", "Reddedildi"],
+                                                  width=140, command=lambda _: self._satinalma_tree_render())
+        self.sa_durum_filtre.pack(side="left", padx=(0, 12), pady=10)
 
         if self.rol == "Yönetici":
-            sa_buton_satiri = ctk.CTkFrame(sol, fg_color="transparent")
+            sa_buton_satiri = ctk.CTkFrame(self.sat_liste_govde, fg_color="transparent")
             sa_buton_satiri.pack(fill="x", padx=10, pady=(0, 5))
-            ctk.CTkButton(sa_buton_satiri, text="✅ Seçileni Onayla", fg_color="#49B772", hover_color="#3E9C61",
+            ctk.CTkLabel(sa_buton_satiri, text="Seçili talep için:", font=("Segoe UI", 11)).pack(side="left", padx=(5, 10))
+            ctk.CTkButton(sa_buton_satiri, text="✅ Onayla", fg_color="#49B772", hover_color="#3E9C61",
                           command=self.satinalma_talep_onayla_islem).pack(side="left", padx=(0, 5))
-            ctk.CTkButton(sa_buton_satiri, text="✕ Seçileni Reddet", fg_color="#F36D6D", hover_color="#CF5D5D",
+            ctk.CTkButton(sa_buton_satiri, text="✕ Reddet", fg_color="#F36D6D", hover_color="#CF5D5D",
                           command=self.satinalma_talep_reddet_islem).pack(side="left")
 
-        sag = ctk.CTkFrame(ust_frame, fg_color=RENK_KART, corner_radius=12)
-        sag.pack(side="right", fill="both", expand=True, padx=(5, 0))
-        ctk.CTkLabel(sag, text="Mal Kabul (Tedarikçi Alış Faturası Gir)", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
-
-        f2 = ctk.CTkFrame(sag, fg_color="transparent")
-        f2.pack(fill="x", padx=10, pady=5)
-        ted_frame = ctk.CTkFrame(f2, fg_color="transparent")
-        ted_frame.grid(row=0, column=0, padx=5, pady=5)
-        self.af_ted = ctk.CTkEntry(ted_frame, placeholder_text="Tedarikçi ID", width=90)
-        self.af_ted.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(ted_frame, text="🔍", width=30, command=lambda: self.tedarikci_secim_penceresi(self.af_ted)).pack(side="left")
-        self.af_fatno = ctk.CTkEntry(f2, placeholder_text="Fatura No")
-        self.af_fatno.grid(row=0, column=1, padx=5, pady=5)
-        stok_frame = ctk.CTkFrame(f2, fg_color="transparent")
-        stok_frame.grid(row=1, column=0, padx=5, pady=5)
-        self.af_stok = ctk.CTkEntry(stok_frame, placeholder_text="Gelen Stok Kod", width=100)
-        self.af_stok.pack(side="left", padx=(0, 4))
-        ctk.CTkButton(stok_frame, text="🔑", width=30, fg_color="#5585EF", hover_color="#4871CB",
-                      command=lambda: self.urun_secim_penceresi(self.af_stok, hedef_fiyat_entry=self.af_fiyat)).pack(side="left")
-        self.af_mik = ctk.CTkEntry(f2, placeholder_text="Miktar")
-        self.af_mik.grid(row=1, column=1, padx=5, pady=5)
-        self.af_fiyat = ctk.CTkEntry(f2, placeholder_text="Birim Alış Fiyatı")
-        self.af_fiyat.grid(row=2, column=0, padx=5, pady=5)
-        self.af_depo_secim = ctk.CTkOptionMenu(f2, values=["Merkez Depo"], width=140)
-        self.af_depo_secim.grid(row=3, column=0, padx=5, pady=5)
-        self._af_depolar_cache = []
-        
-        ctk.CTkButton(f2, text="Faturayı İşle & Stoğa Ekle", fg_color="#45C89D", hover_color="#3BAA85", height=30, command=self.alis_faturasi_isle).grid(row=2, column=1, padx=5, pady=5)
-
-        af_cerceve, self.af_tree = tablo_olustur(sag, ["Fatura No", "Tedarikçi", "Stok", "Miktar", "Tutar", "Tarih"], [90, 150, 100, 60, 90, 120], height=5)
-        af_cerceve.pack(fill="both", expand=True, padx=10, pady=5)
-
+        self.sa_tree = OzelTablo(self.sat_liste_govde, ["ID", "Stok", "Miktar", "Talep Eden", "Durum", "Tarih"],
+                                                 [40, 100, 60, 100, 80, 120], height=16, durum_kolonu="Durum")
+        self.sa_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._sa_veri_cache = []
         self.satinalma_verilerini_yukle()
-        self._af_depolari_yukle()
 
-    def _af_depolari_yukle(self):
-        try:
-            res = requests.get(f"{API}/depolar", headers=self.req_headers(), timeout=5)
-            depolar = res.json().get("depolar", []) if res.status_code == 200 else []
-            self._af_depolar_cache = depolar
-            isimler = [d["DepoAdi"] for d in depolar] or ["Merkez Depo"]
-            self.af_depo_secim.configure(values=isimler)
-            varsayilan = next((d["DepoAdi"] for d in depolar if d.get("Varsayilan")), isimler[0])
-            self.af_depo_secim.set(varsayilan)
-        except Exception:
-            pass
+    def _satinalma_form_olustur(self):
+        ust = ctk.CTkFrame(self.sat_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.satinalma_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Satınalma Talebi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.satinalma_talep_ekle_islem).pack(side="right")
+
+        form = ctk.CTkFrame(self.sat_form_govde, fg_color=RENK_KART, corner_radius=12)
+        form.pack(fill="x", padx=20, pady=(0, 10))
+        stok_frame = ctk.CTkFrame(form, fg_color="transparent")
+        stok_frame.pack(fill="x", padx=15, pady=(15, 8))
+        ctk.CTkLabel(stok_frame, text="Stok Kodu:", font=("Segoe UI", 11, "bold"), width=100, anchor="w").pack(side="left")
+        self.sa_stok = ctk.CTkEntry(stok_frame, placeholder_text="Stok Kodu", width=140)
+        self.sa_stok.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(stok_frame, text="🔑", width=30, fg_color="#5585EF", hover_color="#4871CB",
+                      command=lambda: self.urun_secim_penceresi(self.sa_stok)).pack(side="left")
+        mik_frame = ctk.CTkFrame(form, fg_color="transparent")
+        mik_frame.pack(fill="x", padx=15, pady=8)
+        ctk.CTkLabel(mik_frame, text="Miktar:", font=("Segoe UI", 11, "bold"), width=100, anchor="w").pack(side="left")
+        self.sa_mik = ctk.CTkEntry(mik_frame, placeholder_text="Miktar", width=140)
+        self.sa_mik.pack(side="left")
+        ack_frame = ctk.CTkFrame(form, fg_color="transparent")
+        ack_frame.pack(fill="x", padx=15, pady=(8, 15))
+        ctk.CTkLabel(ack_frame, text="Açıklama:", font=("Segoe UI", 11, "bold"), width=100, anchor="w").pack(side="left")
+        self.sa_ack = ctk.CTkEntry(ack_frame, placeholder_text="Neden ihtiyaç duyuluyor?", width=320)
+        self.sa_ack.pack(side="left")
 
     def satinalma_talep_ekle_islem(self):
         try:
             data = {"StokKod": self.sa_stok.get().strip(), "Miktar": float(self.sa_mik.get()), "Aciklama": self.sa_ack.get().strip(), "TalepEden": self.username}
             res = requests.post(f"{API}/satinalma-talep-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.sa_stok.delete(0, 'end')
-                self.sa_mik.delete(0, 'end')
-                self.sa_ack.delete(0, 'end')
                 self.satinalma_verilerini_yukle()
+                self.satinalma_liste_goster()
+                messagebox.showinfo("Başarılı", "Satınalma talebi oluşturuldu.")
             else:
                 self.api_hata_goster(res)
         except ValueError:
@@ -15033,99 +17837,130 @@ class MainApp(ctk.CTkToplevel):
         except requests.exceptions.RequestException:
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
-    def alis_faturasi_isle(self):
-        try:
-            secili_depo_adi = self.af_depo_secim.get()
-            secili_depo_id = next((d["DepoID"] for d in self._af_depolar_cache if d["DepoAdi"] == secili_depo_adi), None)
-            data = {
-                "TedarikciID": int(self.af_ted.get()), "FaturaNo": self.af_fatno.get().strip(), 
-                "StokKod": self.af_stok.get().strip(), "Miktar": float(self.af_mik.get()), 
-                "BirimFiyat": float(self.af_fiyat.get()), "DepoID": secili_depo_id
-            }
-            res = requests.post(f"{API}/alis-faturasi-gir", json=data, headers=self.req_headers(), timeout=5)
-            if res.status_code == 200:
-                self.af_ted.delete(0, 'end')
-                self.af_fatno.delete(0, 'end')
-                self.af_stok.delete(0, 'end')
-                self.af_mik.delete(0, 'end')
-                self.af_fiyat.delete(0, 'end')
-                self.satinalma_verilerini_yukle()
-                self.stoklari_yukle()
-                self.loglari_yukle()
-                messagebox.showinfo("Başarılı", "Mal kabulü yapıldı ve ilgili stok artırıldı!")
-            else:
-                self.api_hata_goster(res)
-        except ValueError:
-            messagebox.showwarning("Hata", "Tedarikçi ID, Miktar ve Fiyat sayısal olmalıdır.")
-        except Exception:
-            pass
-
     def satinalma_verilerini_yukle(self):
-        if not hasattr(self, 'sa_tree'): return
+        if not hasattr(self, 'sa_tree'):
+            return
         try:
             res = requests.get(f"{API}/satinalma-talepleri", headers=self.req_headers(), timeout=5)
-            for i in self.sa_tree.get_children():
-                self.sa_tree.delete(i)
-            for t in res.json().get("talepler", []):
-                self.sa_tree.insert("", "end", iid=str(t["TalepID"]), values=(t["TalepID"], t["StokKod"], t["Miktar"], t["TalepEden"], t["Durum"], t["Tarih"]))
+            self._sa_veri_cache = res.json().get("talepler", [])
         except Exception:
-            pass
+            self._sa_veri_cache = []
+        self._satinalma_tree_render()
 
-        try:
-            res = requests.get(f"{API}/alis-faturalari", headers=self.req_headers(), timeout=5)
-            for i in self.af_tree.get_children():
-                self.af_tree.delete(i)
-            for f in res.json().get("faturalar", []):
-                self.af_tree.insert("", "end", values=(f["FaturaNo"], f["Tedarikci"], f["StokKod"], f["Miktar"], f"{f['SatirToplami']:,.2f} TL", f["Tarih"]))
-        except Exception:
-            pass
+    def _satinalma_tree_render(self):
+        if not hasattr(self, "sa_tree"):
+            return
+        for i in self.sa_tree.get_children():
+            self.sa_tree.delete(i)
+        arama = self.sa_arama.get().strip().lower() if hasattr(self, "sa_arama") else ""
+        durum_secim = self.sa_durum_filtre.get() if hasattr(self, "sa_durum_filtre") else "Tümü"
+        for t in self._sa_veri_cache:
+            if durum_secim != "Tümü" and t["Durum"] != durum_secim:
+                continue
+            if arama and arama not in t["StokKod"].lower() and arama not in t["TalepEden"].lower():
+                continue
+            self.sa_tree.insert("", "end", iid=str(t["TalepID"]), values=(t["TalepID"], t["StokKod"], t["Miktar"], t["TalepEden"], t["Durum"], t["Tarih"]))
 
     def init_alis_irsaliye(self):
         self._ai_kalem_listesi = []
+        self.ai_liste_govde = ctk.CTkFrame(self.tab_alis_irsaliye, fg_color="transparent")
+        self.ai_form_govde = ctk.CTkFrame(self.tab_alis_irsaliye, fg_color="transparent")
+        self._ai_liste_olustur()
+        self._ai_form_olustur()
+        self.ai_liste_goster()
 
-        ust = ctk.CTkFrame(self.tab_alis_irsaliye, fg_color=RENK_KART, corner_radius=12)
-        ust.pack(fill="x", padx=10, pady=10)
+    def ai_liste_goster(self):
+        self.ai_form_govde.pack_forget()
+        self.ai_liste_govde.pack(fill="both", expand=True)
 
-        ust_satir = ctk.CTkFrame(ust, fg_color="transparent")
-        ust_satir.pack(fill="x", padx=10, pady=10)
+    def ai_form_goster(self):
+        self.ai_liste_govde.pack_forget()
+        self._ai_form_sifirla()
+        self.ai_form_govde.pack(fill="both", expand=True)
+
+    def _ai_form_sifirla(self):
+        for k in list(self._ai_kalem_listesi):
+            k["satir"].destroy()
+        self._ai_kalem_listesi = []
+        self.ai_kalem_ekle()
+        self.ai_ted.delete(0, "end")
+        self.ai_belge_no.delete(0, "end")
+        self.ai_fatura_no.delete(0, "end")
+        self.ai_ack.delete(0, "end")
+        self.ai_soz_teslim.delete(0, "end")
+
+    def _ai_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.ai_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="📥 Alış İrsaliyesi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Alış İrsaliyesi Kes", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.ai_form_goster).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.ai_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.ai_arama = ctk.CTkEntry(arama_bar, placeholder_text="Tedarikçi, belge no veya açıklamaya göre ara...", width=320)
+        self.ai_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.ai_arama.bind("<KeyRelease>", lambda e: self._ai_tree_render())
+
+        self.ai_tree = OzelTablo(
+            self.ai_liste_govde, ["ID", "Tedarikçi", "Belge No", "Fatura No", "Tarih", "Açıklama", "Tutar", "Durum"],
+            [50, 180, 110, 110, 140, 190, 100, 90], height=16, durum_kolonu="Durum")
+        self.ai_tree.pack(pady=(0, 10), padx=10, fill="both", expand=True)
+        self._ai_veri_cache = []
+        self.alis_irsaliyeleri_yukle()
+
+    def _ai_form_olustur(self):
+        ust = ctk.CTkFrame(self.ai_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.ai_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Alış İrsaliyesi Kes", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.ai_kaydet_islem).pack(side="right")
+
+        ust_kutu = ctk.CTkFrame(self.ai_form_govde, fg_color=RENK_KART, corner_radius=12)
+        ust_kutu.pack(fill="x", padx=20, pady=(0, 10))
+
+        ust_satir = ctk.CTkFrame(ust_kutu, fg_color="transparent")
+        ust_satir.pack(fill="x", padx=10, pady=(10, 5))
         ted_frame = ctk.CTkFrame(ust_satir, fg_color="transparent")
         ted_frame.pack(side="left", padx=(0, 10))
         self.ai_ted = ctk.CTkEntry(ted_frame, placeholder_text="Tedarikçi ID", width=100)
         self.ai_ted.pack(side="left", padx=(0, 4))
         ctk.CTkButton(ted_frame, text="🔍", width=32, command=lambda: self.tedarikci_secim_penceresi(self.ai_ted)).pack(side="left")
-        self.ai_belge_no = ctk.CTkEntry(ust_satir, placeholder_text="Belge No (İrsaliye No)", width=180)
+        self.ai_belge_no = ctk.CTkEntry(ust_satir, placeholder_text="Belge No (İrsaliye No)", width=160)
         self.ai_belge_no.pack(side="left", padx=(0, 10))
-        self.ai_ack = ctk.CTkEntry(ust_satir, placeholder_text="Açıklama", width=220)
+        self.ai_fatura_no = ctk.CTkEntry(ust_satir, placeholder_text="Fatura No (varsa)", width=140)
+        self.ai_fatura_no.pack(side="left", padx=(0, 10))
+        self.ai_ack = ctk.CTkEntry(ust_satir, placeholder_text="Açıklama", width=180)
         self.ai_ack.pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(ust_satir, text="Söz Verilen Teslim:", font=("Arial", 11)).pack(side="left", padx=(0, 5))
-        self.ai_soz_teslim = ctk.CTkEntry(ust_satir, placeholder_text="YYYY-AA-GG (opsiyonel)", width=140)
-        self.ai_soz_teslim.pack(side="left", padx=(0, 10))
-        ctk.CTkLabel(ust_satir, text="Depo:", font=("Arial", 11)).pack(side="left", padx=(0, 5))
+        ctk.CTkLabel(ust_satir, text="Depo:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 5))
         self.ai_depo_secim = ctk.CTkOptionMenu(ust_satir, values=["Merkez Depo"], width=140)
         self.ai_depo_secim.pack(side="left")
         self._ai_depolar_cache = []
 
-        kalem_baslik = ctk.CTkFrame(ust, fg_color="transparent")
-        kalem_baslik.pack(fill="x", padx=10, pady=(0, 5))
-        ctk.CTkLabel(kalem_baslik, text="Gelen Ürünler", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(side="left")
+        ikinci_satir = ctk.CTkFrame(ust_kutu, fg_color="transparent")
+        ikinci_satir.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(ikinci_satir, text="Tedarikçinin Söz Verdiği Teslim Tarihi:", font=("Segoe UI", 11)).pack(side="left", padx=(0, 5))
+        self.ai_soz_teslim = ctk.CTkEntry(ikinci_satir, placeholder_text="YYYY-AA-GG (opsiyonel)", width=140)
+        self.ai_soz_teslim.pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(ikinci_satir, text="(performans takibi için - tedarikçinin ne zaman teslim etmeyi vaat ettiği)",
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(side="left")
+
+        kalem_baslik = ctk.CTkFrame(ust_kutu, fg_color="transparent")
+        kalem_baslik.pack(fill="x", padx=10, pady=(0, 0))
+        ctk.CTkLabel(kalem_baslik, text="Gelen Ürünler", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(kalem_baslik, text="+ Kalem Ekle", width=110, fg_color="#45C89D", hover_color="#3BAA85",
                       command=self.ai_kalem_ekle).pack(side="right")
+        ctk.CTkLabel(ust_kutu, text="Birim fiyat opsiyoneldir - girilirse ortalama maliyet ve muhasebe kaydı (153/320) otomatik güncellenir.",
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=10, pady=(2, 5))
 
-        self.ai_kalemler_frame = ctk.CTkScrollableFrame(ust, fg_color=gecerli_renk(RENK_IKINCIL), height=150, corner_radius=12)
-        self.ai_kalemler_frame.pack(fill="x", padx=10, pady=(0, 10))
-
-        ctk.CTkButton(ust, text="📥 Mal Kabulünü Kaydet (Stok Artar)", fg_color="#9965F1", hover_color="#8256CD", height=38,
-                      command=self.ai_kaydet_islem).pack(padx=10, pady=(0, 10), anchor="w")
-
-        ctk.CTkLabel(self.tab_alis_irsaliye, text="Alış İrsaliyesi Geçmişi", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 0))
-        ai_cerceve, self.ai_tree = tablo_olustur(
-            self.tab_alis_irsaliye, ["ID", "Tedarikçi", "Belge No", "Tarih", "Açıklama", "Durum"],
-            [50, 200, 130, 140, 220, 100], height=13)
-        ai_cerceve.pack(pady=10, padx=20, fill="both", expand=True)
+        self.ai_kalemler_frame = ctk.CTkScrollableFrame(ust_kutu, fg_color=gecerli_renk(RENK_IKINCIL), height=250, corner_radius=12)
+        self.ai_kalemler_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         self.ai_kalem_ekle()
         self._ai_depolari_yukle()
-        self.alis_irsaliyeleri_yukle()
 
     def _ai_depolari_yukle(self):
         try:
@@ -15146,14 +17981,16 @@ class MainApp(ctk.CTkToplevel):
 
         stok_kod_entry = ctk.CTkEntry(satir, placeholder_text="Stok Kod", width=100)
         stok_kod_entry.pack(side="left", padx=(0, 4))
+        urun_adi_entry = ctk.CTkEntry(satir, placeholder_text="Ürün Adı", width=200)
+        miktar_entry = ctk.CTkEntry(satir, placeholder_text="Miktar", width=80)
+        fiyat_entry = ctk.CTkEntry(satir, placeholder_text="Birim Fiyat (opsiyonel)", width=140)
         ctk.CTkButton(satir, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
                       command=lambda: self.urun_secim_penceresi(
                           stok_kod_entry, hedef_ad_entry=urun_adi_entry,
-                          hedef_fiyat_entry=None)).pack(side="left", padx=(0, 8))
-        urun_adi_entry = ctk.CTkEntry(satir, placeholder_text="Ürün Adı", width=220)
+                          hedef_fiyat_entry=fiyat_entry)).pack(side="left", padx=(0, 8))
         urun_adi_entry.pack(side="left", padx=(0, 8))
-        miktar_entry = ctk.CTkEntry(satir, placeholder_text="Miktar", width=90)
         miktar_entry.pack(side="left", padx=(0, 8))
+        fiyat_entry.pack(side="left", padx=(0, 8))
         kalite_secim = ctk.CTkOptionMenu(satir, values=["-", "KABUL", "SARTLI_KABUL", "RED"], width=120)
         kalite_secim.pack(side="left", padx=(0, 8))
 
@@ -15167,7 +18004,7 @@ class MainApp(ctk.CTkToplevel):
         stok_kod_entry.bind("<KeyRelease>", lambda e: kalem_veri.__setitem__("stok_kod", stok_kod_entry.get().strip()))
 
         self._ai_kalem_listesi.append({"satir": satir, "stok_kod_entry": stok_kod_entry, "urun_adi_entry": urun_adi_entry,
-                                        "miktar_entry": miktar_entry, "kalite_secim": kalite_secim, "kalem_veri": kalem_veri})
+                                        "miktar_entry": miktar_entry, "fiyat_entry": fiyat_entry, "kalite_secim": kalite_secim, "kalem_veri": kalem_veri})
 
     def ai_kaydet_islem(self):
         try:
@@ -15188,9 +18025,17 @@ class MainApp(ctk.CTkToplevel):
             except ValueError:
                 messagebox.showwarning("Hatalı Değer", f"'{urun_adi or stok_kod}' için miktar sayısal olmalıdır.")
                 return
+            fiyat_str = k["fiyat_entry"].get().strip()
+            fiyat = None
+            if fiyat_str:
+                try:
+                    fiyat = float(fiyat_str)
+                except ValueError:
+                    messagebox.showwarning("Hatalı Değer", f"'{urun_adi or stok_kod}' için birim fiyat sayısal olmalıdır.")
+                    return
             kalite = k["kalite_secim"].get()
             kalemler.append({"StokKod": stok_kod, "StokAdi": urun_adi or stok_kod, "Miktar": miktar,
-                              "KaliteSonucu": kalite if kalite != "-" else None})
+                              "BirimFiyat": fiyat, "KaliteSonucu": kalite if kalite != "-" else None})
 
         if not kalemler:
             messagebox.showwarning("Eksik Bilgi", "En az bir ürün kalemi eklemelisiniz.")
@@ -15199,24 +18044,18 @@ class MainApp(ctk.CTkToplevel):
         secili_depo_adi = self.ai_depo_secim.get()
         secili_depo_id = next((d["DepoID"] for d in self._ai_depolar_cache if d["DepoAdi"] == secili_depo_adi), None)
         data = {"TedarikciID": tedarikci_id, "BelgeNo": self.ai_belge_no.get().strip() or None,
+                "FaturaNo": self.ai_fatura_no.get().strip() or None,
                 "Aciklama": self.ai_ack.get().strip() or None, "Kalemler": kalemler, "DepoID": secili_depo_id,
                 "SozVerilenTeslimTarihi": self.ai_soz_teslim.get().strip() or None}
         try:
             res = requests.post(f"{API}/alis-irsaliyesi-kes", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                for k in list(self._ai_kalem_listesi):
-                    k["satir"].destroy()
-                self._ai_kalem_listesi = []
-                self.ai_kalem_ekle()
-                self.ai_ted.delete(0, "end")
-                self.ai_belge_no.delete(0, "end")
-                self.ai_ack.delete(0, "end")
-                self.ai_soz_teslim.delete(0, "end")
                 self.alis_irsaliyeleri_yukle()
-                if hasattr(self, "stoklari_yukle"):
+                if hasattr(self, "stok_tree"):
                     self.stoklari_yukle()
-                if hasattr(self, "loglari_yukle"):
+                if hasattr(self, "log_tree"):
                     self.loglari_yukle()
+                self.ai_liste_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj", "Mal kabulü kaydedildi."))
             else:
                 self.api_hata_goster(res)
@@ -15226,12 +18065,25 @@ class MainApp(ctk.CTkToplevel):
     def alis_irsaliyeleri_yukle(self):
         try:
             res = requests.get(f"{API}/alis-irsaliyesi-listesi", headers=self.req_headers(), timeout=5)
-            for i in self.ai_tree.get_children():
-                self.ai_tree.delete(i)
-            for r in res.json().get("irsaliyeler", []):
-                self.ai_tree.insert("", "end", values=(r["AlisIrsaliyeID"], r["FirmaAdi"], r["BelgeNo"], r["Tarih"], r["Aciklama"], r["Durum"]))
+            self._ai_veri_cache = res.json().get("irsaliyeler", [])
         except Exception:
-            pass
+            self._ai_veri_cache = []
+        self._ai_tree_render()
+
+    def _ai_tree_render(self):
+        if not hasattr(self, "ai_tree"):
+            return
+        for i in self.ai_tree.get_children():
+            self.ai_tree.delete(i)
+        arama = self.ai_arama.get().strip().lower() if hasattr(self, "ai_arama") else ""
+        for r in self._ai_veri_cache:
+            if arama and arama not in str(r.get("FirmaAdi", "")).lower() and arama not in str(r.get("BelgeNo", "")).lower() \
+                    and arama not in str(r.get("FaturaNo", "")).lower() and arama not in str(r.get("Aciklama", "")).lower():
+                continue
+            tutar = r.get("ToplamTutar") or 0
+            tutar_metin = f"{tutar:,.2f} TL" if tutar else "-"
+            self.ai_tree.insert("", "end", values=(r["AlisIrsaliyeID"], r["FirmaAdi"], r["BelgeNo"], r.get("FaturaNo", "-"),
+                                                     r["Tarih"], r["Aciklama"], tutar_metin, r["Durum"]))
 
     def bordro_hesapla_penceresi(self):
         pencere = ctk.CTkToplevel(self)
@@ -15243,13 +18095,13 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        ctk.CTkLabel(pencere, text="🧮 Brüt/Net Bordro Hesaplama", font=("Arial", 16, "bold"), text_color="#76CCE1").pack(pady=(18, 5))
+        ctk.CTkLabel(pencere, text="🧮 Brüt/Net Bordro Hesaplama", font=("Segoe UI", 16, "bold"), text_color="#76CCE1").pack(pady=(18, 5))
         ctk.CTkLabel(pencere, text="Bu hesaplama TAHMİNİDİR (kümülatif yıllık matrah dikkate alınmaz).\nKesin tutarlar için mali müşavirinize danışın.",
-                     font=("Arial", 10), text_color="#F36D6D", justify="center", wraplength=400).pack(pady=(0, 15))
+                     font=("Segoe UI", 10), text_color="#F36D6D", justify="center", wraplength=400).pack(pady=(0, 15))
 
         giris_satiri = ctk.CTkFrame(pencere, fg_color="transparent")
         giris_satiri.pack(pady=(0, 15))
-        ctk.CTkLabel(giris_satiri, text="Brüt Maaş (TL):", font=("Arial", 12)).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(giris_satiri, text="Brüt Maaş (TL):", font=("Segoe UI", 12)).pack(side="left", padx=(0, 8))
         brut_entry = ctk.CTkEntry(giris_satiri, width=150)
         brut_entry.pack(side="left")
 
@@ -15259,8 +18111,8 @@ class MainApp(ctk.CTkToplevel):
         def sonuc_satiri_ekle(etiket, deger, vurgu=False):
             satir = ctk.CTkFrame(sonuc_cerceve, fg_color="transparent")
             satir.pack(fill="x", pady=3, padx=8)
-            ctk.CTkLabel(satir, text=etiket, font=("Arial", 12, "bold" if vurgu else "normal")).pack(side="left")
-            ctk.CTkLabel(satir, text=deger, font=("Arial", 12, "bold"),
+            ctk.CTkLabel(satir, text=etiket, font=("Segoe UI", 12, "bold" if vurgu else "normal")).pack(side="left")
+            ctk.CTkLabel(satir, text=deger, font=("Segoe UI", 12, "bold"),
                          text_color="#45C89D" if vurgu else gecerli_renk(RENK_METIN)).pack(side="right")
 
         def hesapla():
@@ -15296,8 +18148,62 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(pencere, text="Hesapla", fg_color="#49B772", hover_color="#3E9C61", command=hesapla).pack(pady=(0, 15), padx=20, fill="x")
 
     def init_hr(self):
-        hr_frame = ctk.CTkFrame(self.tab_hr, fg_color="transparent")
-        hr_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        self.hr_liste_govde = ctk.CTkFrame(self.tab_hr, fg_color="transparent")
+        self.hr_form_govde = ctk.CTkFrame(self.tab_hr, fg_color="transparent")
+        self._hr_personel_form_olustur()
+        self._hr_liste_olustur()
+        self.hr_liste_goster()
+
+    def hr_liste_goster(self):
+        self.hr_form_govde.pack_forget()
+        self.hr_liste_govde.pack(fill="both", expand=True)
+
+    def hr_form_goster(self):
+        self.hr_liste_govde.pack_forget()
+        for e in (self.hr_ad, self.hr_dep, self.hr_tel, self.hr_maas, self.hr_ise_giris,
+                  self.hr_tc_no, self.hr_dogum_tarihi, self.hr_brut_maas):
+            e.delete(0, "end")
+        self.hr_form_govde.pack(fill="both", expand=True)
+
+    def _hr_personel_form_olustur(self):
+        ust = ctk.CTkFrame(self.hr_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=10, pady=(10, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.hr_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Personel", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Personel Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=150, height=30,
+                      command=self.personel_ekle_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.hr_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=10, pady=(0, 10), fill="x")
+
+        f1 = ctk.CTkFrame(kart, fg_color="transparent")
+        f1.pack(fill="x", padx=10, pady=(10, 5))
+        self.hr_ad = ctk.CTkEntry(f1, placeholder_text="Ad Soyad", width=180)
+        self.hr_ad.pack(side="left", padx=2)
+        self.hr_dep = ctk.CTkEntry(f1, placeholder_text="Departman", width=140)
+        self.hr_dep.pack(side="left", padx=2)
+        self.hr_tel = ctk.CTkEntry(f1, placeholder_text="Telefon", width=140)
+        self.hr_tel.pack(side="left", padx=2)
+        self.hr_maas = ctk.CTkEntry(f1, placeholder_text="Net Maaş", width=110)
+        self.hr_maas.pack(side="left", padx=2)
+
+        f1b = ctk.CTkFrame(kart, fg_color="transparent")
+        f1b.pack(fill="x", padx=10, pady=(0, 5))
+        self.hr_ise_giris = ctk.CTkEntry(f1b, placeholder_text="İşe Giriş Tarihi (YYYY-MM-DD, opsiyonel)", width=230)
+        self.hr_ise_giris.pack(side="left", padx=2)
+        self.hr_brut_maas = ctk.CTkEntry(f1b, placeholder_text="Brüt Maaş (opsiyonel)", width=150)
+        self.hr_brut_maas.pack(side="left", padx=2)
+
+        f1c = ctk.CTkFrame(kart, fg_color="transparent")
+        f1c.pack(fill="x", padx=10, pady=(0, 10))
+        self.hr_tc_no = ctk.CTkEntry(f1c, placeholder_text="TC No (opsiyonel)", width=160)
+        self.hr_tc_no.pack(side="left", padx=2)
+        self.hr_dogum_tarihi = ctk.CTkEntry(f1c, placeholder_text="Doğum Tarihi (YYYY-MM-DD, opsiyonel)", width=230)
+        self.hr_dogum_tarihi.pack(side="left", padx=2)
+
+    def _hr_liste_olustur(self):
+        hr_frame = self.hr_liste_govde
 
         ust_frame = ctk.CTkFrame(hr_frame, fg_color="transparent")
         ust_frame.pack(fill="x", pady=(0, 10))
@@ -15306,36 +18212,14 @@ class MainApp(ctk.CTkToplevel):
 
         sol = ctk.CTkFrame(ust_frame, fg_color=RENK_KART, corner_radius=12)
         sol.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        ctk.CTkLabel(sol, text="Yeni Personel Kaydı", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
-        
-        f1 = ctk.CTkFrame(sol, fg_color="transparent")
-        f1.pack(fill="x", padx=10, pady=5)
-        self.hr_ad = ctk.CTkEntry(f1, placeholder_text="Ad Soyad", width=130)
-        self.hr_ad.pack(side="left", padx=2)
-        self.hr_dep = ctk.CTkEntry(f1, placeholder_text="Departman", width=100)
-        self.hr_dep.pack(side="left", padx=2)
-        self.hr_tel = ctk.CTkEntry(f1, placeholder_text="Telefon", width=100)
-        self.hr_tel.pack(side="left", padx=2)
-        self.hr_maas = ctk.CTkEntry(f1, placeholder_text="Net Maaş", width=80)
-        self.hr_maas.pack(side="left", padx=2)
+        sol_ust = ctk.CTkFrame(sol, fg_color="transparent")
+        sol_ust.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(sol_ust, text="Personeller", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(sol_ust, text="+ Yeni Personel", fg_color="#49B772", hover_color="#3E9C61", width=120,
+                      command=self.hr_form_goster).pack(side="right")
 
-        f1b = ctk.CTkFrame(sol, fg_color="transparent")
-        f1b.pack(fill="x", padx=10, pady=(0, 5))
-        self.hr_ise_giris = ctk.CTkEntry(f1b, placeholder_text="İşe Giriş Tarihi (YYYY-MM-DD, opsiyonel)", width=190)
-        self.hr_ise_giris.pack(side="left", padx=2)
-        self.hr_brut_maas = ctk.CTkEntry(f1b, placeholder_text="Brüt Maaş (opsiyonel)", width=110)
-        self.hr_brut_maas.pack(side="left", padx=2)
-        ctk.CTkButton(f1b, text="Kaydet", width=60, fg_color="#5585EF", hover_color="#4871CB", command=self.personel_ekle_islem).pack(side="left", padx=2)
-
-        f1c = ctk.CTkFrame(sol, fg_color="transparent")
-        f1c.pack(fill="x", padx=10, pady=(0, 5))
-        self.hr_tc_no = ctk.CTkEntry(f1c, placeholder_text="TC No (opsiyonel)", width=130)
-        self.hr_tc_no.pack(side="left", padx=2)
-        self.hr_dogum_tarihi = ctk.CTkEntry(f1c, placeholder_text="Doğum Tarihi (YYYY-MM-DD, opsiyonel)", width=190)
-        self.hr_dogum_tarihi.pack(side="left", padx=2)
-
-        p_cerceve, self.personel_tree = tablo_olustur(sol, ["ID", "Ad Soyad", "Departman", "Maaş", "İçerideki Bakiye"], [40, 140, 100, 100, 100], height=5)
-        p_cerceve.pack(fill="both", expand=True, padx=10, pady=5)
+        self.personel_tree = OzelTablo(sol, ["ID", "Ad Soyad", "Departman", "Maaş", "İçerideki Bakiye"], [40, 140, 100, 100, 100], height=5)
+        self.personel_tree.pack(fill="both", expand=True, padx=10, pady=5)
         p_buton_satiri = ctk.CTkFrame(sol, fg_color="transparent")
         p_buton_satiri.pack(fill="x", padx=10, pady=(0, 8))
         ctk.CTkButton(p_buton_satiri, text="✏️ Seçileni Düzenle", fg_color="#5585EF", hover_color="#4871CB",
@@ -15345,7 +18229,7 @@ class MainApp(ctk.CTkToplevel):
 
         sag = ctk.CTkFrame(ust_frame, fg_color=RENK_KART, corner_radius=12)
         sag.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        ctk.CTkLabel(sag, text="Bordro, Avans ve Maaş Ödemesi", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
+        ctk.CTkLabel(sag, text="Bordro, Avans ve Maaş Ödemesi", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(anchor="w", padx=10, pady=5)
 
         f2 = ctk.CTkFrame(sag, fg_color="transparent")
         f2.pack(fill="x", padx=10, pady=5)
@@ -15356,12 +18240,17 @@ class MainApp(ctk.CTkToplevel):
         self.hr_htutar = ctk.CTkEntry(f2, placeholder_text="Tutar", width=100)
         self.hr_htutar.grid(row=0, column=2, padx=5, pady=5)
 
-        self.hr_banka = ctk.CTkEntry(f2, placeholder_text="Banka Hesap ID (Ödemeler için)", width=180)
-        self.hr_banka.grid(row=1, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+        # Avans/Maaş Ödemesi için ödeme yeri - verilmezse (Nakit) artık Kasa TL'den
+        # gerçekten düşülüyor (bkz. personel_hareket_ekle backend fonksiyonu); önceden
+        # bu seçim raw bir "Hesap ID" kutusuydu ve boş bırakılırsa hiçbir yere düşmüyordu.
+        ctk.CTkLabel(f2, text="Ödeme Yeri (Avans/Maaş için):", font=("Segoe UI", 11)).grid(row=1, column=0, padx=5, pady=(8, 0), sticky="w")
+        self.hr_banka = ctk.CTkOptionMenu(f2, values=["(Nakit - Kasa'dan düşülür)"], width=220)
+        self.hr_banka.grid(row=2, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="w")
         self.hr_hack = ctk.CTkEntry(f2, placeholder_text="Açıklama (Örn: Ekim Maaşı)", width=200)
-        self.hr_hack.grid(row=1, column=1, columnspan=2, sticky="e", padx=5, pady=5)
+        self.hr_hack.grid(row=1, column=2, rowspan=2, sticky="w", padx=5, pady=5)
+        self._hr_banka_hesap_yukle()
 
-        ctk.CTkButton(f2, text="İşlemi Kaydet", fg_color="#45C89D", hover_color="#3BAA85", command=self.personel_hareket_islem).grid(row=2, column=0, columnspan=3, pady=10)
+        ctk.CTkButton(f2, text="İşlemi Kaydet", fg_color="#45C89D", hover_color="#3BAA85", command=self.personel_hareket_islem).grid(row=3, column=0, columnspan=3, pady=10)
         ctk.CTkButton(sag, text="🧮 Brüt/Net Bordro Hesapla", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.bordro_hesapla_penceresi).pack(fill="x", padx=10, pady=(0, 10))
 
@@ -15369,11 +18258,14 @@ class MainApp(ctk.CTkToplevel):
         alt_frame.pack(fill="both", expand=True)
         buton_satiri = ctk.CTkFrame(alt_frame, fg_color="transparent")
         buton_satiri.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(buton_satiri, text="Son Personel İşlemleri", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(buton_satiri, text="Son Personel İşlemleri", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, width=80, command=self.hr_verilerini_yukle).pack(side="right")
+        ctk.CTkButton(buton_satiri, text="🚫 Seçileni İptal Et", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.secili_personel_hareketi_iptal_et).pack(side="right", padx=(0, 8))
 
-        h_cerceve, self.hr_hareket_tree = tablo_olustur(alt_frame, ["İşlem ID", "Personel", "İşlem Türü", "Tutar", "Açıklama", "Tarih"], [60, 150, 120, 100, 200, 120], height=8)
-        h_cerceve.pack(fill="both", expand=True, padx=10, pady=5)
+        self.hr_hareket_tree = OzelTablo(alt_frame, ["İşlem ID", "Personel", "İşlem Türü", "Tutar", "Açıklama", "Tarih"], [60, 150, 120, 100, 200, 120], height=8)
+        self.hr_hareket_tree.pack(fill="both", expand=True, padx=10, pady=5)
+        self.hr_hareket_tree.tag_configure("iptal_edilmis", foreground=("#a1a1aa", "#71717a"))
 
         self.hr_verilerini_yukle()
 
@@ -15387,10 +18279,9 @@ class MainApp(ctk.CTkToplevel):
                     "BrutMaas": float(self.hr_brut_maas.get()) if self.hr_brut_maas.get().strip() else None}
             res = requests.post(f"{API}/personel-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                for e in (self.hr_ad, self.hr_dep, self.hr_tel, self.hr_maas, self.hr_ise_giris,
-                          self.hr_tc_no, self.hr_dogum_tarihi, self.hr_brut_maas):
-                    e.delete(0, 'end')
                 self.hr_verilerini_yukle()
+                self.hr_liste_goster()
+                messagebox.showinfo("Başarılı", "Personel kaydedildi.")
             else:
                 self.api_hata_goster(res)
         except ValueError:
@@ -15447,12 +18338,12 @@ class MainApp(ctk.CTkToplevel):
         top.grab_set()
 
         ctk.CTkLabel(top, text="⚠️ Bu resmi bir bordro/tazminat hesabı DEĞİLDİR - kesin tutar için mali müşavirinize danışın.",
-                     font=("Arial", 10), text_color="#F7B341", wraplength=380, justify="left").pack(anchor="w", padx=15, pady=(15, 10))
-        ctk.CTkLabel(top, text="Çıkış Tarihi (YYYY-MM-DD, boşsa bugün):", font=("Arial", 11, "bold")).pack(anchor="w", padx=15)
+                     font=("Segoe UI", 10), text_color="#F7B341", wraplength=380, justify="left").pack(anchor="w", padx=15, pady=(15, 10))
+        ctk.CTkLabel(top, text="Çıkış Tarihi (YYYY-MM-DD, boşsa bugün):", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=15)
         cikis_entry = ctk.CTkEntry(top, width=200)
         cikis_entry.pack(anchor="w", padx=15, pady=(3, 15))
 
-        sonuc_lbl = ctk.CTkLabel(top, text="", font=("Arial", 12), justify="left", wraplength=380)
+        sonuc_lbl = ctk.CTkLabel(top, text="", font=("Segoe UI", 12), justify="left", wraplength=380)
         sonuc_lbl.pack(anchor="w", padx=15, pady=(0, 15))
 
         def hesapla():
@@ -15475,26 +18366,47 @@ class MainApp(ctk.CTkToplevel):
 
         ctk.CTkButton(top, text="📊 Hesapla", fg_color="#5585EF", hover_color="#4871CB", command=hesapla).pack(anchor="w", padx=15)
 
-    def personel_hareket_islem(self):
+    def _hr_banka_hesap_yukle(self):
         try:
-            b_id = self.hr_banka.get().strip()
+            res = requests.get(f"{API}/banka-hesaplari", headers=self.req_headers(), timeout=5)
+            self._hr_banka_hesap_cache = res.json().get("hesaplar", []) if res.status_code == 200 else []
+        except Exception:
+            self._hr_banka_hesap_cache = []
+        secenekler = ["(Nakit - Kasa'dan düşülür)"] + [f"{h['HesapID']} - {h['BankaAdi']} {h.get('SubeAdi') or ''}".strip()
+                                                         for h in self._hr_banka_hesap_cache]
+        self.hr_banka.configure(values=secenekler)
+        self.hr_banka.set(secenekler[0])
+
+    def personel_hareket_islem(self):
+        secili = self.hr_banka.get()
+        hesap_id = None
+        if " - " in secili:
+            try:
+                hesap_id = int(secili.split(" - ")[0])
+            except (ValueError, IndexError):
+                hesap_id = None
+        try:
             data = {
                 "PersonelID": int(self.hr_pid.get()),
                 "IslemTuru": self.hr_tur.get(),
                 "Tutar": float(self.hr_htutar.get()),
                 "Aciklama": self.hr_hack.get().strip(),
-                "HesapID": int(b_id) if b_id else None
+                "HesapID": hesap_id
             }
             res = requests.post(f"{API}/personel-hareket-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                for e in (self.hr_pid, self.hr_htutar, self.hr_banka, self.hr_hack): e.delete(0, 'end')
+                for e in (self.hr_pid, self.hr_htutar, self.hr_hack): e.delete(0, 'end')
+                self._hr_banka_hesap_yukle()
                 self.hr_verilerini_yukle()
-                self.finans_verilerini_yukle()
+                if hasattr(self, "banka_tree"):
+                    self.finans_verilerini_yukle()
+                if hasattr(self, "kasa_kartlari_alani"):
+                    self.kasalari_yukle()
                 messagebox.showinfo("Başarılı", "Personel işlemi kaydedildi.")
             else:
                 self.api_hata_goster(res)
         except ValueError:
-            messagebox.showwarning("Hata", "Personel ID, Tutar ve Hesap ID sayısal olmalıdır.")
+            messagebox.showwarning("Hata", "Personel ID ve Tutar sayısal olmalıdır.")
         except Exception: pass
 
     def hr_verilerini_yukle(self):
@@ -15517,37 +18429,59 @@ class MainApp(ctk.CTkToplevel):
                 if h["IslemTuru"] == "Maaş Tahakkuku": tag = ("Tamamlandı",)
                 elif h["IslemTuru"] == "Avans": tag = ("İptal",)
                 elif h["IslemTuru"] == "Maaş Ödemesi": tag = ("Kargoda",)
-                
-                self.hr_hareket_tree.insert("", "end", values=(h["HareketID"], h["AdSoyad"], h["IslemTuru"], f"{h['Tutar']:,.2f} TL", h["Aciklama"], h["Tarih"]), tags=tag)
+                # NOT: "İptal" etiketi burada Avans satırlarını kırmızı göstermek için
+                # kullanılıyor (gerçek iptal durumuyla ilgisi yok) - o yüzden gerçekten
+                # iptal edilmiş kayıtlar İÇİN AYRI bir etiket ("iptal_edilmis", soluk gri)
+                # kullanılıyor, isim çakışması olmasın diye.
+                if h.get("Durum") == "İptal":
+                    tag = tag + ("iptal_edilmis",)
+
+                self.hr_hareket_tree.insert("", "end", iid=str(h["HareketID"]), values=(h["HareketID"], h["AdSoyad"], h["IslemTuru"], f"{h['Tutar']:,.2f} TL", h["Aciklama"], h["Tarih"]), tags=tag)
         except Exception: pass
+
+    def secili_personel_hareketi_iptal_et(self):
+        secili = self.hr_hareket_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen iptal etmek istediğiniz işlemi listeden seçin.")
+            return
+        hareket_id = secili[0]
+        self._hareket_iptal_penceresi_ac(
+            f"Personel Hareketi İptal: #{hareket_id}", f"{API}/personel-hareket-iptal/{hareket_id}", self.hr_verilerini_yukle,
+            "⚠️ Bu işlem silinmez, 'İptal' olarak işaretlenir; ödemeyse ilgili kasa/banka bakiyesi geri alınır ve ters (storno) bir muhasebe kaydı atılır.")
 
     def init_personel_izin(self):
         ust = ctk.CTkFrame(self.tab_personel_izin, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🏖️ Personel İzin Takibi", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🏖️ Personel İzin Takibi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.personel_izin_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_personel_izin,
                      text="Yıllık izin hakedişi İşe Giriş Tarihi'ne göre otomatik hesaplanır (1-5 yıl: 14 gün, 5-15 yıl: 20 gün, 15+ yıl: 26 gün - asgari yasal süreler).",
-                     font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=900, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         form_cerceve = ctk.CTkFrame(self.tab_personel_izin, fg_color=RENK_KART, corner_radius=12)
         form_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form_cerceve, text="Personel ID:", font=("Arial", 11, "bold")).grid(row=0, column=0, padx=(15, 5), pady=12, sticky="w")
-        self.pi_personel_id = ctk.CTkEntry(form_cerceve, width=70)
-        self.pi_personel_id.grid(row=0, column=1, padx=(0, 15), pady=12)
+        ctk.CTkLabel(form_cerceve, text="Personel:", font=("Segoe UI", 11, "bold")).grid(row=0, column=0, padx=(15, 5), pady=12, sticky="w")
+        pi_personel_secim_cerceve = ctk.CTkFrame(form_cerceve, fg_color="transparent")
+        pi_personel_secim_cerceve.grid(row=0, column=1, padx=(0, 15), pady=12, sticky="w")
+        self.pi_personel_id = ctk.CTkEntry(pi_personel_secim_cerceve, width=50, placeholder_text="ID")
+        self.pi_personel_id.pack(side="left", padx=(0, 4))
+        self.pi_personel_ad = ctk.CTkEntry(pi_personel_secim_cerceve, width=130, placeholder_text="Ad Soyad")
+        self.pi_personel_ad.pack(side="left", padx=(0, 4))
+        ctk.CTkButton(pi_personel_secim_cerceve, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
+                      command=self._pi_personel_sec).pack(side="left")
         ctk.CTkButton(form_cerceve, text="📊 Bakiye Sorgula", fg_color="#42ACA2", hover_color="#38928A",
                       command=self.personel_izin_bakiye_sorgula).grid(row=0, column=2, padx=(0, 15), pady=12)
-        self.pi_bakiye_lbl = ctk.CTkLabel(form_cerceve, text="", font=("Arial", 11), text_color=RENK_METIN_SOLUK)
+        self.pi_bakiye_lbl = ctk.CTkLabel(form_cerceve, text="", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK)
         self.pi_bakiye_lbl.grid(row=0, column=3, padx=(0, 15), pady=12, sticky="w")
 
-        ctk.CTkLabel(form_cerceve, text="İzin Tipi:", font=("Arial", 11, "bold")).grid(row=1, column=0, padx=(15, 5), pady=(0, 12), sticky="w")
+        ctk.CTkLabel(form_cerceve, text="İzin Tipi:", font=("Segoe UI", 11, "bold")).grid(row=1, column=0, padx=(15, 5), pady=(0, 12), sticky="w")
         self.pi_izin_tipi = ctk.CTkOptionMenu(form_cerceve, values=["Yıllık", "Ücretsiz", "Mazeret", "Rapor"], width=110)
         self.pi_izin_tipi.grid(row=1, column=1, padx=(0, 15), pady=(0, 12))
-        ctk.CTkLabel(form_cerceve, text="Başlangıç:", font=("Arial", 11, "bold")).grid(row=1, column=2, padx=(0, 5), pady=(0, 12), sticky="w")
+        ctk.CTkLabel(form_cerceve, text="Başlangıç:", font=("Segoe UI", 11, "bold")).grid(row=1, column=2, padx=(0, 5), pady=(0, 12), sticky="w")
         self.pi_baslangic = ctk.CTkEntry(form_cerceve, width=100, placeholder_text="YYYY-MM-DD")
         self.pi_baslangic.grid(row=1, column=3, padx=(0, 15), pady=(0, 12))
-        ctk.CTkLabel(form_cerceve, text="Bitiş:", font=("Arial", 11, "bold")).grid(row=1, column=4, padx=(0, 5), pady=(0, 12), sticky="w")
+        ctk.CTkLabel(form_cerceve, text="Bitiş:", font=("Segoe UI", 11, "bold")).grid(row=1, column=4, padx=(0, 5), pady=(0, 12), sticky="w")
         self.pi_bitis = ctk.CTkEntry(form_cerceve, width=100, placeholder_text="YYYY-MM-DD")
         self.pi_bitis.grid(row=1, column=5, padx=(0, 15), pady=(0, 12))
         self.pi_aciklama = ctk.CTkEntry(form_cerceve, width=180, placeholder_text="Açıklama (opsiyonel)")
@@ -15555,10 +18489,10 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(form_cerceve, text="➕ İzin Talebi Oluştur", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.personel_izin_talep_islem).grid(row=1, column=7, padx=(0, 15), pady=(0, 12))
 
-        pi_cerceve, self.pi_tree = tablo_olustur(
+        self.pi_tree = OzelTablo(
             self.tab_personel_izin, ["ID", "Personel", "Tip", "Başlangıç", "Bitiş", "Gün", "Durum", "Açıklama"],
-            [50, 160, 90, 100, 100, 60, 100, 220], height=14)
-        pi_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+            [50, 160, 90, 100, 100, 60, 100, 220], height=14, durum_kolonu="Durum")
+        self.pi_tree.pack(fill="both", expand=True, padx=20, pady=(0, 8))
 
         buton_satiri = ctk.CTkFrame(self.tab_personel_izin, fg_color="transparent")
         buton_satiri.pack(fill="x", padx=20, pady=(0, 15))
@@ -15568,6 +18502,9 @@ class MainApp(ctk.CTkToplevel):
                       command=lambda: self.personel_izin_sonuclandir_islem("Reddedildi")).pack(side="left")
 
         self.personel_izin_yukle()
+
+    def _pi_personel_sec(self):
+        self.personel_secim_penceresi(self.pi_personel_id, self.pi_personel_ad)
 
     def personel_izin_talep_islem(self):
         try:
@@ -15640,43 +18577,131 @@ class MainApp(ctk.CTkToplevel):
 
 # --- YENİ: MASRAF YÖNETİMİ ---
     def init_masraf(self):
-        m_frame = ctk.CTkFrame(self.tab_masraf, fg_color=RENK_KART, corner_radius=12)
-        m_frame.pack(pady=10, padx=10, fill="x")
-        
+        self.masraf_liste_govde = ctk.CTkFrame(self.tab_masraf, fg_color="transparent")
+        self.masraf_form_govde = ctk.CTkFrame(self.tab_masraf, fg_color="transparent")
+        self._masraf_liste_olustur()
+        self._masraf_form_olustur()
+        self.masraf_liste_goster()
+
+    def masraf_liste_goster(self):
+        self.masraf_form_govde.pack_forget()
+        self.masraf_liste_govde.pack(fill="both", expand=True)
+
+    def masraf_form_goster(self):
+        self.masraf_liste_govde.pack_forget()
+        for e in (self.m_tutar, self.m_ack):
+            e.delete(0, "end")
+        self.m_odeme_yeri.set("Kasa")
+        self._masraf_odeme_yeri_degisti("Kasa")
+        self._masraf_banka_hesaplarini_yukle()
+        self.masraf_form_govde.pack(fill="both", expand=True)
+
+    def _masraf_liste_olustur(self):
+        ust = ctk.CTkFrame(self.masraf_liste_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust, text="💸 Masraflar", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust, text="+ Yeni Masraf", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=self.masraf_form_goster).pack(side="right")
+        ctk.CTkButton(ust, text="🚫 Seçileni İptal Et", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, height=34,
+                      command=self.secili_masrafi_iptal_et).pack(side="right", padx=(0, 8))
+
+        filtre_satiri = ctk.CTkFrame(self.masraf_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        filtre_satiri.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(filtre_satiri, text="Başlangıç (YYYY-AA-GG):").pack(side="left", padx=(12, 5), pady=10)
+        self.m_bas_tarih = ctk.CTkEntry(filtre_satiri, width=100)
+        self.m_bas_tarih.pack(side="left", padx=5, pady=10)
+        ctk.CTkLabel(filtre_satiri, text="Bitiş:").pack(side="left", padx=5, pady=10)
+        self.m_bit_tarih = ctk.CTkEntry(filtre_satiri, width=100)
+        self.m_bit_tarih.pack(side="left", padx=5, pady=10)
+        ctk.CTkButton(filtre_satiri, text="🔄 Filtrele", fg_color="#5585EF", hover_color="#4871CB", width=120,
+                      command=self.masraflari_yukle).pack(side="left", padx=10, pady=10)
+        ctk.CTkButton(filtre_satiri, text="📥 Excel İndir", fg_color="#45C89D", hover_color="#3BAA85",
+                      command=lambda: self.tabloyu_excele_aktar(self.masraf_tree, "Masraf_Gider")).pack(side="right", padx=10, pady=10)
+
+        self.masraf_tree = OzelTablo(self.masraf_liste_govde, ["ID", "Kategori", "Tutar", "Açıklama", "Tarih", "İşleyen"], [50, 150, 100, 300, 150, 100], height=15)
+        self.masraf_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.masraf_tree.tag_configure("iptal_edilmis", foreground=("#a1a1aa", "#71717a"))
+        self.masraflari_yukle()
+
+    def secili_masrafi_iptal_et(self):
+        secili = self.masraf_tree.selection()
+        if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen iptal etmek istediğiniz masrafı listeden seçin.")
+            return
+        masraf_id = self.masraf_tree.item(secili[0])["values"][0]
+        self._hareket_iptal_penceresi_ac(
+            f"Masraf İptal: #{masraf_id}", f"{API}/masraf-iptal/{masraf_id}", self.masraflari_yukle,
+            "⚠️ Bu masraf silinmez, 'İptal' olarak işaretlenir; ödendiği kasa/banka bakiyesi geri alınır ve ters (storno) bir muhasebe kaydı atılır.")
+
+    def _masraf_form_olustur(self):
+        ust = ctk.CTkFrame(self.masraf_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.masraf_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Masraf", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Masrafı İşle", fg_color="#49B772", hover_color="#3E9C61", width=140, height=30,
+                      command=self.masraf_ekle_islem).pack(side="right")
+
+        m_frame = ctk.CTkFrame(self.masraf_form_govde, fg_color=RENK_KART, corner_radius=12)
+        m_frame.pack(padx=20, pady=(0, 10), fill="x")
         self.m_kat = ctk.CTkOptionMenu(m_frame, values=["Elektrik & Su", "Kira", "Yemek & Market", "Kırtasiye", "Kargo", "Diğer"])
         self.m_kat.grid(row=0, column=0, padx=10, pady=10)
         self.m_tutar = ctk.CTkEntry(m_frame, placeholder_text="Tutar (TL)")
         self.m_tutar.grid(row=0, column=1, padx=10, pady=10)
         self.m_ack = ctk.CTkEntry(m_frame, placeholder_text="Açıklama / Fiş No", width=250)
         self.m_ack.grid(row=0, column=2, padx=10, pady=10)
-        
-        ctk.CTkButton(m_frame, text="Masrafı İşle", fg_color="#F36D6D", hover_color="#CF5D5D", command=self.masraf_ekle_islem).grid(row=0, column=3, padx=10, pady=10)
 
-        filtre_satiri = ctk.CTkFrame(self.tab_masraf, fg_color="transparent")
-        filtre_satiri.pack(fill="x", padx=10, pady=(10, 0))
-        ctk.CTkLabel(filtre_satiri, text="Başlangıç (YYYY-AA-GG):").pack(side="left", padx=5)
-        self.m_bas_tarih = ctk.CTkEntry(filtre_satiri, width=100)
-        self.m_bas_tarih.pack(side="left", padx=5)
-        ctk.CTkLabel(filtre_satiri, text="Bitiş:").pack(side="left", padx=5)
-        self.m_bit_tarih = ctk.CTkEntry(filtre_satiri, width=100)
-        self.m_bit_tarih.pack(side="left", padx=5)
-        
-        ctk.CTkButton(filtre_satiri, text="🔄 Filtrele", fg_color="#5585EF", hover_color="#4871CB", width=120, command=self.masraflari_yukle).pack(side="left", padx=10)
-        ctk.CTkButton(filtre_satiri, text="📥 Excel İndir", fg_color="#45C89D", hover_color="#3BAA85", 
-                      command=lambda: self.tabloyu_excele_aktar(self.masraf_tree, "Masraf_Gider")).pack(side="right", padx=10)
+        # Ödeme Yeri - hangi gerçek alt sistemin (Kasa/Banka) düşüleceği. Önceden bu
+        # seçim yoktu ve masraf hiçbir zaman gerçek Kasa/Banka bakiyesine işlenmiyordu.
+        ctk.CTkLabel(m_frame, text="Ödeme Yeri:").grid(row=1, column=0, padx=10, pady=(0, 10), sticky="w")
+        self.m_odeme_yeri = ctk.CTkOptionMenu(m_frame, values=["Kasa", "Banka"], command=self._masraf_odeme_yeri_degisti)
+        self.m_odeme_yeri.grid(row=1, column=0, padx=10, pady=(0, 10))
+        self.m_kasa_secim = ctk.CTkOptionMenu(m_frame, values=["TL", "USD", "EUR"])
+        self.m_kasa_secim.grid(row=1, column=1, padx=10, pady=(0, 10))
+        self.m_banka_hesap = ctk.CTkOptionMenu(m_frame, values=["(Banka hesabı yükleniyor...)"])
+        self._masraf_banka_hesaplarini_yukle()
+        self._masraf_odeme_yeri_degisti("Kasa")
 
-        mc, self.masraf_tree = tablo_olustur(self.tab_masraf, ["ID", "Kategori", "Tutar", "Açıklama", "Tarih", "İşleyen"], [50, 150, 100, 300, 150, 100], height=15)
-        mc.pack(fill="both", expand=True, padx=10, pady=10)
-        self.masraflari_yukle()
+    def _masraf_odeme_yeri_degisti(self, secim):
+        if secim == "Kasa":
+            self.m_banka_hesap.grid_forget()
+            self.m_kasa_secim.grid(row=1, column=1, padx=10, pady=(0, 10))
+        else:
+            self.m_kasa_secim.grid_forget()
+            self.m_banka_hesap.grid(row=1, column=1, padx=10, pady=(0, 10))
+
+    def _masraf_banka_hesaplarini_yukle(self):
+        try:
+            res = requests.get(f"{API}/banka-hesaplari", headers=self.req_headers(), timeout=5)
+            self._m_banka_hesap_cache = res.json().get("hesaplar", []) if res.status_code == 200 else []
+        except Exception:
+            self._m_banka_hesap_cache = []
+        secenekler = [f"{h['HesapID']} - {h['BankaAdi']} {h.get('SubeAdi') or ''}".strip() for h in self._m_banka_hesap_cache] or ["(Kayıtlı banka hesabı yok)"]
+        self.m_banka_hesap.configure(values=secenekler)
+        self.m_banka_hesap.set(secenekler[0])
 
     def masraf_ekle_islem(self):
         try:
-            data = {"Kategori": self.m_kat.get(), "Tutar": float(self.m_tutar.get()), "Aciklama": self.m_ack.get()}
+            data = {"Kategori": self.m_kat.get(), "Tutar": float(self.m_tutar.get()), "Aciklama": self.m_ack.get(),
+                    "OdemeYeri": self.m_odeme_yeri.get()}
+            if data["OdemeYeri"] == "Kasa":
+                data["ParaBirimi"] = self.m_kasa_secim.get()
+            else:
+                secili = self.m_banka_hesap.get()
+                try:
+                    data["BankaHesapID"] = int(secili.split(" - ")[0])
+                except (ValueError, IndexError):
+                    messagebox.showwarning("Eksik Bilgi", "Geçerli bir banka hesabı seçin.")
+                    return
             res = requests.post(f"{API}/masraf-ekle", json=data, headers=self.req_headers(), timeout=5)
             if res.status_code == 200:
-                self.m_tutar.delete(0, 'end')
-                self.m_ack.delete(0, 'end')
                 self.masraflari_yukle()
+                if hasattr(self, "banka_tree"):
+                    self.finans_verilerini_yukle()
+                if hasattr(self, "kasa_kartlari_alani"):
+                    self.kasalari_yukle()
+                self.masraf_liste_goster()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Masraf işlendi."))
             else: self.api_hata_goster(res)
         except Exception: pass
 
@@ -15691,7 +18716,8 @@ class MainApp(ctk.CTkToplevel):
             res = requests.get(url, headers=self.req_headers(), timeout=5)
             for i in self.masraf_tree.get_children(): self.masraf_tree.delete(i)
             for m in res.json().get("masraflar", []):
-                self.masraf_tree.insert("", "end", values=(m["MasrafID"], m["Kategori"], f"{m['Tutar']:.2f} TL", m["Aciklama"], m["Tarih"], m["Kullanici"]))
+                etiket = ("iptal_edilmis",) if m.get("Durum") == "İptal" else ()
+                self.masraf_tree.insert("", "end", tags=etiket, values=(m["MasrafID"], m["Kategori"], f"{m['Tutar']:.2f} TL", m["Aciklama"], m["Tarih"], m["Kullanici"]))
         except Exception: pass
 
     # ================= FİYATLANDIRMA / ÜRÜN MALİYET HESAPLAMA =================
@@ -15700,16 +18726,64 @@ class MainApp(ctk.CTkToplevel):
         self._fiyat_secenek_satirlari = []   # [(cerceve, ad_entry, fiyat_entry, pb_menu, tl_label), ...]
         self._duzenlenen_maliyet_id = None   # None = yeni kayıt, dolu = güncelleme
         self._guncel_kurlar = {"TL": 1.0}
+        self._fy_veri_cache = []
 
-        govde = ctk.CTkFrame(self.tab_fiyatlandirma, fg_color="transparent")
-        govde.pack(fill="both", expand=True, padx=10, pady=10)
-        govde.grid_columnconfigure(0, weight=3)
-        govde.grid_columnconfigure(1, weight=2)
-        govde.grid_rowconfigure(0, weight=1)
+        self.fy_liste_govde = ctk.CTkFrame(self.tab_fiyatlandirma, fg_color="transparent")
+        self.fy_form_govde = ctk.CTkFrame(self.tab_fiyatlandirma, fg_color="transparent")
+        self._fiyatlandirma_liste_olustur()
+        self._fiyatlandirma_form_olustur()
+        self.fiyatlandirma_liste_goster()
 
-        # --- SOL: MALİYET HESAPLAMA FORMU ---
-        sol = ctk.CTkFrame(govde, fg_color=RENK_KART, corner_radius=12)
-        sol.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    def fiyatlandirma_liste_goster(self):
+        self.fy_form_govde.pack_forget()
+        self.fy_liste_govde.pack(fill="both", expand=True)
+
+    def fiyatlandirma_form_goster(self):
+        self.fy_liste_govde.pack_forget()
+        self.fy_form_govde.pack(fill="both", expand=True)
+
+    def _fiyatlandirma_liste_olustur(self):
+        ust_bar = ctk.CTkFrame(self.fy_liste_govde, fg_color="transparent")
+        ust_bar.pack(fill="x", padx=10, pady=(10, 5))
+        ctk.CTkLabel(ust_bar, text="💲 Kayıtlı Ürün Maliyetleri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkButton(ust_bar, text="+ Yeni Ürün Maliyeti Hesapla", fg_color="#49B772", hover_color="#3E9C61", height=34,
+                      command=lambda: (self.fiyatlandirma_formu_temizle(), self.fiyatlandirma_form_goster())).pack(side="right")
+
+        arama_bar = ctk.CTkFrame(self.fy_liste_govde, fg_color=RENK_PANEL, corner_radius=12)
+        arama_bar.pack(fill="x", padx=10, pady=(0, 5))
+        ctk.CTkLabel(arama_bar, text="🔍", font=("Segoe UI", 13)).pack(side="left", padx=(12, 4), pady=10)
+        self.fy_arama = ctk.CTkEntry(arama_bar, placeholder_text="Ürün adı veya stok koduna göre ara...", width=320)
+        self.fy_arama.pack(side="left", padx=(0, 12), pady=10)
+        self.fy_arama.bind("<KeyRelease>", lambda e: self._fiyatlandirma_tree_render())
+
+        self.fiyat_liste_tree = OzelTablo(
+            self.fy_liste_govde, ["ID", "Stok Kod", "Ürün Adı", "Toplam Maliyet", "Güncelleme"], [50, 120, 260, 140, 150], height=16)
+        self.fiyat_liste_tree.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+        self.fiyat_liste_tree.bind("<Double-1>", self.fiyatlandirma_duzenle_ac)
+
+        alt_buton = ctk.CTkFrame(self.fy_liste_govde, fg_color="transparent")
+        alt_buton.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkButton(alt_buton, text="✏️ Düzenle / Aç", fg_color="#5585EF", hover_color="#4871CB",
+                      command=self.fiyatlandirma_duzenle_ac).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(alt_buton, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
+                      command=self.fiyatlandirma_sil_islem).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(alt_buton, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=self.fiyatlandirma_listesi_yukle).pack(side="left")
+        self.fiyatlandirma_listesi_yukle()
+
+    def _fiyatlandirma_form_olustur(self):
+        ust = ctk.CTkFrame(self.fy_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.fiyatlandirma_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="💲 Ürün Maliyeti Hesapla", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="💾 Kaydet", fg_color="#49B772", hover_color="#3E9C61", width=110, height=30,
+                      command=self.fiyatlandirma_kaydet_islem).pack(side="right")
+        ctk.CTkButton(ust, text="🆕 Formu Temizle", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.fiyatlandirma_formu_temizle).pack(side="right", padx=(0, 8))
+
+        sol = ctk.CTkFrame(self.fy_form_govde, fg_color=RENK_KART, corner_radius=12)
+        sol.pack(fill="both", expand=True, padx=20, pady=(0, 15))
 
         ust_satir = ctk.CTkFrame(sol, fg_color="transparent")
         ust_satir.pack(fill="x", padx=14, pady=(14, 0))
@@ -15720,29 +18794,29 @@ class MainApp(ctk.CTkToplevel):
 
         kur_satiri = ctk.CTkFrame(sol, fg_color="transparent")
         kur_satiri.pack(fill="x", padx=14, pady=(8, 0))
-        self.fy_kur_bilgi_label = ctk.CTkLabel(kur_satiri, text="Kurlar yükleniyor...", font=("Arial", 10), text_color=RENK_METIN_SOLUK)
+        self.fy_kur_bilgi_label = ctk.CTkLabel(kur_satiri, text="Kurlar yükleniyor...", font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK)
         self.fy_kur_bilgi_label.pack(side="left")
-        ctk.CTkButton(kur_satiri, text="🔄 Kur Yenile", width=90, height=22, font=("Arial", 10),
+        ctk.CTkButton(kur_satiri, text="🔄 Kur Yenile", width=90, height=22, font=("Segoe UI", 10),
                       fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL, command=self.fiyatlandirma_kur_yenile).pack(side="left", padx=8)
 
         # --- Maliyet Kalemleri (dinamik, + ile eklenir) ---
         kalem_baslik = ctk.CTkFrame(sol, fg_color="transparent")
         kalem_baslik.pack(fill="x", padx=14, pady=(10, 4))
-        ctk.CTkLabel(kalem_baslik, text="Maliyet Kalemleri", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(kalem_baslik, text="Maliyet Kalemleri", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(kalem_baslik, text="+ Kalem Ekle", width=110, height=26, fg_color="#5585EF", hover_color="#4871CB",
                       command=self.fiyatlandirma_kalem_ekle).pack(side="right")
 
         self.fy_kalem_alani = ctk.CTkScrollableFrame(sol, fg_color=RENK_TABAN, height=160)
         self.fy_kalem_alani.pack(fill="x", padx=14, pady=(0, 6))
 
-        self.fy_toplam_maliyet_label = ctk.CTkLabel(sol, text="Toplam Maliyet: 0.00 TL", font=("Arial", 14, "bold"), text_color="#F36D6D")
+        self.fy_toplam_maliyet_label = ctk.CTkLabel(sol, text="Toplam Maliyet: 0.00 TL", font=("Segoe UI", 14, "bold"), text_color="#F36D6D")
         self.fy_toplam_maliyet_label.pack(anchor="e", padx=14, pady=(0, 10))
 
         # ================= GRAMAJ HESAPLAMA (EXCEL ENTEGRASYONU) =================
         gramaj_ana_frame = ctk.CTkFrame(sol, fg_color="#1f2937", corner_radius=12, border_width=1, border_color="#374151")
         gramaj_ana_frame.pack(fill="x", padx=14, pady=(0, 10))
 
-        ctk.CTkLabel(gramaj_ana_frame, text="📏 Excel Gramaj & Ağırlık Motoru", font=("Arial", 12, "bold"), text_color="#64CCFA").pack(anchor="w", padx=15, pady=(8, 0))
+        ctk.CTkLabel(gramaj_ana_frame, text="📏 Excel Gramaj & Ağırlık Motoru", font=("Segoe UI", 12, "bold"), text_color="#64CCFA").pack(anchor="w", padx=15, pady=(8, 0))
         
         g_inputs_frame = ctk.CTkFrame(gramaj_ana_frame, fg_color="transparent")
         g_inputs_frame.pack(fill="x", padx=10, pady=5)
@@ -15750,7 +18824,7 @@ class MainApp(ctk.CTkToplevel):
         def g_input(parent, text, val):
             f = ctk.CTkFrame(parent, fg_color="transparent")
             f.pack(side="left", padx=5)
-            ctk.CTkLabel(f, text=text, font=("Arial", 11, "bold"), text_color="#d1d5db").pack(anchor="w")
+            ctk.CTkLabel(f, text=text, font=("Segoe UI", 11, "bold"), text_color="#d1d5db").pack(anchor="w")
             e = ctk.CTkEntry(f, width=70, height=28)
             e.insert(0, val)
             e.pack()
@@ -15764,7 +18838,7 @@ class MainApp(ctk.CTkToplevel):
         sonuc_f = ctk.CTkFrame(gramaj_ana_frame, fg_color="#111827", corner_radius=8)
         sonuc_f.pack(fill="x", padx=15, pady=(5, 10))
 
-        self.lbl_gramaj_sonuc = ctk.CTkLabel(sonuc_f, text="Adet Ağırlık: 1522 gr", font=("Arial", 13, "bold"), text_color="#45C89D")
+        self.lbl_gramaj_sonuc = ctk.CTkLabel(sonuc_f, text="Adet Ağırlık: 1522 gr", font=("Segoe UI", 13, "bold"), text_color="#45C89D")
         self.lbl_gramaj_sonuc.pack(side="left", padx=15, pady=6)
 
         def excel_gramaj_hesapla(*args):
@@ -15788,45 +18862,18 @@ class MainApp(ctk.CTkToplevel):
         # --- Fiyat Seçenekleri (dinamik, + ile eklenir - Peşin/Kredi Kartı/Vade vb.) ---
         secenek_baslik = ctk.CTkFrame(sol, fg_color="transparent")
         secenek_baslik.pack(fill="x", padx=14, pady=(4, 4))
-        ctk.CTkLabel(secenek_baslik, text="Fiyat Seçenekleri (Peşin / Kredi Kartı / Vade vb.)", font=("Arial", 13, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(secenek_baslik, text="Fiyat Seçenekleri (Peşin / Kredi Kartı / Vade vb.)", font=("Segoe UI", 13, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(secenek_baslik, text="+ Seçenek Ekle", width=120, height=26, fg_color="#5585EF", hover_color="#4871CB",
                       command=self.fiyatlandirma_secenek_ekle).pack(side="right")
 
         self.fy_secenek_alani = ctk.CTkScrollableFrame(sol, fg_color=RENK_TABAN, height=140)
-        self.fy_secenek_alani.pack(fill="x", padx=14, pady=(0, 10))
-
-        alt_buton_satiri = ctk.CTkFrame(sol, fg_color="transparent")
-        alt_buton_satiri.pack(fill="x", padx=14, pady=(0, 14))
-        ctk.CTkButton(alt_buton_satiri, text="🆕 Yeni / Formu Temizle", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
-                      command=self.fiyatlandirma_formu_temizle).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(alt_buton_satiri, text="💾 Ürün Maliyetini Kaydet", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.fiyatlandirma_kaydet_islem).pack(side="left")
-
-        # --- SAĞ: KAYITLI ÜRÜN MALİYETLERİ LİSTESİ ---
-        sag = ctk.CTkFrame(govde, fg_color="transparent")
-        sag.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        ctk.CTkLabel(sag, text="Kayıtlı Ürün Maliyetleri", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(anchor="w", pady=(0, 6))
-        ctk.CTkLabel(sag, text="Bir ürüne tıklayınca soldaki forma yüklenir, düzenleyip tekrar kaydedebilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, justify="left", wraplength=320).pack(anchor="w", pady=(0, 8))
-
-        liste_cerceve, self.fiyat_liste_tree = tablo_olustur(
-            sag, ["ID", "Ürün Adı", "Toplam Maliyet", "Güncelleme"], [40, 200, 120, 130], height=14)
-        liste_cerceve.pack(fill="both", expand=True)
-        self.fiyat_liste_tree.bind("<<TreeviewSelect>>", self.fiyatlandirma_secilince)
-
-        alt_sag_buton = ctk.CTkFrame(sag, fg_color="transparent")
-        alt_sag_buton.pack(fill="x", pady=(8, 0))
-        ctk.CTkButton(alt_sag_buton, text="🗑️ Seçileni Sil", fg_color="#F36D6D", hover_color="#CF5D5D",
-                      command=self.fiyatlandirma_sil_islem).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(alt_sag_buton, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
-                      command=self.fiyatlandirma_listesi_yukle).pack(side="left")
+        self.fy_secenek_alani.pack(fill="x", padx=14, pady=(0, 14))
 
         self.fiyatlandirma_kalem_ekle()    # başlangıçta boş bir satır hazır dursun
         self.fiyatlandirma_secenek_ekle()
-        
+
         # Eğer bu iki fonksiyon class içinde yoksa hata vermemesi için try bloğuna aldık
         try:
-            self.fiyatlandirma_listesi_yukle()
             self.fiyatlandirma_kur_yenile()
         except AttributeError:
             pass
@@ -15855,7 +18902,7 @@ class MainApp(ctk.CTkToplevel):
         pb_menu.set(para_birimi)
         pb_menu.pack(side="left", padx=(0, 6))
 
-        tl_karsilik_label = ctk.CTkLabel(satir, text="", font=("Arial", 10), text_color=RENK_METIN_SOLUK, width=90, anchor="w")
+        tl_karsilik_label = ctk.CTkLabel(satir, text="", font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, width=90, anchor="w")
         tl_karsilik_label.pack(side="left", padx=(0, 6))
 
         tutar_entry.bind("<KeyRelease>", lambda e: self.fiyatlandirma_toplam_hesapla())
@@ -15907,7 +18954,7 @@ class MainApp(ctk.CTkToplevel):
         pb_menu.set(para_birimi)
         pb_menu.pack(side="left", padx=(0, 6))
 
-        tl_karsilik_label = ctk.CTkLabel(satir, text="", font=("Arial", 10), text_color=RENK_METIN_SOLUK, width=110, anchor="w")
+        tl_karsilik_label = ctk.CTkLabel(satir, text="", font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, width=110, anchor="w")
         tl_karsilik_label.pack(side="left", padx=(0, 6))
 
         # 👑 VADE SEÇİLDİĞİNDE OTOMATİK HESAPLAMA YAPAN BEYİN
@@ -16059,13 +19106,13 @@ class MainApp(ctk.CTkToplevel):
                     f"Toplam Ağırlık: {toplam_kg:,.2f} KG\n"
                     f"1 KG Maliyeti: {kg_maliyeti_tl:,.2f} TL  |  {kg_maliyeti_usd:,.2f} $\n"
                     f"1 TON Maliyeti: {ton_maliyeti_tl:,.2f} TL  |  {ton_maliyeti_usd:,.2f} $")
-            self.fy_toplam_maliyet_label.configure(text=ozet, text_color="#45C89D", font=("Arial", 12, "bold"))
+            self.fy_toplam_maliyet_label.configure(text=ozet, text_color="#45C89D", font=("Segoe UI", 12, "bold"))
         else:
             ozet = f"Toplam Maliyet: {toplam_maliyet_tl:,.2f} TL  |  {toplam_maliyet_usd:,.2f} $"
-            self.fy_toplam_maliyet_label.configure(text=ozet, text_color="#F36D6D", font=("Arial", 14, "bold"))
+            self.fy_toplam_maliyet_label.configure(text=ozet, text_color="#F36D6D", font=("Segoe UI", 14, "bold"))
 
     def fiyatlandirma_formu_temizle(self):
-        for satir, _, _, _, _ in list(self._maliyet_kalem_satirlari):
+        for satir, *_ in list(self._maliyet_kalem_satirlari):
             satir.destroy()
         self._maliyet_kalem_satirlari = []
         for satir, _, _, _, _ in list(self._fiyat_secenek_satirlari):
@@ -16113,9 +19160,10 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/urun-maliyeti-kaydet", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kaydedildi."))
                 self.fiyatlandirma_formu_temizle()
                 self.fiyatlandirma_listesi_yukle()
+                self.fiyatlandirma_liste_goster()
+                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Kaydedildi."))
             else:
                 self.api_hata_goster(res)
         except requests.exceptions.RequestException:
@@ -16126,17 +19174,28 @@ class MainApp(ctk.CTkToplevel):
             res = requests.get(f"{API}/urun-maliyeti-listesi", headers=self.req_headers(), timeout=6)
             if res.status_code != 200:
                 return
-            for i in self.fiyat_liste_tree.get_children():
-                self.fiyat_liste_tree.delete(i)
-            for u in res.json()["urunler"]:
-                self.fiyat_liste_tree.insert("", "end", iid=str(u["MaliyetID"]),
-                                              values=(u["MaliyetID"], u["UrunAdi"], f"{u['ToplamMaliyet']:,.2f} TL", u["GuncellemeTarihi"]))
+            self._fy_veri_cache = res.json().get("urunler", [])
         except Exception:
-            pass
+            self._fy_veri_cache = []
+        self._fiyatlandirma_tree_render()
 
-    def fiyatlandirma_secilince(self, event=None):
+    def _fiyatlandirma_tree_render(self):
+        if not hasattr(self, "fiyat_liste_tree"):
+            return
+        for i in self.fiyat_liste_tree.get_children():
+            self.fiyat_liste_tree.delete(i)
+        arama = self.fy_arama.get().strip().lower() if hasattr(self, "fy_arama") else ""
+        for u in self._fy_veri_cache:
+            if arama and arama not in str(u.get("UrunAdi", "")).lower() and arama not in str(u.get("StokKod", "")).lower():
+                continue
+            self.fiyat_liste_tree.insert("", "end", iid=str(u["MaliyetID"]),
+                                          values=(u["MaliyetID"], u.get("StokKod", "-"), u["UrunAdi"],
+                                                  f"{u['ToplamMaliyet']:,.2f} TL", u["GuncellemeTarihi"]))
+
+    def fiyatlandirma_duzenle_ac(self, event=None):
         secili = self.fiyat_liste_tree.selection()
         if not secili:
+            messagebox.showinfo("Seçim Yok", "Lütfen açmak için bir ürün maliyeti seçin.")
             return
         try:
             res = requests.get(f"{API}/urun-maliyeti-detay/{secili[0]}", headers=self.req_headers(), timeout=6)
@@ -16148,7 +19207,7 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
             return
 
-        for satir, _, _, _, _ in list(self._maliyet_kalem_satirlari):
+        for satir, *_ in list(self._maliyet_kalem_satirlari):
             satir.destroy()
         self._maliyet_kalem_satirlari = []
         for satir, _, _, _, _ in list(self._fiyat_secenek_satirlari):
@@ -16170,6 +19229,7 @@ class MainApp(ctk.CTkToplevel):
         if not veri["FiyatSecenekleri"]:
             self.fiyatlandirma_secenek_ekle()
         self.fiyatlandirma_toplam_hesapla()
+        self.fiyatlandirma_form_goster()
 
     def fiyatlandirma_sil_islem(self):
         secili = self.fiyat_liste_tree.selection()
@@ -16192,18 +19252,18 @@ class MainApp(ctk.CTkToplevel):
     def init_mrp(self):
         ust = ctk.CTkFrame(self.tab_mrp, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📐 MRP / Malzeme İhtiyaç Planlama", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📐 MRP / Malzeme İhtiyaç Planlama", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="▶️ MRP Çalıştır", fg_color="#49B772", hover_color="#3E9C61",
                       command=self.mrp_calistir_islem).pack(side="right")
         ctk.CTkLabel(self.tab_mrp,
                      text="Açık satış siparişlerini reçetelere (BOM) göre hammadde/bileşen ihtiyacına böler, mevcut stok + "
                           "açık üretim + onaylı satınalma talepleriyle netleştirir. Bu bir ÖNERİ raporudur - hiçbir satınalma "
                           "talebi burada OTOMATİK oluşmaz, sadece seçtiğiniz önerileri 'Talebe Dönüştür' ile serbest bırakırsınız.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         buton_satiri = ctk.CTkFrame(self.tab_mrp, fg_color="transparent")
         buton_satiri.pack(fill="x", padx=20, pady=(0, 5))
-        ctk.CTkLabel(buton_satiri, text="Seçili öneriler için:", font=("Arial", 11)).pack(side="left", padx=(5, 10))
+        ctk.CTkLabel(buton_satiri, text="Seçili öneriler için:", font=("Segoe UI", 11)).pack(side="left", padx=(5, 10))
         ctk.CTkButton(buton_satiri, text="📦 Satınalma Talebine Dönüştür", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.mrp_oneri_donustur_islem).pack(side="left", padx=4)
         ctk.CTkButton(buton_satiri, text="✖️ Reddet", fg_color="#F36D6D", hover_color="#CF5D5D",
@@ -16211,12 +19271,12 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(buton_satiri, text="🔄 Yenile", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
                       command=self.mrp_onerilerini_yukle).pack(side="left", padx=4)
 
-        mrp_cerceve, self.mrp_tree = tablo_olustur(
+        self.mrp_tree = OzelTablo(
             self.tab_mrp, ["Öneri ID", "Stok Kod", "Stok Adı", "Net İhtiyaç", "Mevcut Stok", "Önerilen Satınalma", "Kaynak Siparişler", "Durum"],
-            [70, 100, 200, 100, 100, 130, 150, 100], height=16)
-        mrp_cerceve.pack(pady=10, padx=20, fill="both", expand=True)
+            [70, 100, 200, 100, 100, 130, 150, 100], height=16, durum_kolonu="Durum")
+        self.mrp_tree.pack(pady=10, padx=20, fill="both", expand=True)
         ctk.CTkLabel(self.tab_mrp, text="Not: Birden fazla öneri seçmek için Ctrl (veya Shift) tuşunu kullanabilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 10))
 
         self.mrp_onerilerini_yukle()
 
@@ -16278,61 +19338,99 @@ class MainApp(ctk.CTkToplevel):
             messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def init_onay_zincirleri(self):
-        ROL_SECENEKLERI = ["Yönetici", "Master", "Patron", "Satış", "Muhasebe", "Depo", "Üretim", "Satınalma", "Finans", "İnsan Kaynakları"]
-
         ust = ctk.CTkFrame(self.tab_onay_zincirleri, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔗 Onay Zincirleri", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔗 Onay Zincirleri", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.onay_zincirlerini_yukle).pack(side="right")
+        ctk.CTkButton(ust, text="+ Yeni Onay Zinciri", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.onay_zinciri_penceresi_ac).pack(side="right", padx=(0, 8))
         ctk.CTkLabel(self.tab_onay_zincirleri,
                      text="Tutar aralığına göre kaç aşamalı onay gerektiğini burada tanımlarsınız - örn. 10.000-50.000 TL arası "
                           "önce Depo, sonra Yönetici onaylasın. Bir tutar birden fazla zincire denk gelirse en yüksek alt sınıra "
                           "sahip (en spesifik) zincir uygulanır. Zincirler silinmez, sadece Aktif/Pasif yapılabilir (geçmiş "
                           "onay kayıtları bozulmasın diye).",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        zincir_cerceve, self.onay_zincir_tree = tablo_olustur(
-            self.tab_onay_zincirleri, ["ID", "Ad", "Min Tutar", "Max Tutar", "Adımlar", "Durum"], [50, 180, 110, 110, 260, 80], height=8)
-        zincir_cerceve.pack(fill="x", padx=20, pady=(0, 10))
+        self.onay_zincir_tree = OzelTablo(
+            self.tab_onay_zincirleri, ["ID", "Ad", "Min Tutar", "Max Tutar", "Adımlar", "Durum"], [50, 180, 110, 110, 260, 80], height=8, durum_kolonu="Durum")
+        self.onay_zincir_tree.pack(fill="x", padx=20, pady=(0, 10))
         ctk.CTkButton(self.tab_onay_zincirleri, text="🔁 Seçilinin Aktif/Pasif Durumunu Değiştir", fg_color="#F7B341", hover_color="#D29837",
                       command=self.onay_zinciri_durum_degistir_islem).pack(anchor="w", padx=20, pady=(0, 15))
 
-        form = ctk.CTkFrame(self.tab_onay_zincirleri, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 20))
-        ctk.CTkLabel(form, text="Yeni Onay Zinciri Ekle", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        temel_satir = ctk.CTkFrame(form, fg_color="transparent")
-        temel_satir.pack(fill="x", padx=10, pady=(0, 8))
-        self.oz_ad = ctk.CTkEntry(temel_satir, placeholder_text="Zincir Adı (örn: Orta Tutar Siparişleri)", width=280)
-        self.oz_ad.pack(side="left", padx=(0, 8))
-        self.oz_min = ctk.CTkEntry(temel_satir, placeholder_text="Min Tutar", width=110)
-        self.oz_min.pack(side="left", padx=(0, 8))
-        self.oz_max = ctk.CTkEntry(temel_satir, placeholder_text="Max Tutar (boş=sınırsız)", width=150)
-        self.oz_max.pack(side="left", padx=(0, 8))
+        self.onay_zincirlerini_yukle()
 
-        self.oz_adim_cercevesi = ctk.CTkFrame(form, fg_color="transparent")
-        self.oz_adim_cercevesi.pack(fill="x", padx=10, pady=(0, 5))
-        self._oz_adim_secimleri = []
+    def onay_zinciri_penceresi_ac(self):
+        ROL_SECENEKLERI = ["Yönetici", "Master", "Patron", "Satış", "Muhasebe", "Depo", "Üretim", "Satınalma", "Finans", "İnsan Kaynakları"]
+
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Onay Zinciri")
+        self._pencere_ortala(pencere, 500, 560)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
+
+        ctk.CTkLabel(pencere, text="🔗 Yeni Onay Zinciri", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        oz_ad = ctk.CTkEntry(pencere, placeholder_text="Zincir Adı (örn: Orta Tutar Siparişleri)", width=380)
+        oz_ad.pack(pady=5)
+        oz_min = ctk.CTkEntry(pencere, placeholder_text="Min Tutar", width=380)
+        oz_min.pack(pady=5)
+        oz_max = ctk.CTkEntry(pencere, placeholder_text="Max Tutar (boş=sınırsız)", width=380)
+        oz_max.pack(pady=5)
+
+        adim_cercevesi = ctk.CTkFrame(pencere, fg_color="transparent")
+        adim_cercevesi.pack(fill="x", padx=20, pady=(5, 5))
+        adim_secimleri = []
 
         def adim_ekle(varsayilan="Depo"):
-            satir = ctk.CTkFrame(self.oz_adim_cercevesi, fg_color="transparent")
+            satir = ctk.CTkFrame(adim_cercevesi, fg_color="transparent")
             satir.pack(fill="x", pady=2)
-            ctk.CTkLabel(satir, text=f"Adım {len(self._oz_adim_secimleri) + 1}:", width=70).pack(side="left")
-            secim = ctk.CTkOptionMenu(satir, values=ROL_SECENEKLERI, width=180)
+            ctk.CTkLabel(satir, text=f"Adım {len(adim_secimleri) + 1}:", width=70).pack(side="left")
+            secim = ctk.CTkOptionMenu(satir, values=ROL_SECENEKLERI, width=200)
             secim.set(varsayilan)
             secim.pack(side="left", padx=(0, 8))
-            self._oz_adim_secimleri.append(secim)
+            adim_secimleri.append(secim)
 
-        buton_satiri = ctk.CTkFrame(form, fg_color="transparent")
-        buton_satiri.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkButton(buton_satiri, text="+ Adım Ekle", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
-                      command=lambda: adim_ekle()).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(buton_satiri, text="✅ Zinciri Kaydet", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.onay_zinciri_ekle_islem).pack(side="left")
+        ctk.CTkButton(pencere, text="+ Adım Ekle", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=lambda: adim_ekle()).pack(pady=(5, 10))
 
         adim_ekle("Depo")
         adim_ekle("Yönetici")
-        self.onay_zincirlerini_yukle()
+
+        def kaydet():
+            ad = oz_ad.get().strip()
+            if not ad:
+                messagebox.showwarning("Eksik Bilgi", "Zincir adı zorunludur.")
+                return
+            try:
+                min_tutar = float(oz_min.get())
+            except ValueError:
+                messagebox.showwarning("Hatalı Değer", "Min Tutar sayısal olmalıdır.")
+                return
+            max_deger = oz_max.get().strip()
+            max_tutar = None
+            if max_deger:
+                try:
+                    max_tutar = float(max_deger)
+                except ValueError:
+                    messagebox.showwarning("Hatalı Değer", "Max Tutar sayısal olmalıdır.")
+                    return
+            adimlar = [{"AdimSira": i + 1, "GerekliRol": secim.get()} for i, secim in enumerate(adim_secimleri)]
+            try:
+                res = requests.post(f"{API}/onay-zinciri-ekle", json={"Ad": ad, "MinTutar": min_tutar, "MaxTutar": max_tutar, "Adimlar": adimlar},
+                                     headers=self.req_headers(), timeout=8)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.onay_zincirlerini_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj", "Zincir oluşturuldu."))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="✅ Zinciri Kaydet", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
 
     def onay_zincirlerini_yukle(self):
         try:
@@ -16347,39 +19445,6 @@ class MainApp(ctk.CTkToplevel):
                                                       adim_ozeti, "Aktif" if z["AktifMi"] else "Pasif"))
         except Exception:
             pass
-
-    def onay_zinciri_ekle_islem(self):
-        ad = self.oz_ad.get().strip()
-        if not ad:
-            messagebox.showwarning("Eksik Bilgi", "Zincir adı zorunludur.")
-            return
-        try:
-            min_tutar = float(self.oz_min.get())
-        except ValueError:
-            messagebox.showwarning("Hatalı Değer", "Min Tutar sayısal olmalıdır.")
-            return
-        max_deger = self.oz_max.get().strip()
-        max_tutar = None
-        if max_deger:
-            try:
-                max_tutar = float(max_deger)
-            except ValueError:
-                messagebox.showwarning("Hatalı Değer", "Max Tutar sayısal olmalıdır.")
-                return
-        adimlar = [{"AdimSira": i + 1, "GerekliRol": secim.get()} for i, secim in enumerate(self._oz_adim_secimleri)]
-        try:
-            res = requests.post(f"{API}/onay-zinciri-ekle", json={"Ad": ad, "MinTutar": min_tutar, "MaxTutar": max_tutar, "Adimlar": adimlar},
-                                 headers=self.req_headers(), timeout=8)
-            if res.status_code == 200:
-                self.oz_ad.delete(0, "end")
-                self.oz_min.delete(0, "end")
-                self.oz_max.delete(0, "end")
-                self.onay_zincirlerini_yukle()
-                messagebox.showinfo("Başarılı", res.json().get("mesaj", "Zincir oluşturuldu."))
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
 
     def onay_zinciri_durum_degistir_islem(self):
         secili = self.onay_zincir_tree.selection()
@@ -16403,43 +19468,43 @@ class MainApp(ctk.CTkToplevel):
 
         ust = ctk.CTkFrame(self.tab_hizli_barkod, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📷 Hızlı Barkod İşlem", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📷 Hızlı Barkod İşlem", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkLabel(self.tab_hizli_barkod,
                      text="El terminaliyle (ya da telefon/masaüstü kamerası + barkod okuyucu yazılımıyla) barkodu okutun, "
                           "ya da stok kodunu yazıp Enter'a basın. Ürün bulununca miktar girip Giriş/Çıkış'a basmanız yeterli - "
                           "her işlemden sonra alan otomatik temizlenip yeniden odaklanır, art arda hızlı okutabilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        barkod_cerceve = ctk.CTkFrame(self.tab_hizli_barkod, fg_color=RENK_KART, corner_radius=12)
+        barkod_cerceve = ctk.CTkFrame(self.tab_hizli_barkod, fg_color=RENK_PANEL, corner_radius=12)
         barkod_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(barkod_cerceve, text="📷 Barkod Okut / Stok Kodu Yaz:", font=("Arial", 13, "bold")).pack(side="left", padx=(12, 8), pady=12)
+        ctk.CTkLabel(barkod_cerceve, text="📷 Barkod Okut / Stok Kodu Yaz:", font=("Segoe UI", 13, "bold")).pack(side="left", padx=(12, 8), pady=12)
         self.hb_barkod_entry = ctk.CTkEntry(barkod_cerceve, placeholder_text="Barkod okuyucuyla okutun veya yazıp Enter'a basın",
-                                             width=400, height=36, font=("Arial", 13))
+                                             width=400, height=36, font=("Segoe UI", 13))
         self.hb_barkod_entry.pack(side="left", padx=(0, 10), pady=12)
         self.hb_barkod_entry.bind("<Return>", lambda e: self.hb_urun_ara())
 
         kart = ctk.CTkFrame(self.tab_hizli_barkod, fg_color=RENK_KART, corner_radius=12)
         kart.pack(fill="x", padx=20, pady=(0, 10))
-        self.hb_urun_label = ctk.CTkLabel(kart, text="Henüz ürün okutulmadı.", font=("Arial", 15, "bold"), text_color=RENK_METIN_SOLUK)
+        self.hb_urun_label = ctk.CTkLabel(kart, text="Henüz ürün okutulmadı.", font=("Segoe UI", 15, "bold"), text_color=RENK_METIN_SOLUK)
         self.hb_urun_label.pack(anchor="w", padx=12, pady=(12, 4))
-        self.hb_stok_label = ctk.CTkLabel(kart, text="", font=("Arial", 12), text_color=RENK_METIN_SOLUK)
+        self.hb_stok_label = ctk.CTkLabel(kart, text="", font=("Segoe UI", 12), text_color=RENK_METIN_SOLUK)
         self.hb_stok_label.pack(anchor="w", padx=12, pady=(0, 10))
 
         islem_satiri = ctk.CTkFrame(kart, fg_color="transparent")
         islem_satiri.pack(fill="x", padx=12, pady=(0, 12))
-        self.hb_miktar_entry = ctk.CTkEntry(islem_satiri, placeholder_text="Miktar", width=110, height=36, font=("Arial", 13))
+        self.hb_miktar_entry = ctk.CTkEntry(islem_satiri, placeholder_text="Miktar", width=110, height=36, font=("Segoe UI", 13))
         self.hb_miktar_entry.pack(side="left", padx=(0, 8))
         self.hb_depo_secim = ctk.CTkOptionMenu(islem_satiri, values=["Depo Seçilmedi (opsiyonel)"], width=200)
         self.hb_depo_secim.pack(side="left", padx=(0, 8))
         ctk.CTkButton(islem_satiri, text="➕ Giriş", fg_color="#49B772", hover_color="#3E9C61", height=36,
-                      font=("Arial", 13, "bold"), command=lambda: self.hb_hareket_kaydet("GIRIS")).pack(side="left", padx=(0, 6))
+                      font=("Segoe UI", 13, "bold"), command=lambda: self.hb_hareket_kaydet("GIRIS")).pack(side="left", padx=(0, 6))
         ctk.CTkButton(islem_satiri, text="➖ Çıkış", fg_color="#F36D6D", hover_color="#CF5D5D", height=36,
-                      font=("Arial", 13, "bold"), command=lambda: self.hb_hareket_kaydet("CIKIS")).pack(side="left")
+                      font=("Segoe UI", 13, "bold"), command=lambda: self.hb_hareket_kaydet("CIKIS")).pack(side="left")
 
-        ctk.CTkLabel(self.tab_hizli_barkod, text="Bugünün İşlemleri", font=("Arial", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 2))
-        gecmis_cerceve, self.hb_gecmis_tree = tablo_olustur(
+        ctk.CTkLabel(self.tab_hizli_barkod, text="Bugünün İşlemleri", font=("Segoe UI", 13, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(5, 2))
+        self.hb_gecmis_tree = OzelTablo(
             self.tab_hizli_barkod, ["Saat", "Stok Kod", "Ürün", "Yön", "Miktar", "Yeni Mevcut"], [90, 100, 260, 80, 90, 100], height=12)
-        gecmis_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.hb_gecmis_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
 
         self._hb_depolari_yukle()
         self.hb_barkod_entry.focus_set()
@@ -16512,7 +19577,7 @@ class MainApp(ctk.CTkToplevel):
     def init_dokuman_kontrol(self):
         ust = ctk.CTkFrame(self.tab_dokuman_kontrol, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📋 Kalite Doküman Kontrolü", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📋 Kalite Doküman Kontrolü", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.dokumanlari_yukle).pack(side="right")
         ctk.CTkLabel(self.tab_dokuman_kontrol,
@@ -16520,68 +19585,78 @@ class MainApp(ctk.CTkToplevel):
                           "Not: Bu, genel 'Doküman Arşivi' (sözleşme/teklif için) ile AYNI şey değildir - burası versiyon "
                           "geçmişi ve onay iş akışı gerektiren resmi dokümanlar içindir. Yeni yüklenen bir versiyon, bir "
                           "Yönetici onaylayana kadar 'taslak' sayılır; önceki yürürlükteki versiyon geçerliliğini korur.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        yukle_cerceve = ctk.CTkFrame(self.tab_dokuman_kontrol, fg_color=RENK_KART, corner_radius=12)
-        yukle_cerceve.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(yukle_cerceve, text="Yeni Doküman Ekle", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        satir1 = ctk.CTkFrame(yukle_cerceve, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(0, 5))
-        self.dk_dosya_yolu = ctk.StringVar(value="")
-        ctk.CTkButton(satir1, text="📎 Dosya Seç", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.dk_dosya_sec).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(satir1, textvariable=self.dk_dosya_yolu, font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=300).pack(side="left")
-        satir2 = ctk.CTkFrame(yukle_cerceve, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 10))
-        self.dk_ad = ctk.CTkEntry(satir2, placeholder_text="Doküman Adı (örn: Üretim Prosedürü PR-01)", width=300)
-        self.dk_ad.pack(side="left", padx=(0, 8))
-        self.dk_kategori = ctk.CTkOptionMenu(satir2, values=["Prosedür", "Talimat", "Form", "Politika"], width=130)
-        self.dk_kategori.pack(side="left", padx=(0, 8))
-        self.dk_aciklama = ctk.CTkEntry(satir2, placeholder_text="Açıklama (opsiyonel)", width=220)
-        self.dk_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir2, text="⬆️ Yükle", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.dokuman_ekle_islem).pack(side="left")
+        ust_buton_satiri = ctk.CTkFrame(self.tab_dokuman_kontrol, fg_color="transparent")
+        ust_buton_satiri.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkButton(ust_buton_satiri, text="⬆️ Yeni Doküman Ekle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.dokuman_ekle_penceresi_ac).pack(side="left")
 
         ctk.CTkLabel(self.tab_dokuman_kontrol, text="Bir dokümana çift tıklayarak versiyon geçmişini/onay ekranını açabilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
-        liste_cerceve, self.dokuman_tree = tablo_olustur(
-            self.tab_dokuman_kontrol, ["ID", "Ad", "Kategori", "Güncel Versiyon", "Durum", "Son Onay"], [40, 260, 110, 110, 110, 130], height=14)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
+        self.dokuman_tree = OzelTablo(
+            self.tab_dokuman_kontrol, ["ID", "Ad", "Kategori", "Güncel Versiyon", "Durum", "Son Onay"], [40, 260, 110, 110, 110, 130], height=14, durum_kolonu="Durum")
+        self.dokuman_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.dokuman_tree.bind("<Double-Button-1>", lambda e: self.dokuman_versiyon_penceresi())
 
         self.dokumanlari_yukle()
 
-    def dk_dosya_sec(self):
-        yol = filedialog.askopenfilename(title="Yüklenecek Dosyayı Seçin")
-        if yol:
-            self.dk_dosya_yolu.set(os.path.basename(yol))
-            self._dk_secili_dosya_tam_yol = yol
+    def dokuman_ekle_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni Kontrollü Doküman")
+        self._pencere_ortala(pencere, 460, 440)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
 
-    def dokuman_ekle_islem(self):
-        tam_yol = getattr(self, "_dk_secili_dosya_tam_yol", None)
-        if not tam_yol:
-            messagebox.showwarning("Eksik Bilgi", "Lütfen önce bir dosya seçin.")
-            return
-        ad = self.dk_ad.get().strip()
-        if not ad:
-            messagebox.showwarning("Eksik Bilgi", "Doküman adı zorunludur.")
-            return
-        try:
-            with open(tam_yol, "rb") as f:
-                dosyalar = {"dosya": (os.path.basename(tam_yol), f)}
-                form_data = {"Ad": ad, "Kategori": self.dk_kategori.get(), "Aciklama": self.dk_aciklama.get().strip() or ""}
-                res = requests.post(f"{API}/kontrollu-dokuman-ekle", files=dosyalar, data=form_data, headers=self.req_headers(), timeout=30)
-            if res.status_code == 200:
-                self.dk_dosya_yolu.set("")
-                self._dk_secili_dosya_tam_yol = None
-                self.dk_ad.delete(0, "end")
-                self.dk_aciklama.delete(0, "end")
-                self.dokumanlari_yukle()
-                messagebox.showinfo("Başarılı", res.json().get("mesaj"))
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+        ctk.CTkLabel(pencere, text="📋 Yeni Kontrollü Doküman", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+
+        dosya_yolu_var = ctk.StringVar(value="")
+        secili_dosya = {"tam_yol": None}
+
+        def dosya_sec():
+            yol = filedialog.askopenfilename(title="Yüklenecek Dosyayı Seçin")
+            if yol:
+                dosya_yolu_var.set(os.path.basename(yol))
+                secili_dosya["tam_yol"] = yol
+
+        ctk.CTkButton(pencere, text="📎 Dosya Seç", fg_color="#9965F1", hover_color="#8256CD",
+                      command=dosya_sec).pack(pady=5)
+        ctk.CTkLabel(pencere, textvariable=dosya_yolu_var, font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=340).pack(pady=(0, 5))
+
+        dk_ad = ctk.CTkEntry(pencere, placeholder_text="Doküman Adı (örn: Üretim Prosedürü PR-01)", width=340)
+        dk_ad.pack(pady=5)
+        dk_kategori = ctk.CTkOptionMenu(pencere, values=["Prosedür", "Talimat", "Form", "Politika"], width=340)
+        dk_kategori.pack(pady=5)
+        dk_aciklama = ctk.CTkEntry(pencere, placeholder_text="Açıklama (opsiyonel)", width=340)
+        dk_aciklama.pack(pady=5)
+
+        def kaydet():
+            tam_yol = secili_dosya["tam_yol"]
+            if not tam_yol:
+                messagebox.showwarning("Eksik Bilgi", "Lütfen önce bir dosya seçin.")
+                return
+            ad = dk_ad.get().strip()
+            if not ad:
+                messagebox.showwarning("Eksik Bilgi", "Doküman adı zorunludur.")
+                return
+            try:
+                with open(tam_yol, "rb") as f:
+                    dosyalar = {"dosya": (os.path.basename(tam_yol), f)}
+                    form_data = {"Ad": ad, "Kategori": dk_kategori.get(), "Aciklama": dk_aciklama.get().strip() or ""}
+                    res = requests.post(f"{API}/kontrollu-dokuman-ekle", files=dosyalar, data=form_data, headers=self.req_headers(), timeout=30)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.dokumanlari_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj"))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="⬆️ Yükle", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
 
     def dokumanlari_yukle(self):
         try:
@@ -16610,11 +19685,11 @@ class MainApp(ctk.CTkToplevel):
         pencere.lift()
         pencere.focus_force()
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"🕓 {dokuman_adi} — Versiyon Geçmişi", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        ctk.CTkLabel(pencere, text=f"🕓 {dokuman_adi} — Versiyon Geçmişi", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
 
-        cerceve, tree = tablo_olustur(pencere, ["Versiyon ID", "No", "Durum", "Not", "Hazırlayan", "Onaylayan", "Onay Tarihi"],
-                                       [80, 40, 90, 150, 100, 100, 130], height=10)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        tree = OzelTablo(pencere, ["Versiyon ID", "No", "Durum", "Not", "Hazırlayan", "Onaylayan", "Onay Tarihi"],
+                                       [80, 40, 90, 150, 100, 100, 130], height=10, durum_kolonu="Durum")
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 10))
 
         def gecmisi_yukle():
             for i in tree.get_children():
@@ -16694,46 +19769,71 @@ class MainApp(ctk.CTkToplevel):
                       command=indir).pack(side="left", padx=6)
 
     def init_teklif_karsilastirma(self):
-        ust = ctk.CTkFrame(self.tab_teklif_karsilastirma, fg_color="transparent")
+        self.teklif_talep_liste_govde = ctk.CTkFrame(self.tab_teklif_karsilastirma, fg_color="transparent")
+        self.teklif_talep_form_govde = ctk.CTkFrame(self.tab_teklif_karsilastirma, fg_color="transparent")
+        self._teklif_talep_liste_olustur()
+        self._teklif_talep_form_olustur()
+        self.teklif_talep_liste_goster()
+
+    def teklif_talep_liste_goster(self):
+        self.teklif_talep_form_govde.pack_forget()
+        self.teklif_talep_liste_govde.pack(fill="both", expand=True)
+
+    def teklif_talep_form_goster(self):
+        self.teklif_talep_liste_govde.pack_forget()
+        for e in (self.tk_stok, self.tk_stok_adi, self.tk_miktar, self.tk_aciklama):
+            e.delete(0, "end")
+        self.teklif_talep_form_govde.pack(fill="both", expand=True)
+
+    def _teklif_talep_liste_olustur(self):
+        ust = ctk.CTkFrame(self.teklif_talep_liste_govde, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="📋 Satınalma Teklif Karşılaştırma", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="📋 Satınalma Teklif Karşılaştırma", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.teklif_talepleri_yukle).pack(side="right")
-        ctk.CTkLabel(self.tab_teklif_karsilastirma,
+        ctk.CTkButton(ust, text="+ Yeni Teklif Talebi", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.teklif_talep_form_goster).pack(side="right", padx=(0, 8))
+        ctk.CTkLabel(self.teklif_talep_liste_govde,
                      text="Bir ürün için birden fazla tedarikçiden fiyat isteyip yan yana karşılaştırabilir, kazananı "
                           "seçebilirsiniz. Kazanan seçildiğinde talep kapanır - satınalma talebini ayrıca normal "
                           "'Satınalma & Alış' ekranından açmanız gerekir.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        form = ctk.CTkFrame(self.tab_teklif_karsilastirma, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form, text="Yeni Teklif Talebi Aç", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(0, 10))
-        stok_frame = ctk.CTkFrame(satir1, fg_color="transparent")
+        ctk.CTkLabel(self.teklif_talep_liste_govde, text="Bir talebe çift tıklayarak gelen teklifleri karşılaştırabilirsiniz.",
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
+        self.teklif_talep_tree = OzelTablo(
+            self.teklif_talep_liste_govde, ["ID", "Stok", "Miktar", "Açıklama", "Talep Eden", "Durum", "Tarih"],
+            [50, 120, 90, 220, 120, 90, 130], height=14, durum_kolonu="Durum")
+        self.teklif_talep_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        self.teklif_talep_tree.bind("<Double-Button-1>", lambda e: self.teklif_karsilastirma_penceresi())
+
+        self.teklif_talepleri_yukle()
+
+    def _teklif_talep_form_olustur(self):
+        ust = ctk.CTkFrame(self.teklif_talep_form_govde, fg_color="transparent")
+        ust.pack(fill="x", padx=20, pady=(15, 10))
+        ctk.CTkButton(ust, text="← Listeye Dön", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      width=130, height=30, command=self.teklif_talep_liste_goster).pack(side="left")
+        ctk.CTkLabel(ust, text="+ Yeni Teklif Talebi", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left", padx=(15, 0))
+        ctk.CTkButton(ust, text="+ Talep Aç", fg_color="#49B772", hover_color="#3E9C61", width=130, height=30,
+                      command=self.teklif_talebi_olustur_islem).pack(side="right")
+
+        kart = ctk.CTkFrame(self.teklif_talep_form_govde, fg_color=RENK_KART, corner_radius=12)
+        kart.pack(padx=20, pady=(0, 20), fill="x")
+        satir = ctk.CTkFrame(kart, fg_color="transparent")
+        satir.pack(fill="x", padx=15, pady=15)
+        stok_frame = ctk.CTkFrame(satir, fg_color="transparent")
         stok_frame.pack(side="left", padx=(0, 8))
         self.tk_stok = ctk.CTkEntry(stok_frame, placeholder_text="Stok Kodu", width=100)
         self.tk_stok.pack(side="left", padx=(0, 4))
         ctk.CTkButton(stok_frame, text="🔑", width=32, fg_color="#5585EF", hover_color="#4871CB",
                       command=lambda: self.urun_secim_penceresi(self.tk_stok, hedef_ad_entry=self.tk_stok_adi)).pack(side="left")
-        self.tk_stok_adi = ctk.CTkEntry(satir1, placeholder_text="Stok Adı (opsiyonel)", width=200)
+        self.tk_stok_adi = ctk.CTkEntry(satir, placeholder_text="Stok Adı (opsiyonel)", width=200)
         self.tk_stok_adi.pack(side="left", padx=(0, 8))
-        self.tk_miktar = ctk.CTkEntry(satir1, placeholder_text="Miktar", width=100)
+        self.tk_miktar = ctk.CTkEntry(satir, placeholder_text="Miktar", width=100)
         self.tk_miktar.pack(side="left", padx=(0, 8))
-        self.tk_aciklama = ctk.CTkEntry(satir1, placeholder_text="Açıklama (opsiyonel)", width=220)
-        self.tk_aciklama.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir1, text="+ Talep Aç", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.teklif_talebi_olustur_islem).pack(side="left")
-
-        ctk.CTkLabel(self.tab_teklif_karsilastirma, text="Bir talebe çift tıklayarak gelen teklifleri karşılaştırabilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
-        liste_cerceve, self.teklif_talep_tree = tablo_olustur(
-            self.tab_teklif_karsilastirma, ["ID", "Stok", "Miktar", "Açıklama", "Talep Eden", "Durum", "Tarih"],
-            [50, 120, 90, 220, 120, 90, 130], height=14)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        self.teklif_talep_tree.bind("<Double-Button-1>", lambda e: self.teklif_karsilastirma_penceresi())
-
-        self.teklif_talepleri_yukle()
+        self.tk_aciklama = ctk.CTkEntry(satir, placeholder_text="Açıklama (opsiyonel)", width=220)
+        self.tk_aciklama.pack(side="left")
 
     def teklif_talebi_olustur_islem(self):
         stok_kod = self.tk_stok.get().strip()
@@ -16750,9 +19850,8 @@ class MainApp(ctk.CTkToplevel):
         try:
             res = requests.post(f"{API}/teklif-talebi-olustur", json=data, headers=self.req_headers(), timeout=8)
             if res.status_code == 200:
-                for e in (self.tk_stok, self.tk_stok_adi, self.tk_miktar, self.tk_aciklama):
-                    e.delete(0, "end")
                 self.teklif_talepleri_yukle()
+                self.teklif_talep_liste_goster()
                 messagebox.showinfo("Başarılı", res.json().get("mesaj", "Talep oluşturuldu."))
             else:
                 self.api_hata_goster(res)
@@ -16787,11 +19886,11 @@ class MainApp(ctk.CTkToplevel):
         pencere.lift()
         pencere.focus_force()
         pencere.grab_set()
-        ctk.CTkLabel(pencere, text=f"📋 {stok_adi} — Teklif Karşılaştırma", font=("Arial", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
+        ctk.CTkLabel(pencere, text=f"📋 {stok_adi} — Teklif Karşılaştırma", font=("Segoe UI", 14, "bold"), text_color="#76CCE1").pack(pady=(15, 10))
 
-        cerceve, tree = tablo_olustur(pencere, ["Teklif ID", "Tedarikçi", "Birim Fiyat", "P.B.", "Teslim (gün)", "Açıklama", "Kazandı mı"],
+        tree = OzelTablo(pencere, ["Teklif ID", "Tedarikçi", "Birim Fiyat", "P.B.", "Teslim (gün)", "Açıklama", "Kazandı mı"],
                                        [70, 150, 100, 50, 90, 150, 80], height=8)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 10))
 
         def teklifleri_yukle():
             for i in tree.get_children():
@@ -16808,7 +19907,7 @@ class MainApp(ctk.CTkToplevel):
 
         ekle_cerceve = ctk.CTkFrame(pencere, fg_color=RENK_KART, corner_radius=12)
         ekle_cerceve.pack(fill="x", padx=15, pady=(0, 10))
-        ctk.CTkLabel(ekle_cerceve, text="Yeni Teklif Ekle", font=("Arial", 11, "bold")).pack(anchor="w", padx=8, pady=(8, 4))
+        ctk.CTkLabel(ekle_cerceve, text="Yeni Teklif Ekle", font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=8, pady=(8, 4))
         ekle_satiri = ctk.CTkFrame(ekle_cerceve, fg_color="transparent")
         ekle_satiri.pack(fill="x", padx=8, pady=(0, 8))
         ted_frame = ctk.CTkFrame(ekle_satiri, fg_color="transparent")
@@ -16872,16 +19971,16 @@ class MainApp(ctk.CTkToplevel):
     def init_oturum_gunlugu(self):
         ust = ctk.CTkFrame(self.tab_oturum_gunlugu, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="🔒 Oturum Günlüğü", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="🔒 Oturum Günlüğü", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=lambda: (self.oturum_gunlugunu_yukle(), self.supheli_girisleri_yukle())).pack(side="right")
         ctk.CTkLabel(self.tab_oturum_gunlugu,
                      text="Başarılı ve başarısız giriş denemelerini IP adresiyle birlikte gösterir. Başarısız denemeler "
                           "kırmızı renkte vurgulanır. Aşağıdaki 'Şüpheli Girişler' bölümü, son 1 saatte aynı kullanıcı "
                           "adı için 5+ başarısız deneme olduğunda otomatik uyarır (olası brute-force/parola deneme).",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
-        filtre_cerceve = ctk.CTkFrame(self.tab_oturum_gunlugu, fg_color=RENK_KART, corner_radius=12)
+        filtre_cerceve = ctk.CTkFrame(self.tab_oturum_gunlugu, fg_color=RENK_PANEL, corner_radius=12)
         filtre_cerceve.pack(fill="x", padx=20, pady=(0, 10))
         filtre_satiri = ctk.CTkFrame(filtre_cerceve, fg_color="transparent")
         filtre_satiri.pack(fill="x", padx=10, pady=10)
@@ -16892,15 +19991,15 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkButton(filtre_satiri, text="Filtrele", fg_color="#9965F1", hover_color="#8256CD",
                       command=self.oturum_gunlugunu_yukle).pack(side="left")
 
-        liste_cerceve, self.oturum_gunlugu_tree = tablo_olustur(
+        self.oturum_gunlugu_tree = OzelTablo(
             self.tab_oturum_gunlugu, ["ID", "Kullanıcı", "İşlem", "IP Adresi", "Tarih", "Detay"], [50, 130, 130, 120, 130, 220], height=12)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self.oturum_gunlugu_tree.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
         ctk.CTkLabel(self.tab_oturum_gunlugu, text="⚠️ Şüpheli Girişler (son 1 saat, 5+ başarısız deneme)",
-                     font=("Arial", 13, "bold"), text_color="#F36D6D").pack(anchor="w", padx=22, pady=(5, 2))
-        supheli_cerceve, self.supheli_giris_tree = tablo_olustur(
+                     font=("Segoe UI", 13, "bold"), text_color="#F36D6D").pack(anchor="w", padx=22, pady=(5, 2))
+        self.supheli_giris_tree = OzelTablo(
             self.tab_oturum_gunlugu, ["Kullanıcı", "Deneme Sayısı", "Son Deneme"], [200, 130, 160], height=4)
-        supheli_cerceve.pack(fill="x", padx=20, pady=(0, 20))
+        self.supheli_giris_tree.pack(fill="x", padx=20, pady=(0, 20))
 
         self.oturum_gunlugunu_yukle()
         self.supheli_girisleri_yukle()
@@ -16935,18 +20034,18 @@ class MainApp(ctk.CTkToplevel):
             pass
 
     def init_elektronik_imza(self):
-        self._ei_imzacilar = []
-
         ust = ctk.CTkFrame(self.tab_elektronik_imza, fg_color="transparent")
         ust.pack(fill="x", padx=20, pady=(15, 5))
-        ctk.CTkLabel(ust, text="✍️ Elektronik İmza", font=("Arial", 18, "bold"), text_color="#76CCE1").pack(side="left")
+        ctk.CTkLabel(ust, text="✍️ Elektronik İmza", font=("Segoe UI", 18, "bold"), text_color="#76CCE1").pack(side="left")
         ctk.CTkButton(ust, text="🔄 Yenile", fg_color="#5585EF", hover_color="#4871CB",
                       command=self.imza_talepleri_yukle).pack(side="right")
+        ctk.CTkButton(ust, text="✍️ Yeni İmza Talebi", fg_color="#49B772", hover_color="#3E9C61",
+                      command=self.imza_talebi_penceresi_ac).pack(side="right", padx=(0, 8))
         ctk.CTkLabel(self.tab_elektronik_imza,
                      text="Bir belgeyi (sözleşme, teklif vb.) birden fazla kişiye imzaya gönderir. NOT: Bu Nitelikli "
                           "Elektronik İmza (e-Güven/TÜRKTRUST gibi bir sağlayıcının verdiği kriptografik imza) DEĞİLDİR - "
                           "kendi hesabınızla 'imzaladım' onayınızı IP adresi ve tarihle kayıt altına alan bir iç onay akışıdır.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=950, justify="left").pack(anchor="w", padx=22, pady=(0, 10))
 
         self.ei_filtre_var = ctk.BooleanVar(value=True)
         filtre_satiri = ctk.CTkFrame(self.tab_elektronik_imza, fg_color="transparent")
@@ -16954,89 +20053,93 @@ class MainApp(ctk.CTkToplevel):
         ctk.CTkCheckBox(filtre_satiri, text="Sadece benim imzalayacaklarım", variable=self.ei_filtre_var,
                          command=self.imza_talepleri_yukle).pack(side="left")
 
-        form = ctk.CTkFrame(self.tab_elektronik_imza, fg_color=RENK_KART, corner_radius=12)
-        form.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(form, text="Yeni İmza Talebi Aç", font=("Arial", 12, "bold"), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=10, pady=(10, 5))
-        satir1 = ctk.CTkFrame(form, fg_color="transparent")
-        satir1.pack(fill="x", padx=10, pady=(0, 5))
-        self.ei_belge_adi = ctk.CTkEntry(satir1, placeholder_text="Belge Adı (örn: 2026 Distribütörlük Sözleşmesi)", width=300)
-        self.ei_belge_adi.pack(side="left", padx=(0, 8))
-        self.ei_dosya_yolu = ctk.StringVar(value="")
-        ctk.CTkButton(satir1, text="📎 Dosya Seç (opsiyonel)", fg_color="#9965F1", hover_color="#8256CD",
-                      command=self.ei_dosya_sec).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(satir1, textvariable=self.ei_dosya_yolu, font=("Arial", 10), text_color=RENK_METIN_SOLUK, wraplength=200).pack(side="left")
-        satir2 = ctk.CTkFrame(form, fg_color="transparent")
-        satir2.pack(fill="x", padx=10, pady=(0, 5))
-        self.ei_aciklama = ctk.CTkEntry(satir2, placeholder_text="Açıklama (opsiyonel)", width=300)
-        self.ei_aciklama.pack(side="left", padx=(0, 8))
-        satir3 = ctk.CTkFrame(form, fg_color="transparent")
-        satir3.pack(fill="x", padx=10, pady=(0, 5))
-        self.ei_imzaci_entry = ctk.CTkEntry(satir3, placeholder_text="İmzacı kullanıcı adı", width=180)
-        self.ei_imzaci_entry.pack(side="left", padx=(0, 8))
-        ctk.CTkButton(satir3, text="+ İmzacı Ekle", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
-                      command=self.ei_imzaci_ekle).pack(side="left", padx=(0, 8))
-        self.ei_imzacilar_label = ctk.CTkLabel(satir3, text="İmzacılar: (henüz yok)", font=("Arial", 10), text_color=RENK_METIN_SOLUK)
-        self.ei_imzacilar_label.pack(side="left")
-        satir4 = ctk.CTkFrame(form, fg_color="transparent")
-        satir4.pack(fill="x", padx=10, pady=(0, 10))
-        ctk.CTkButton(satir4, text="✍️ İmza Talebi Aç", fg_color="#49B772", hover_color="#3E9C61",
-                      command=self.imza_talebi_olustur_islem).pack(side="left")
-
         ctk.CTkLabel(self.tab_elektronik_imza, text="Bir talebe çift tıklayarak detayları/imzalama ekranını açabilirsiniz.",
-                     font=("Arial", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
-        liste_cerceve, self.imza_talep_tree = tablo_olustur(
-            self.tab_elektronik_imza, ["ID", "Belge Adı", "Durum", "Oluşturan", "Tarih"], [50, 260, 100, 130, 130], height=12)
-        liste_cerceve.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+                     font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK).pack(anchor="w", padx=22, pady=(0, 2))
+        self.imza_talep_tree = OzelTablo(
+            self.tab_elektronik_imza, ["ID", "Belge Adı", "Durum", "Oluşturan", "Tarih"], [50, 260, 100, 130, 130], height=12, durum_kolonu="Durum")
+        self.imza_talep_tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
         self.imza_talep_tree.bind("<Double-Button-1>", lambda e: self.imza_talebi_detay_penceresi())
 
         self.imza_talepleri_yukle()
 
-    def ei_dosya_sec(self):
-        yol = filedialog.askopenfilename(title="Belgeyi Seçin")
-        if yol:
-            self.ei_dosya_yolu.set(os.path.basename(yol))
-            self._ei_secili_dosya_tam_yol = yol
+    def imza_talebi_penceresi_ac(self):
+        pencere = ctk.CTkToplevel(self)
+        pencere.title("Yeni İmza Talebi")
+        self._pencere_ortala(pencere, 480, 520)
+        pencere.transient(self)
+        pencere.lift()
+        pencere.focus_force()
+        pencere.grab_set()
 
-    def ei_imzaci_ekle(self):
-        kullanici = self.ei_imzaci_entry.get().strip()
-        if not kullanici:
-            return
-        if kullanici not in self._ei_imzacilar:
-            self._ei_imzacilar.append(kullanici)
-        self.ei_imzaci_entry.delete(0, "end")
-        self.ei_imzacilar_label.configure(text="İmzacılar: " + ", ".join(self._ei_imzacilar))
+        ctk.CTkLabel(pencere, text="✍️ Yeni İmza Talebi", font=("Segoe UI", 15, "bold"), text_color="#76CCE1").pack(pady=(15, 15))
+        ei_belge_adi = ctk.CTkEntry(pencere, placeholder_text="Belge Adı (örn: 2026 Distribütörlük Sözleşmesi)", width=380)
+        ei_belge_adi.pack(pady=5)
 
-    def imza_talebi_olustur_islem(self):
-        belge_adi = self.ei_belge_adi.get().strip()
-        if not belge_adi:
-            messagebox.showwarning("Eksik Bilgi", "Belge adı zorunludur.")
-            return
-        if not self._ei_imzacilar:
-            messagebox.showwarning("Eksik Bilgi", "En az bir imzacı eklemelisiniz.")
-            return
-        form_data = {"BelgeAdi": belge_adi, "Aciklama": self.ei_aciklama.get().strip() or "",
-                     "Imzacilar": ",".join(self._ei_imzacilar)}
-        tam_yol = getattr(self, "_ei_secili_dosya_tam_yol", None)
-        try:
-            if tam_yol:
-                with open(tam_yol, "rb") as f:
-                    dosyalar = {"dosya": (os.path.basename(tam_yol), f)}
-                    res = requests.post(f"{API}/imza-talebi-olustur", data=form_data, files=dosyalar, headers=self.req_headers(), timeout=30)
-            else:
-                res = requests.post(f"{API}/imza-talebi-olustur", data=form_data, headers=self.req_headers(), timeout=15)
-            if res.status_code == 200:
-                self.ei_belge_adi.delete(0, "end")
-                self.ei_aciklama.delete(0, "end")
-                self.ei_dosya_yolu.set("")
-                self._ei_secili_dosya_tam_yol = None
-                self._ei_imzacilar = []
-                self.ei_imzacilar_label.configure(text="İmzacılar: (henüz yok)")
-                self.imza_talepleri_yukle()
-                messagebox.showinfo("Başarılı", res.json().get("mesaj", "İmza talebi oluşturuldu."))
-            else:
-                self.api_hata_goster(res)
-        except requests.exceptions.RequestException:
-            messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+        dosya_yolu_var = ctk.StringVar(value="")
+        secili_dosya = {"tam_yol": None}
+
+        def dosya_sec():
+            yol = filedialog.askopenfilename(title="Belgeyi Seçin")
+            if yol:
+                dosya_yolu_var.set(os.path.basename(yol))
+                secili_dosya["tam_yol"] = yol
+
+        ctk.CTkButton(pencere, text="📎 Dosya Seç (opsiyonel)", fg_color="#9965F1", hover_color="#8256CD",
+                      command=dosya_sec).pack(pady=5)
+        ctk.CTkLabel(pencere, textvariable=dosya_yolu_var, font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=340).pack()
+
+        ei_aciklama = ctk.CTkEntry(pencere, placeholder_text="Açıklama (opsiyonel)", width=380)
+        ei_aciklama.pack(pady=5)
+
+        imzacilar = []
+        imzaci_satiri = ctk.CTkFrame(pencere, fg_color="transparent")
+        imzaci_satiri.pack(pady=5)
+        ei_imzaci_entry = ctk.CTkEntry(imzaci_satiri, placeholder_text="İmzacı kullanıcı adı", width=200)
+        ei_imzaci_entry.pack(side="left", padx=(0, 8))
+        imzacilar_label = ctk.CTkLabel(pencere, text="İmzacılar: (henüz yok)", font=("Segoe UI", 10), text_color=RENK_METIN_SOLUK, wraplength=380)
+        imzacilar_label.pack(pady=5)
+
+        def imzaci_ekle():
+            kullanici = ei_imzaci_entry.get().strip()
+            if not kullanici:
+                return
+            if kullanici not in imzacilar:
+                imzacilar.append(kullanici)
+            ei_imzaci_entry.delete(0, "end")
+            imzacilar_label.configure(text="İmzacılar: " + ", ".join(imzacilar))
+
+        ctk.CTkButton(imzaci_satiri, text="+ İmzacı Ekle", fg_color=RENK_KENARLIK, text_color=RENK_METIN, hover_color=RENK_IKINCIL,
+                      command=imzaci_ekle).pack(side="left")
+
+        def kaydet():
+            belge_adi = ei_belge_adi.get().strip()
+            if not belge_adi:
+                messagebox.showwarning("Eksik Bilgi", "Belge adı zorunludur.")
+                return
+            if not imzacilar:
+                messagebox.showwarning("Eksik Bilgi", "En az bir imzacı eklemelisiniz.")
+                return
+            form_data = {"BelgeAdi": belge_adi, "Aciklama": ei_aciklama.get().strip() or "",
+                         "Imzacilar": ",".join(imzacilar)}
+            tam_yol = secili_dosya["tam_yol"]
+            try:
+                if tam_yol:
+                    with open(tam_yol, "rb") as f:
+                        dosyalar = {"dosya": (os.path.basename(tam_yol), f)}
+                        res = requests.post(f"{API}/imza-talebi-olustur", data=form_data, files=dosyalar, headers=self.req_headers(), timeout=30)
+                else:
+                    res = requests.post(f"{API}/imza-talebi-olustur", data=form_data, headers=self.req_headers(), timeout=15)
+                if res.status_code == 200:
+                    pencere.destroy()
+                    self.imza_talepleri_yukle()
+                    messagebox.showinfo("Başarılı", res.json().get("mesaj", "İmza talebi oluşturuldu."))
+                else:
+                    self.api_hata_goster(res)
+            except requests.exceptions.RequestException:
+                messagebox.showerror("Bağlantı Hatası", "Sunucuya ulaşılamadı.")
+
+        ctk.CTkButton(pencere, text="✍️ İmza Talebi Aç", fg_color="#49B772", hover_color="#3E9C61",
+                      command=kaydet).pack(pady=(15, 10), padx=20, fill="x")
 
     def imza_talepleri_yukle(self):
         try:
@@ -17066,13 +20169,13 @@ class MainApp(ctk.CTkToplevel):
         pencere.focus_force()
         pencere.grab_set()
 
-        baslik_label = ctk.CTkLabel(pencere, text="", font=("Arial", 14, "bold"), text_color="#76CCE1")
+        baslik_label = ctk.CTkLabel(pencere, text="", font=("Segoe UI", 14, "bold"), text_color="#76CCE1")
         baslik_label.pack(pady=(15, 5))
-        aciklama_label = ctk.CTkLabel(pencere, text="", font=("Arial", 11), text_color=RENK_METIN_SOLUK, wraplength=560)
+        aciklama_label = ctk.CTkLabel(pencere, text="", font=("Segoe UI", 11), text_color=RENK_METIN_SOLUK, wraplength=560)
         aciklama_label.pack(pady=(0, 10))
 
-        cerceve, tree = tablo_olustur(pencere, ["Kullanıcı", "Durum", "İmza Tarihi", "IP Adresi", "Not"], [120, 100, 130, 110, 150], height=8)
-        cerceve.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        tree = OzelTablo(pencere, ["Kullanıcı", "Durum", "İmza Tarihi", "IP Adresi", "Not"], [120, 100, 130, 110, 150], height=8, durum_kolonu="Durum")
+        tree.pack(fill="both", expand=True, padx=15, pady=(0, 10))
 
         durum_bilgisi = {}
 

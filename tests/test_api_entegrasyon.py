@@ -373,15 +373,15 @@ class TestOnayVerAdimFarkinda:
 
     def test_son_adimda_orijinal_islem_replay_edilir(self, client, monkeypatch):
         """Tek adımlı (ya da son adıma gelmiş) bir zincirde onay verilince orijinal
-        işlem (burada SiparisEkle) gerçekten uygulanmalı - replay mekanizması."""
+        işlem (burada SiparisGrupEkle) gerçekten uygulanmalı - replay mekanizması."""
         conn, cursor = sahte_cursor_olustur()
         cursor.fetchone.side_effect = [
-            ("SiparisEkle", '{"MusteriID": 1, "StokKod": "PP-001", "StokAdi": "Test", "Miktar": 10, "BirimFiyat": 5}', "Bekliyor", 5, 1),
+            ("SiparisGrupEkle", '{"MusteriID": 1, "Kalemler": [{"StokKod": "PP-001", "StokAdi": "Test", "Miktar": 10, "BirimFiyat": 5}]}', "Bekliyor", 5, 1),
             ("Depo",),   # mevcut adımın gerekli rolü
             (1,),        # toplam adım sayısı -> mevcut_adim(1) == toplam_adim(1), son adım
         ]
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
-        monkeypatch.setattr(main, "siparis_ekle", lambda siparis, user: {"mesaj": "sipariş eklendi (replay)"})
+        monkeypatch.setattr(main, "siparis_grup_ekle", lambda veri, user: {"mesaj": "sipariş eklendi (replay)"})
 
         yanit = client.post("/onay-ver/1")
         assert yanit.status_code == 200
@@ -865,6 +865,10 @@ class TestFiyatPolitikasiKontrolEt:
 
 
 class TestSiparisEkleFiyatKapisi:
+    """/siparis-ekle kaldırıldı (arayüzden hiç çağrılmıyordu, hem tekli hem çoklu
+    sipariş formu zaten /siparis-grup-ekle'ye gidiyor) - fiyat kapısı kontrolü artık
+    tek gerçek sipariş giriş ucu olan /siparis-grup-ekle üzerinden test ediliyor."""
+
     def test_politika_disi_fiyatla_siparis_reddedilir(self, monkeypatch):
         conn, cursor = sahte_cursor_olustur()
         cursor.fetchone.side_effect = [(100.0,), None, None]  # taban fiyat 100, özel liste/iskonto yok
@@ -872,19 +876,23 @@ class TestSiparisEkleFiyatKapisi:
         try:
             monkeypatch.setattr(main, "get_db_connection", lambda: conn)
             gecici_client = TestClient(main.app)
-            yanit = gecici_client.post("/siparis-ekle", json={
-                "MusteriID": 1, "StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 5, "BirimFiyat": 50
+            yanit = gecici_client.post("/siparis-grup-ekle", json={
+                "MusteriID": 1, "Kalemler": [
+                    {"StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 5, "BirimFiyat": 50}
+                ]
             })
             assert yanit.status_code == 400
         finally:
             main.app.dependency_overrides.clear()
 
     def test_yonetici_politika_disi_fiyatla_siparis_girebilir(self, client, monkeypatch):
-        conn, cursor = sahte_cursor_olustur()
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(100.0, 0.0))
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
-        yanit = client.post("/siparis-ekle", json={
-            "MusteriID": 1, "StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 5, "BirimFiyat": 1
+        yanit = client.post("/siparis-grup-ekle", json={
+            "MusteriID": 1, "Kalemler": [
+                {"StokKod": "PP-001", "StokAdi": "Test Ürünü", "Miktar": 5, "BirimFiyat": 1}
+            ]
         })
         assert yanit.status_code == 200
 
@@ -998,8 +1006,8 @@ class TestBankaCekSenetMuhasebeEntegrasyonu:
 
     def test_cek_senet_ciro_dogru_hesaplara_islenir(self, client, monkeypatch):
         conn, cursor = sahte_cursor_olustur()
-        # 1) evrak bilgisi (EvrakNo, Tutar), 2) yevmiye_fisi_olustur'un yeni FisID'si
-        cursor.fetchone.side_effect = [("CK-001", 2000.0), (1,)]
+        # 1) evrak bilgisi (EvrakNo, Tutar, Durum='Portföyde'), 2) yevmiye_fisi_olustur'un yeni FisID'si
+        cursor.fetchone.side_effect = [("CK-001", 2000.0, "Portföyde"), (1,)]
         monkeypatch.setattr(main, "get_db_connection", lambda: conn)
 
         yanit = client.put("/cek-senet-ciro", json={"EvrakID": 1, "VerilenTedarikciID": 3})
@@ -1007,6 +1015,206 @@ class TestBankaCekSenetMuhasebeEntegrasyonu:
         yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
         hesap_kodlari = {c.args[1][1] for c in yevmiye_satirlari}
         assert hesap_kodlari == {"320", "101"}
+
+    def test_cek_senet_ciro_portfoyde_olmayan_evraki_reddeder(self, client, monkeypatch):
+        """ÖNCEDEN Durum hiç kontrol edilmiyordu - zaten tahsil/ciro edilmiş bir
+        evrak tekrar ciro edilebiliyordu (101 hesabını gerçek dışı eksiye düşürürdü)."""
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("CK-001", 2000.0, "Tahsil Edildi")]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/cek-senet-ciro", json={"EvrakID": 1, "VerilenTedarikciID": 3})
+        assert yanit.status_code == 400
+
+
+class TestTlKarsiligiHesapla:
+    """kasa_hareket_ekle/masraf_ekle/cek_senet_tahsil'in ortak döviz çevirme
+    yardımcısı. ÖNCEDEN bu hesaplama hiç yapılmıyordu - EUR/USD kasa hareketleri
+    yevmiyeye 1:1 TL gibi yazılıyordu."""
+
+    def test_tl_ise_kur_1_doner(self):
+        tutar_tl, kur = main.tl_karsiligi_hesapla(100.0, "TL")
+        assert tutar_tl == 100.0
+        assert kur == 1.0
+
+    def test_doviz_dogru_cevrilir(self, monkeypatch):
+        monkeypatch.setattr(main, "guncel_kur_getir", lambda: {"TL": 1.0, "EUR": 40.0})
+        tutar_tl, kur = main.tl_karsiligi_hesapla(100.0, "EUR")
+        assert tutar_tl == 4000.0
+        assert kur == 40.0
+
+    def test_kur_bulunamazsa_502_hata_verir(self, monkeypatch):
+        monkeypatch.setattr(main, "guncel_kur_getir", lambda: {"TL": 1.0})
+        with pytest.raises(main.HTTPException) as exc_info:
+            main.tl_karsiligi_hesapla(100.0, "XYZ")
+        assert exc_info.value.status_code == 502
+
+
+class TestKasaDovizEntegrasyonu:
+    """kasa_hareket_ekle ÖNCEDEN EUR/USD kasadaki bir hareketi hiç çevirmeden 1:1
+    TL gibi yevmiyeye ("100"/"120") yazıyordu - Kasalar.Bakiye doğru döviz tutarını
+    tutsa bile muhasebe defteri yanlış tutuyordu."""
+
+    def test_eur_kasaya_tahsilat_dogru_tl_karsiligiyla_yevmiyeye_yazilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1000.0, "EUR"), (1,)]  # Kasalar satırı, yevmiye FisID
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        monkeypatch.setattr(main, "guncel_kur_getir", lambda: {"TL": 1.0, "EUR": 40.0})
+
+        yanit = client.post("/kasa-hareket-ekle", json={"KasaID": 2, "IslemTuru": "Tahsilat", "Tutar": 100, "Aciklama": "test"})
+        assert yanit.status_code == 200
+
+        # Kasalar.Bakiye kendi (EUR) para biriminde, ÇEVRİLMEDEN güncellenir
+        kasa_guncelleme = [c for c in cursor.execute.call_args_list if "UPDATE Kasalar" in c.args[0]][0]
+        assert kasa_guncelleme.args[1][0] == 100.0
+
+        # Yevmiyeye ise TL karşılığı (100 * 40 = 4000) yazılır
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        satirlar = {c.args[1][1]: (c.args[1][2], c.args[1][3]) for c in yevmiye_satirlari}
+        assert satirlar["100"] == (4000.0, 0)
+        assert satirlar["120"] == (0, 4000.0)
+
+    def test_tl_kasada_kur_hesaba_katilmaz(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [(1000.0, "TL"), (1,)]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/kasa-hareket-ekle", json={"KasaID": 1, "IslemTuru": "Tahsilat", "Tutar": 100, "Aciklama": "test"})
+        assert yanit.status_code == 200
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        satirlar = {c.args[1][1]: (c.args[1][2], c.args[1][3]) for c in yevmiye_satirlari}
+        assert satirlar["100"] == (100.0, 0)
+
+
+class TestKasaHareketIptal:
+    """/kasa-hareket-iptal ÖNCEDEN hiç yoktu - yanlış girilen bir kasa hareketi
+    API üzerinden asla geri alınamıyordu."""
+
+    def test_zaten_iptal_edilmis_hareket_400_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            (2, "Tahsilat", 100.0, "Giriş", "test", "İptal", date(2026, 9, 1), None, None),
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/kasa-hareket-iptal/5", json={"Neden": "yanlış girildi"})
+        assert yanit.status_code == 400
+
+    def test_bulunamayan_hareket_404_doner(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur(fetchone_sonucu=None)
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/kasa-hareket-iptal/999", json={"Neden": "test"})
+        assert yanit.status_code == 404
+
+    def test_donem_kilitliyken_sifresiz_iptal_reddedilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            (2, "Tahsilat", 100.0, "Giriş", "test", "Aktif", date(2026, 8, 1), None, None),
+            (1,),  # donem_kilitli_mi -> True
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/kasa-hareket-iptal/5", json={"Neden": "yanlış girildi"})
+        assert yanit.status_code == 403
+
+    def test_basarili_iptal_ters_yevmiye_atar(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            (2, "Tahsilat", 100.0, "Giriş", "test", "Aktif", date(2026, 9, 1), None, None),
+            None,  # donem_kilitli_mi -> False
+            (1,),  # yevmiye_fisi_olustur FisID
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/kasa-hareket-iptal/5", json={"Neden": "yanlış girildi"})
+        assert yanit.status_code == 200
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        satirlar = {c.args[1][1]: (c.args[1][2], c.args[1][3]) for c in yevmiye_satirlari}
+        # Tahsilat (100 borç/120 alacak) girişinin TAM TERSİ
+        assert satirlar["120"] == (100.0, 0)
+        assert satirlar["100"] == (0, 100.0)
+
+
+class TestCekSenetTahsilVeKarsiliksiz:
+    """ÖNCEDEN çek/senet tahsil (vadesinde bankaya/kasaya geçme) ve karşılıksız
+    işlemlerinin HİÇBİR karşılığı yoktu."""
+
+    def test_tahsil_portfoyde_olmayan_evraki_reddeder(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("CK-001", 2000.0, "Ciro Edildi")]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/cek-senet-tahsil/1", json={"HedefTip": "Banka", "HedefID": 1})
+        assert yanit.status_code == 400
+
+    def test_tahsil_bankaya_dogru_hesaplara_islenir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("CK-001", 2000.0, "Portföyde"),  # evrak bilgisi
+            (1,),  # BankaHesaplari var mı
+            (1,),  # yevmiye_fisi_olustur FisID
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/cek-senet-tahsil/1", json={"HedefTip": "Banka", "HedefID": 3})
+        assert yanit.status_code == 200
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        satirlar = {c.args[1][1]: (c.args[1][2], c.args[1][3]) for c in yevmiye_satirlari}
+        assert satirlar["102"] == (2000.0, 0)
+        assert satirlar["101"] == (0, 2000.0)
+
+    def test_karsiliksiz_musteri_borcunu_yeniden_acar(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [
+            ("CK-001", 2000.0, 7, "Portföyde"),  # evrak bilgisi (+ AlinanMusteriID)
+            (1,),  # yevmiye_fisi_olustur FisID
+        ]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/cek-senet-karsiliksiz/1", json={"Aciklama": "banka reddetti"})
+        assert yanit.status_code == 200
+        yevmiye_satirlari = [c for c in cursor.execute.call_args_list if "INTO YevmiyeSatirlari" in c.args[0]]
+        satirlar = {c.args[1][1]: (c.args[1][2], c.args[1][3]) for c in yevmiye_satirlari}
+        assert satirlar["120"] == (2000.0, 0)  # müşteri borcu yeniden açıldı
+        assert satirlar["101"] == (0, 2000.0)
+
+    def test_karsiliksiz_zaten_tahsil_edilmisi_reddeder(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        cursor.fetchone.side_effect = [("CK-001", 2000.0, 7, "Tahsil Edildi")]
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.put("/cek-senet-karsiliksiz/1", json={"Aciklama": "test"})
+        assert yanit.status_code == 400
+
+
+class TestBankaHareketDogrulama:
+    """banka_hareket_ekle ÖNCEDEN tanınmayan bir IslemTuru için sessizce yarım
+    kayıt bırakıyordu (BankaHareketleri'ne INSERT ama Bakiye güncellenmez, yevmiye
+    yazılmaz)."""
+
+    def test_tanimsiz_islem_turu_reddedilir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+        yanit = client.post("/banka-hareket-ekle", json={"HesapID": 1, "IslemTuru": "Yanlış Tür", "Tutar": 100, "Aciklama": "test"})
+        assert yanit.status_code == 400
+        # Hiçbir INSERT çalışmamalı - erken reddedildi
+        assert cursor.execute.call_count == 0
+
+
+class TestBankaHesapAcilisBakiyesi:
+    """banka_hesap_ekle ÖNCEDEN karşılıksız (yevmiye kaydı olmadan) bir açılış
+    bakiyesiyle hesap eklenebiliyordu."""
+
+    def test_acilis_bakiyesi_sifira_zorlanir(self, client, monkeypatch):
+        conn, cursor = sahte_cursor_olustur()
+        monkeypatch.setattr(main, "get_db_connection", lambda: conn)
+
+        yanit = client.post("/banka-hesap-ekle", json={"BankaAdi": "Test Bank", "SubeAdi": "Merkez", "IbanNo": "TR00", "Bakiye": 5000})
+        assert yanit.status_code == 200
+        insert_cagrisi = [c for c in cursor.execute.call_args_list if "INSERT INTO BankaHesaplari" in c.args[0]][0]
+        assert insert_cagrisi.args[1] == ("Test Bank", "Merkez", "TR00")
+        assert "0 ile açıldı" in yanit.json()["mesaj"]
 
 
 class TestCokluDepoSenkronizasyonu:
@@ -3077,8 +3285,9 @@ class TestDashboardOzetKpiGenisletme:
 
 
 class TestSiparisEkleSozVerilenTeslimTarihi:
-    """/siparis-ekle önceden söz verilen teslim tarihi almıyordu - Geç Teslimat Oranı
-    KPI'sının hesaplanabilmesi için bu alan artık INSERT'e geçiriliyor."""
+    """Söz verilen teslim tarihi Geç Teslimat Oranı KPI'sının hesaplanabilmesi için
+    /siparis-grup-ekle (tek gerçek sipariş giriş ucu - bkz. TestSiparisEkleFiyatKapisi
+    notu) üzerinden INSERT'e geçiriliyor mu diye doğrular."""
 
     def test_teslim_tarihi_insert_e_dogru_geciyor(self, client, monkeypatch):
         conn, cursor = sahte_cursor_olustur(fetchone_sonucu=(0,))
@@ -3088,8 +3297,10 @@ class TestSiparisEkleSozVerilenTeslimTarihi:
         monkeypatch.setattr(main, "stok_rezerve_et", lambda *a, **k: None)
         monkeypatch.setattr(main, "stok_kullanilabilir_miktar", lambda *a, **k: 10.0)
 
-        yanit = client.post("/siparis-ekle", json={
-            "MusteriID": 1, "StokKod": "PP-001", "StokAdi": "Test", "Miktar": 5, "BirimFiyat": 10,
+        yanit = client.post("/siparis-grup-ekle", json={
+            "MusteriID": 1, "Kalemler": [
+                {"StokKod": "PP-001", "StokAdi": "Test", "Miktar": 5, "BirimFiyat": 10}
+            ],
             "SozVerilenTeslimTarihi": "2026-09-20"
         })
         assert yanit.status_code == 200
